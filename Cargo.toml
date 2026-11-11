@@ -30,6 +30,10 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 name = "ptp_container"
 harness = false
 
+[[bench]]
+name = "ptp_dataset"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
