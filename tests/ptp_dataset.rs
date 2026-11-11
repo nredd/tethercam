@@ -208,8 +208,12 @@ proptest! {
         let _ = ObjectInfo::decode(&bytes);
         let _ = DevicePropDesc::decode(&bytes);
         let _ = DataType::try_from(code);
-        if let Ok(dt) = DataType::try_from(code) {
-            let _ = Value::from_bytes(dt, &bytes);
+        let every_code = (0x0001_u16..=0x000A).chain(0x4001..=0x400A).chain([0xFFFF]);
+        for raw in every_code {
+            let dt = DataType::try_from(raw).unwrap();
+            if let Ok(v) = Value::from_bytes(dt, &bytes) {
+                prop_assert_eq!(v.data_type(), dt);
+            }
         }
         let mut r = Reader::new(&bytes);
         let _ = r.string();
