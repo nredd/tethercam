@@ -8,6 +8,10 @@ mod concurrency_tests;
 #[cfg(test)]
 mod diagnostic_tests;
 #[cfg(test)]
+mod durability_tests;
+#[cfg(test)]
+mod listener_tests;
+#[cfg(test)]
 mod tests;
 
 use std::fmt;
@@ -200,6 +204,19 @@ impl Config {
         }
         check(self.rtsp_port != 0, "rtsp_port", &self.rtsp_port)?;
         check(self.onvif_port != 0, "onvif_port", &self.onvif_port)?;
+        let same_family = self.rtsp_address.is_ipv4() == self.onvif_address.is_ipv4();
+        let addresses_overlap = same_family
+            && (self.rtsp_address == self.onvif_address
+                || self.rtsp_address.is_unspecified()
+                || self.onvif_address.is_unspecified());
+        check(
+            self.rtsp_port != self.onvif_port || !addresses_overlap,
+            "rtsp_address, rtsp_port, onvif_address, onvif_port",
+            &format!(
+                "{}:{} and {}:{}",
+                self.rtsp_address, self.rtsp_port, self.onvif_address, self.onvif_port
+            ),
+        )?;
         check(
             self.streams.frame_rate > 0 && self.streams.frame_rate <= 120,
             "streams.frame_rate",
@@ -292,12 +309,18 @@ impl Config {
                 match config.create(path) {
                     Ok(()) => Ok(config),
                     Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        Self::load(path)
+                        let config = Self::load(path)?;
+                        sync_directory(config_parent(path))?;
+                        Ok(config)
                     }
                     Err(error) => Err(error),
                 }
             }
-            result => result,
+            Ok(config) => {
+                sync_directory(config_parent(path))?;
+                Ok(config)
+            }
+            Err(error) => Err(error),
         }
     }
     /// Atomically create a new configuration without overwriting an existing one.
@@ -305,22 +328,54 @@ impl Config {
     /// # Errors
     /// Returns an error if validation or file creation fails.
     pub fn create(&self, path: &Path) -> Result<(), Error> {
+        self.create_with_sync(path, &mut sync_directory)
+    }
+
+    fn create_with_sync(
+        &self, path: &Path, sync: &mut impl FnMut(&Path) -> io::Result<()>,
+    ) -> Result<(), Error> {
         self.validate()?;
         if !cfg!(unix) {
             return Err(Error::Permissions);
         }
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        let parent = config_parent(path);
+        create_directories(parent, sync)?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         let contents = Zeroizing::new(toml::to_string_pretty(self).map_err(|_| Error::Serialize)?);
         temp.write_all(contents.as_bytes())?;
         temp.as_file().sync_all()?;
         temp.persist_noclobber(path)
             .map_err(|e| Error::Io(e.error))?;
+        sync(parent)?;
         Ok(())
+    }
+}
+
+fn config_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn create_directories(
+    path: &Path, sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if path.is_dir() {
+        return sync(parent);
+    }
+    create_directories(parent, sync)?;
+    match fs::create_dir(path) {
+        Ok(()) => sync(parent),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => sync(parent),
+        Err(error) => Err(error),
     }
 }
 
