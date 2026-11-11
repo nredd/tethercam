@@ -27,7 +27,7 @@ serde_path_to_error = "0.1.20"
 tempfile = "3.27.0"
 thiserror = "2"
 toml = "1.2.1"
-uuid = { version = "1.29.2", features = ["serde", "std", "v4"], default-features = false }
+uuid = { version = "1.29.2", features = ["serde", "std"], default-features = false }
 zeroize = "1.9.1"
 
 [dev-dependencies]

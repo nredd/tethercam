@@ -282,7 +282,12 @@ impl Config {
         let config: Self = serde_path_to_error::deserialize(deserializer).map_err(|error| {
             let key = error.path().to_string();
             if key.starts_with("credentials") || key == "." {
-                Error::Parse(format!("invalid `{key}`: [REDACTED]"))
+                // Structural messages name only keys. Anything else may quote a value.
+                let message = error.inner().message();
+                let structural =
+                    message.starts_with("missing field") || message.starts_with("unknown field");
+                let detail = if structural { message } else { "[REDACTED]" };
+                Error::Parse(format!("invalid `{key}`: {detail}"))
             } else {
                 let value = error
                     .inner()
