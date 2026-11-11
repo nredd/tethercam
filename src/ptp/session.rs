@@ -689,7 +689,12 @@ impl<T: Transport> Session<T> {
     /// After a rejected data-out phase, recovers the camera's non-OK response, if it sent one,
     /// so the caller sees the typed error instead of the stall it caused.
     async fn early_response(&mut self, transaction_id: u32) -> Option<SessionError> {
-        let (header, payload) = self.read_container().await.ok()?;
+        let (header, payload) = match self.read_container().await {
+            Ok(container) => container,
+            // The probe itself ran out of time: that is the error to report.
+            Err(err @ SessionError::DeadlineExceeded(_)) => return Some(err),
+            Err(_) => return None,
+        };
         if header.kind != ContainerKind::Response
             || header.transaction_id != transaction_id
             || header.code == code::RESPONSE_OK
@@ -1135,24 +1140,36 @@ mod tests {
         );
     }
 
-    /// Spends its whole timeout on every read, then reports a timeout.
+    /// When `armed`, spends its whole timeout on every read, then reports a timeout, and
+    /// stalls the second bulk-out (the data phase). Otherwise delegates.
     struct Stalling {
         inner: SimCamera,
         step: Duration,
+        armed: bool,
+        out_calls: usize,
     }
 
     impl Transport for Stalling {
-        fn bulk_out(
+        async fn bulk_out(
             &mut self, bytes: &[u8], timeout: Duration,
-        ) -> impl Future<Output = Result<(), TransportError>> + Send {
-            self.inner.bulk_out(bytes, timeout)
+        ) -> Result<(), TransportError> {
+            if self.armed {
+                self.out_calls += 1;
+                if self.out_calls >= 2 {
+                    return Err(TransportError::Stall);
+                }
+            }
+            self.inner.bulk_out(bytes, timeout).await
         }
 
-        fn bulk_in(
-            &mut self, _bytes: &mut [u8], timeout: Duration,
-        ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+        async fn bulk_in(
+            &mut self, bytes: &mut [u8], timeout: Duration,
+        ) -> Result<usize, TransportError> {
+            if !self.armed {
+                return self.inner.bulk_in(bytes, timeout).await;
+            }
             ELAPSED.set(ELAPSED.get() + timeout.min(self.step));
-            std::future::ready(Err(TransportError::Timeout))
+            Err(TransportError::Timeout)
         }
 
         fn interrupt_in(
@@ -1186,6 +1203,8 @@ mod tests {
             Stalling {
                 inner: SimCamera::new(),
                 step: Duration::from_secs(100),
+                armed: true,
+                out_calls: 0,
             },
             config,
         )
@@ -1257,6 +1276,30 @@ mod tests {
         assert_eq!(
             s.close().await,
             Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert!(!s.is_open());
+    }
+
+    #[tokio::test]
+    async fn deadline_during_the_early_response_probe_is_reported() {
+        ELAPSED.set(Duration::ZERO);
+        let mut s = Session::new(
+            Stalling {
+                inner: SimCamera::new(),
+                step: Duration::from_secs(100),
+                armed: false,
+                out_calls: 0,
+            },
+            SessionConfig::default(),
+        )
+        .with_clock(fake_now);
+        s.open().await.unwrap();
+        s.transport.armed = true;
+        // The data phase stalls; the probe for an early response then spends the budget.
+        assert_eq!(
+            s.transaction_within(Duration::from_secs(3), 0x9999, &[], Some(&[1]))
+                .await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(3)))
         );
         assert!(!s.is_open());
     }
