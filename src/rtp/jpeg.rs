@@ -117,6 +117,9 @@ pub enum JpegError {
     /// EOI hit before an SOS marker.
     #[error("no scan in JPEG")]
     MissingScan,
+    /// A second scan (`SOS`) follows the first; RFC 2435 carries a single scan.
+    #[error("multi-scan JPEG cannot be carried by RFC 2435")]
+    MultipleScans,
     /// The scan has no terminating EOI marker.
     #[error("missing EOI marker")]
     MissingEoi,
@@ -236,11 +239,8 @@ impl<'a> JpegInfo<'a> {
         frame.check_scan(sos)?;
         let tables = frame.tables(&quant)?;
         let rest = data.get(pos..).ok_or(JpegError::Malformed)?;
-        let eoi = rest
-            .windows(2)
-            .position(|w| w == [0xff, 0xd9])
-            .ok_or(JpegError::MissingEoi)?;
-        let scan = rest.get(..eoi).ok_or(JpegError::Malformed)?;
+        let (scan, trailer) = split_scan(rest)?;
+        check_trailer(trailer)?;
         if scan.is_empty() {
             return Err(JpegError::EmptyScan);
         }
@@ -252,6 +252,66 @@ impl<'a> JpegInfo<'a> {
             scan,
             tables,
         })
+    }
+}
+
+/// Split `rest` (everything after the SOS header) into the entropy-coded data and the bytes
+/// from the marker that ends it.
+///
+/// Inside entropy-coded data `FF 00` is a stuffed byte and `FF D0`..`FF D7` are restart
+/// markers; both stay in the scan. Any other marker, after optional `FF` fill bytes, ends it.
+fn split_scan(rest: &[u8]) -> Result<(&[u8], &[u8]), JpegError> {
+    let mut at = 0usize;
+    loop {
+        let offset = rest
+            .get(at..)
+            .and_then(|tail| tail.iter().position(|&b| b == 0xff))
+            .ok_or(JpegError::MissingEoi)?;
+        let start = at + offset;
+        let mut marker_at = start + 1;
+        while rest.get(marker_at) == Some(&0xff) {
+            marker_at += 1;
+        }
+        match rest.get(marker_at) {
+            None => return Err(JpegError::MissingEoi),
+            Some(0x00) if marker_at == start + 1 => at = marker_at + 1,
+            Some(0xd0..=0xd7) => at = marker_at + 1,
+            Some(_) => {
+                let (scan, trailer) = rest.split_at_checked(start).ok_or(JpegError::Malformed)?;
+                return Ok((scan, trailer));
+            }
+        }
+    }
+}
+
+/// After the scan only `EOI` may follow, optionally preceded by skippable segments.
+fn check_trailer(trailer: &[u8]) -> Result<(), JpegError> {
+    let mut pos = 0usize;
+    loop {
+        while trailer.get(pos) == Some(&0xff) && trailer.get(pos + 1) == Some(&0xff) {
+            pos += 1;
+        }
+        let marker = match (trailer.get(pos), trailer.get(pos + 1)) {
+            (Some(0xff), Some(&marker)) => marker,
+            (Some(0xff) | None, None) => return Err(JpegError::MissingEoi),
+            _ => return Err(JpegError::BadMarker),
+        };
+        pos += 2;
+        match marker {
+            0xd9 => return Ok(()),
+            0xda => return Err(JpegError::MultipleScans),
+            0x00 | 0x01 | 0xd0..=0xd8 => return Err(JpegError::BadMarker),
+            _ => {
+                let length = trailer
+                    .get(pos..)
+                    .and_then(<[u8]>::first_chunk::<2>)
+                    .map(|&l| usize::from(u16::from_be_bytes(l)))
+                    .filter(|&l| l >= 2)
+                    .ok_or(JpegError::Malformed)?;
+                trailer.get(pos..pos + length).ok_or(JpegError::Malformed)?;
+                pos += length;
+            }
+        }
     }
 }
 
@@ -976,6 +1036,73 @@ mod tests {
         assert_eq!(got.scan, JpegInfo::parse(&jpeg).unwrap().scan);
     }
 
+    /// `build()` output with `extra` inserted before the final EOI.
+    fn with_before_eoi(extra: &[u8]) -> Vec<u8> {
+        let mut jpeg = build(&Spec {
+            scan_len: 40,
+            ..Spec::default()
+        });
+        jpeg.truncate(jpeg.len() - 2);
+        jpeg.extend_from_slice(extra);
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        jpeg
+    }
+
+    #[test]
+    fn segments_after_scan_are_not_payload() {
+        let plain = build(&Spec {
+            scan_len: 40,
+            ..Spec::default()
+        });
+        let want = JpegInfo::parse(&plain).unwrap().scan.to_vec();
+        for extra in [
+            &[0xff, 0xfe, 0x00, 0x04, 0x41, 0x42][..],
+            &[0xff, 0xff, 0xff, 0xfe, 0x00, 0x03, 0x41],
+            &[0xff, 0xfe, 0x00, 0x02, 0xff, 0xe1, 0x00, 0x02],
+        ] {
+            let jpeg = with_before_eoi(extra);
+            assert_eq!(JpegInfo::parse(&jpeg).unwrap().scan, want, "{extra:02x?}");
+            let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
+            let mut pool = PacketPool::new();
+            packetizer.packetize(&jpeg, 0, &mut pool).unwrap();
+            assert_eq!(depacketize(&pool, 1400).scan, want);
+        }
+    }
+
+    #[test]
+    fn restart_markers_and_stuffing_stay_in_scan() {
+        let mut jpeg = build(&Spec {
+            scan_len: 0,
+            restart: 2,
+            ..Spec::default()
+        });
+        jpeg.truncate(jpeg.len() - 2);
+        let scan = [1, 0xff, 0x00, 2, 0xff, 0xd0, 3, 0xff, 0x00, 0xff, 0xd7, 4];
+        jpeg.extend_from_slice(&scan);
+        jpeg.extend_from_slice(&[0xff, 0xff, 0xff, 0xd9]);
+        assert_eq!(JpegInfo::parse(&jpeg).unwrap().scan, scan);
+    }
+
+    #[test]
+    fn second_scan_and_bad_trailers_are_rejected() {
+        let sos = [0xff, 0xda, 0x00, 0x02];
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&sos)),
+            Err(JpegError::MultipleScans)
+        );
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&[0xff, 0xd8])),
+            Err(JpegError::BadMarker)
+        );
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&[0xff, 0xfe, 0x00, 0x09, 1])),
+            Err(JpegError::Malformed)
+        );
+        let mut no_eoi = with_before_eoi(&[0xff, 0xfe, 0x00, 0x02]);
+        no_eoi.truncate(no_eoi.len() - 2);
+        assert_eq!(JpegInfo::parse(&no_eoi), Err(JpegError::MissingEoi));
+    }
+
     #[test]
     fn steady_state_reuses_pool() {
         let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
@@ -997,6 +1124,16 @@ mod tests {
             let mut packetizer = JpegPacketizer::new(config(400)).unwrap();
             let mut pool = PacketPool::new();
             let _ = packetizer.packetize(&bytes, 0, &mut pool);
+        }
+
+        #[test]
+        fn scan_walker_never_panics(
+            bytes in proptest::collection::vec(prop_oneof![Just(0xffu8), Just(0), Just(0xd0), Just(0xd9), Just(0xda), any::<u8>()], 0..64),
+        ) {
+            if let Ok((scan, trailer)) = split_scan(&bytes) {
+                prop_assert_eq!(scan.len() + trailer.len(), bytes.len());
+            }
+            let _ = check_trailer(&bytes);
         }
 
         #[test]

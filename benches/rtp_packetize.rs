@@ -2,6 +2,7 @@
 //!
 //! Both run once per frame: a 48 KB live-view JPEG and a 40 KB H.264 access unit at MTU 1400.
 
+use std::cell::Cell;
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput};
@@ -55,6 +56,8 @@ enum BenchError {
     H264(#[from] H264Error),
     #[error("{0} produced no packets")]
     NoPackets(&'static str),
+    #[error("{name}: {count} timed packetize call(s) failed")]
+    TimedFailures { name: &'static str, count: u64 },
 }
 
 fn main() -> Result<(), BenchError> {
@@ -74,17 +77,42 @@ fn main() -> Result<(), BenchError> {
         return Err(BenchError::NoPackets("H.264"));
     }
 
+    // `Bencher::iter` discards closure results, so count failures here and fail after timing.
+    let jpeg_failures = Cell::new(0u64);
+    let h264_failures = Cell::new(0u64);
     let mut criterion = Criterion::default().configure_from_args();
     let mut group = criterion.benchmark_group("rtp_packetize");
     group.throughput(Throughput::Bytes(jpeg.len() as u64));
     group.bench_function("jpeg_48k_mtu1400", |b| {
-        b.iter(|| jpeg_packetizer.packetize(black_box(&jpeg), black_box(1), &mut jpeg_pool));
+        b.iter(|| {
+            if jpeg_packetizer
+                .packetize(black_box(&jpeg), black_box(1), &mut jpeg_pool)
+                .is_err()
+            {
+                jpeg_failures.set(jpeg_failures.get() + 1);
+            }
+        });
     });
     group.throughput(Throughput::Bytes(au.len() as u64));
     group.bench_function("h264_40k_mtu1400", |b| {
-        b.iter(|| h264_packetizer.packetize(black_box(&au), black_box(1), &mut h264_pool));
+        b.iter(|| {
+            if h264_packetizer
+                .packetize(black_box(&au), black_box(1), &mut h264_pool)
+                .is_err()
+            {
+                h264_failures.set(h264_failures.get() + 1);
+            }
+        });
     });
     group.finish();
     criterion.final_summary();
+    for (name, failures) in [("JPEG", &jpeg_failures), ("H.264", &h264_failures)] {
+        if failures.get() > 0 {
+            return Err(BenchError::TimedFailures {
+                name,
+                count: failures.get(),
+            });
+        }
+    }
     Ok(())
 }
