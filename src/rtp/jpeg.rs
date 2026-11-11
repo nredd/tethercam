@@ -284,7 +284,8 @@ fn split_scan(rest: &[u8]) -> Result<(&[u8], &[u8]), JpegError> {
     }
 }
 
-/// After the scan only `EOI` may follow, optionally preceded by skippable segments.
+/// After the scan only `EOI` may follow, optionally preceded by `APPn` / `COM` segments.
+/// Anything structural (`SOF`, `DHT`, `DQT`, `DRI`, `SOS`) is rejected.
 fn check_trailer(trailer: &[u8]) -> Result<(), JpegError> {
     let mut pos = 0usize;
     loop {
@@ -300,8 +301,12 @@ fn check_trailer(trailer: &[u8]) -> Result<(), JpegError> {
         match marker {
             0xd9 => return Ok(()),
             0xda => return Err(JpegError::MultipleScans),
-            0x00 | 0x01 | 0xd0..=0xd8 => return Err(JpegError::BadMarker),
-            _ => {
+            0xc2 => return Err(JpegError::Progressive),
+            0xc0 | 0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                return Err(JpegError::UnsupportedFrameType(marker & 0x0f));
+            }
+            // Only application data and comments are skippable after the scan.
+            0xe0..=0xef | 0xfe => {
                 let length = trailer
                     .get(pos..)
                     .and_then(<[u8]>::first_chunk::<2>)
@@ -311,6 +316,7 @@ fn check_trailer(trailer: &[u8]) -> Result<(), JpegError> {
                 trailer.get(pos..pos + length).ok_or(JpegError::Malformed)?;
                 pos += length;
             }
+            _ => return Err(JpegError::BadMarker),
         }
     }
 }
@@ -1098,6 +1104,20 @@ mod tests {
             JpegInfo::parse(&with_before_eoi(&[0xff, 0xfe, 0x00, 0x09, 1])),
             Err(JpegError::Malformed)
         );
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&[0xff, 0xc2, 0x00, 0x02])),
+            Err(JpegError::Progressive)
+        );
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&[0xff, 0xc0, 0x00, 0x02])),
+            Err(JpegError::UnsupportedFrameType(0))
+        );
+        for marker in [0xc4, 0xdb, 0xdd] {
+            assert_eq!(
+                JpegInfo::parse(&with_before_eoi(&[0xff, marker, 0x00, 0x02])),
+                Err(JpegError::BadMarker)
+            );
+        }
         let mut no_eoi = with_before_eoi(&[0xff, 0xfe, 0x00, 0x02]);
         no_eoi.truncate(no_eoi.len() - 2);
         assert_eq!(JpegInfo::parse(&no_eoi), Err(JpegError::MissingEoi));
