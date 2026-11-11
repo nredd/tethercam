@@ -324,9 +324,14 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         self.clear_halts_then_reset().await?;
-        self.try_open().await.map_err(|err| match recoverable(err) {
-            Ok(cause) => SessionError::Unrecoverable(cause),
-            Err(other) => other,
+        self.try_open().await.map_err(|err| {
+            if matches!(err, SessionError::DeadlineExceeded(_)) {
+                return err;
+            }
+            match recoverable(err) {
+                Ok(cause) => SessionError::Unrecoverable(cause),
+                Err(other) => other,
+            }
         })
     }
 
@@ -517,6 +522,10 @@ impl<T: Transport> Session<T> {
             Err(SessionError::Transport(TransportError::Disconnected)) => {
                 Err(TransportError::Disconnected.into())
             }
+            Err(err @ SessionError::DeadlineExceeded(_)) => {
+                self.clear_halts_then_reset().await?;
+                Err(err)
+            }
             Err(_) => self.clear_halts_then_reset().await,
         }
     }
@@ -563,7 +572,10 @@ impl<T: Transport> Session<T> {
 
     async fn send(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
         let timeout = self.transfer_timeout()?;
-        Ok(self.transport.bulk_out(bytes, timeout).await?)
+        self.transport
+            .bulk_out(bytes, timeout)
+            .await
+            .map_err(|err| self.classify(err))
     }
 
     async fn exchange(
@@ -596,6 +608,20 @@ impl<T: Transport> Session<T> {
             return Err(SessionError::DeadlineExceeded(limit));
         }
         Ok(self.config.timeout.min(remaining))
+    }
+
+    /// A timeout that used up the exchange's remaining budget is a missed deadline.
+    fn classify(&self, err: TransportError) -> SessionError {
+        if err == TransportError::Timeout
+            && let Some(Deadline {
+                at: Some(at),
+                limit,
+            }) = self.deadline
+            && (self.clock)() >= at
+        {
+            return SessionError::DeadlineExceeded(limit);
+        }
+        err.into()
     }
 
     async fn exchange_phases(
@@ -719,7 +745,10 @@ impl<T: Transport> Session<T> {
     async fn read_transfer(&mut self) -> Result<usize, SessionError> {
         for _ in 0..MAX_EMPTY_READS {
             let timeout = self.transfer_timeout()?;
-            let len = self.transport.bulk_in(&mut self.buffer, timeout).await?;
+            let len = match self.transport.bulk_in(&mut self.buffer, timeout).await {
+                Ok(len) => len,
+                Err(err) => return Err(self.classify(err)),
+            };
             if len > 0 {
                 return Ok(len);
             }
@@ -1104,6 +1133,92 @@ mod tests {
             s.transaction(GET_OBJECT, &[1], None).await.unwrap().data,
             payload(100)
         );
+    }
+
+    /// Spends its whole timeout on every read, then reports a timeout.
+    struct Stalling {
+        inner: SimCamera,
+        step: Duration,
+    }
+
+    impl Transport for Stalling {
+        fn bulk_out(
+            &mut self, bytes: &[u8], timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.bulk_out(bytes, timeout)
+        }
+
+        fn bulk_in(
+            &mut self, _bytes: &mut [u8], timeout: Duration,
+        ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+            ELAPSED.set(ELAPSED.get() + timeout.min(self.step));
+            std::future::ready(Err(TransportError::Timeout))
+        }
+
+        fn interrupt_in(
+            &mut self, bytes: &mut [u8], timeout: Duration,
+        ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+            self.inner.interrupt_in(bytes, timeout)
+        }
+
+        fn clear_halt(
+            &mut self, endpoint: Endpoint, timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.clear_halt(endpoint, timeout)
+        }
+
+        fn reset(
+            &mut self, timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.reset(timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_timeout_that_spends_the_budget_is_a_missed_deadline() {
+        ELAPSED.set(Duration::ZERO);
+        let config = SessionConfig {
+            timeout: Duration::from_secs(5),
+            transaction_timeout: Duration::from_secs(3),
+            ..SessionConfig::default()
+        };
+        let mut s = Session::new(
+            Stalling {
+                inner: SimCamera::new(),
+                step: Duration::from_secs(100),
+            },
+            config,
+        )
+        .with_clock(fake_now);
+        // The clamped timeout (3 s) is spent in full, so the timeout is the deadline.
+        assert_eq!(
+            s.open().await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(3)))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_is_kept_through_open_and_close_recovery() {
+        let config = SessionConfig {
+            transaction_timeout: Duration::ZERO,
+            ..SessionConfig::default()
+        };
+        let mut s = Session::new(SimCamera::new(), config);
+        assert_eq!(
+            s.open().await,
+            Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert!(!s.is_open());
+
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        s.config.transaction_timeout = Duration::ZERO;
+        assert_eq!(
+            s.close().await,
+            Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert!(!s.is_open());
+        assert!(!s.transport().session_open(), "the reset ended the session");
     }
 
     #[tokio::test]
