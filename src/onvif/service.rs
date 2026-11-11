@@ -8,6 +8,13 @@
 //! A request with no credentials at all gets `401` with a Digest challenge; a request whose
 //! credentials are present but wrong gets the ONVIF `ter:NotAuthorized` fault.
 //!
+//! Failure shape depends on the mechanism, because Digest clients only retry on 401:
+//! - A failed or stale HTTP Digest `Authorization` gets `401` plus a fresh challenge, with
+//!   `stale=true` when the credentials were right for an expired or unknown nonce (RFC 7616)
+//! - A failed WS-Security `UsernameToken` gets the `ter:NotAuthorized` fault with status 400
+//! - A request carrying both is judged by WS-Security alone; the `Authorization` header is
+//!   ignored, so a good token succeeds and a bad token fails with the SOAP fault
+//!
 //! The three pre-auth calls are the ones the ONVIF Core Specification (access control, pre-auth
 //! access class) requires a device to answer without credentials: clients need the time to
 //! build a valid `Created`, and the service URLs to find the other endpoints. They expose
@@ -179,7 +186,10 @@ enum Verdict {
     Granted,
     Unauthenticated,
     Stale,
+    /// A failed WS-Security token: answered with the SOAP fault.
     Denied,
+    /// A failed HTTP Digest attempt: answered with 401 and a fresh challenge.
+    DigestFailed,
 }
 
 impl OnvifService {
@@ -311,7 +321,7 @@ impl OnvifService {
         if !is_pre_auth(endpoint, &env.operation) {
             match verdict {
                 Verdict::Granted => {}
-                Verdict::Unauthenticated => return self.challenge(false),
+                Verdict::Unauthenticated | Verdict::DigestFailed => return self.challenge(false),
                 Verdict::Stale => return self.challenge(true),
                 Verdict::Denied => return ServiceResponse::fault(&Fault::not_authorized()),
             }
@@ -347,7 +357,7 @@ impl OnvifService {
             return match self.digest.verify(req.method, req.target, header) {
                 Ok(()) => Verdict::Granted,
                 Err(AuthError::Stale) => Verdict::Stale,
-                Err(_) => Verdict::Denied,
+                Err(_) => Verdict::DigestFailed,
             };
         }
         Verdict::Unauthenticated

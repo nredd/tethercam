@@ -7,7 +7,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tethercam::onvif::auth::Credentials;
     use tethercam::onvif::auth::digest::DigestAuth;
@@ -258,20 +258,109 @@ mod tests {
         assert!(saw_503);
     }
 
-    #[test]
-    fn slow_clients_time_out_instead_of_pinning_a_thread() {
-        let limits = HttpLimits {
-            io_timeout: Duration::from_millis(200),
+    /// Trickle `payload` one byte every `gap` and return how long until the server hung up
+    /// (a failed write or EOF on read), giving up after `give_up`.
+    fn trickle_until_closed(
+        addr: SocketAddr, prefix: &[u8], payload: &[u8], gap: Duration, give_up: Duration,
+    ) -> Option<Duration> {
+        let mut s = connect(addr);
+        s.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+        s.write_all(prefix).unwrap();
+        let started = Instant::now();
+        for byte in payload.iter().cycle() {
+            if started.elapsed() > give_up {
+                return None;
+            }
+            if s.write_all(&[*byte]).is_err() {
+                return Some(started.elapsed());
+            }
+            let mut probe = [0_u8; 64];
+            if let Ok(0) = s.read(&mut probe) {
+                return Some(started.elapsed());
+            }
+            std::thread::sleep(gap);
+        }
+        None
+    }
+
+    fn assert_serves_new_client(addr: SocketAddr) {
+        // The slot is released asynchronously when the worker thread exits; poll briefly.
+        for _ in 0..50 {
+            let mut s = connect(addr);
+            s.write_all(soap_post("/onvif/device_service", &envelope("", GET_TIME), "").as_bytes())
+                .unwrap();
+            if read_reply(&mut s).status == 200 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("server never served a new client");
+    }
+
+    fn short_limits() -> HttpLimits {
+        HttpLimits {
+            max_connections: 1,
+            head_timeout: Duration::from_millis(300),
+            body_timeout: Duration::from_millis(300),
+            idle_timeout: Duration::from_millis(300),
+            write_timeout: Duration::from_millis(300),
             ..HttpLimits::default()
-        };
-        let server = start(limits);
+        }
+    }
+
+    #[test]
+    fn trickled_body_is_cut_at_the_absolute_deadline() {
+        // One slot, a declared 64 KiB body, one byte every 50 ms: every read is "fast", but
+        // the absolute body deadline (300 ms) must still close the connection.
+        let server = start(short_limits());
+        let prefix = b"POST /onvif/device_service HTTP/1.1\r\nContent-Length: 65536\r\n\r\n";
+        let took = trickle_until_closed(
+            server.local_addr(),
+            prefix,
+            b"a",
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .expect("connection was never closed");
+        assert!(
+            took >= Duration::from_millis(250),
+            "closed too early: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "deadline not enforced: {took:?}"
+        );
+        assert_serves_new_client(server.local_addr());
+    }
+
+    #[test]
+    fn trickled_head_is_cut_at_the_absolute_deadline() {
+        let server = start(short_limits());
+        let took = trickle_until_closed(
+            server.local_addr(),
+            b"POST /onvif/device_service HTTP/1.1\r\nX-Slow: ",
+            b"a",
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+        )
+        .expect("connection was never closed");
+        assert!(
+            took < Duration::from_secs(3),
+            "deadline not enforced: {took:?}"
+        );
+        assert_serves_new_client(server.local_addr());
+    }
+
+    #[test]
+    fn idle_keepalive_connection_is_closed() {
+        let server = start(short_limits());
         let mut s = connect(server.local_addr());
-        s.write_all(b"POST /onvif/device_service HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc")
-            .unwrap();
         let mut rest = Vec::new();
-        // The server drops the connection once its read times out.
+        let started = Instant::now();
         let _ = s.read_to_end(&mut rest);
         assert_eq!(rest.len(), 0);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_serves_new_client(server.local_addr());
     }
 
     #[test]

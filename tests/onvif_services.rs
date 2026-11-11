@@ -46,12 +46,16 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with_secret([9; 32])
+    }
+
+    fn rig_with_secret(secret: [u8; 32]) -> Rig {
         let clock = Arc::new(ManualClock::new(NOW));
         let service = OnvifService::with_digest_secret(
             example_model(),
             Credentials::new(USER, PASS).unwrap(),
             clock.clone(),
-            [9; 32],
+            secret,
         )
         .with_snapshot_source(Arc::new(FakeSnapshots));
         Rig { service, clock }
@@ -289,21 +293,53 @@ mod tests {
             post_with(&rig, "/onvif/device_service", &req, Some(&auth)).status,
             200
         );
+    }
+
+    #[test]
+    fn wrong_digest_password_gets_401_without_stale() {
+        let rig = rig();
+        let req = authed_request("device_get_hostname", "");
+        let challenge = post(&rig, "/onvif/device_service", &req)
+            .www_authenticate
+            .unwrap();
         let bad = DigestAuth::client_response(
             USER,
             "wrong",
             "POST",
             "/onvif/device_service",
             &challenge,
-            2,
+            1,
+            "c1",
+        )
+        .unwrap();
+        let resp = post_with(&rig, "/onvif/device_service", &req, Some(&bad));
+        assert_eq!(resp.status, 401);
+        let fresh = resp.www_authenticate.unwrap();
+        assert!(fresh.starts_with("Digest realm=\"tethercam\"") && !fresh.contains("stale"));
+        // The fresh challenge is usable with the right password.
+        let good = DigestAuth::client_response(
+            USER,
+            PASS,
+            "POST",
+            "/onvif/device_service",
+            &fresh,
+            1,
             "c1",
         )
         .unwrap();
         assert_eq!(
-            post_with(&rig, "/onvif/device_service", &req, Some(&bad)).status,
-            400
+            post_with(&rig, "/onvif/device_service", &req, Some(&good)).status,
+            200
         );
-        // Expired nonce asks the client to retry.
+    }
+
+    #[test]
+    fn stale_digest_nonce_gets_stale_true_and_retry_succeeds() {
+        let rig = rig();
+        let req = authed_request("device_get_hostname", "");
+        let challenge = post(&rig, "/onvif/device_service", &req)
+            .www_authenticate
+            .unwrap();
         rig.clock.advance(1000);
         let late = DigestAuth::client_response(
             USER,
@@ -311,13 +347,98 @@ mod tests {
             "POST",
             "/onvif/device_service",
             &challenge,
-            3,
+            1,
             "c1",
         )
         .unwrap();
         let resp = post_with(&rig, "/onvif/device_service", &req, Some(&late));
         assert_eq!(resp.status, 401);
+        let fresh = resp.www_authenticate.unwrap();
+        assert!(fresh.contains("stale=true"));
+        let retry = DigestAuth::client_response(
+            USER,
+            PASS,
+            "POST",
+            "/onvif/device_service",
+            &fresh,
+            1,
+            "c1",
+        )
+        .unwrap();
+        assert_eq!(
+            post_with(&rig, "/onvif/device_service", &req, Some(&retry)).status,
+            200
+        );
+    }
+
+    #[test]
+    fn nonce_from_a_previous_server_run_is_stale_not_denied() {
+        let old = rig_with_secret([1; 32]);
+        let req = authed_request("device_get_hostname", "");
+        let challenge = post(&old, "/onvif/device_service", &req)
+            .www_authenticate
+            .unwrap();
+        let restarted = rig_with_secret([2; 32]);
+        let auth = DigestAuth::client_response(
+            USER,
+            PASS,
+            "POST",
+            "/onvif/device_service",
+            &challenge,
+            1,
+            "c1",
+        )
+        .unwrap();
+        let resp = post_with(&restarted, "/onvif/device_service", &req, Some(&auth));
+        assert_eq!(resp.status, 401);
         assert!(resp.www_authenticate.unwrap().contains("stale=true"));
+    }
+
+    #[test]
+    fn ws_security_takes_precedence_over_http_digest() {
+        let rig = rig();
+        let challenge = post(
+            &rig,
+            "/onvif/device_service",
+            &authed_request("device_get_hostname", ""),
+        )
+        .www_authenticate
+        .unwrap();
+        let good_digest = DigestAuth::client_response(
+            USER,
+            PASS,
+            "POST",
+            "/onvif/device_service",
+            &challenge,
+            1,
+            "c1",
+        )
+        .unwrap();
+        // Bad token plus a good Authorization header: the token decides, SOAP fault, no challenge.
+        let bad_token = authed_request(
+            "device_get_hostname",
+            &security("wrong", b"nonce-both-0001", NOW),
+        );
+        let resp = post_with(
+            &rig,
+            "/onvif/device_service",
+            &bad_token,
+            Some(&good_digest),
+        );
+        assert_eq!(resp.status, 400);
+        assert!(resp.www_authenticate.is_none() && text(&resp).contains("ter:NotAuthorized"));
+        // Good token plus a garbage Authorization header: the token decides, success.
+        let good_token = authed_request(
+            "device_get_hostname",
+            &security(PASS, b"nonce-both-0002", NOW),
+        );
+        let resp = post_with(
+            &rig,
+            "/onvif/device_service",
+            &good_token,
+            Some("Digest garbage"),
+        );
+        assert_eq!(resp.status, 200);
     }
 
     #[test]

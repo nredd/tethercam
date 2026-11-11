@@ -9,12 +9,14 @@
 //! References:
 //! - [HTTP/1.1, RFC 9112](https://www.rfc-editor.org/rfc/rfc9112)
 
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -31,8 +33,15 @@ pub struct HttpLimits {
     pub max_body_bytes: usize,
     /// Maximum simultaneous connections; extras get `503`.
     pub max_connections: usize,
-    /// Read and write timeout.
-    pub io_timeout: Duration,
+    /// Absolute time a keep-alive connection may sit idle waiting for the next request.
+    pub idle_timeout: Duration,
+    /// Absolute time to receive the complete request line and headers, from the first byte.
+    /// Progress does not extend it.
+    pub head_timeout: Duration,
+    /// Absolute time to receive the complete body once the head is in.
+    pub body_timeout: Duration,
+    /// Absolute time to write one complete response.
+    pub write_timeout: Duration,
     /// Requests served on one connection before it is closed.
     pub max_requests_per_connection: usize,
 }
@@ -44,7 +53,10 @@ impl Default for HttpLimits {
             max_headers: 32,
             max_body_bytes: 64 * 1024,
             max_connections: 16,
-            io_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(10),
+            head_timeout: Duration::from_secs(10),
+            body_timeout: Duration::from_secs(15),
+            write_timeout: Duration::from_secs(10),
             max_requests_per_connection: 64,
         }
     }
@@ -168,6 +180,25 @@ fn token_char(b: u8) -> bool {
 ///
 /// Returns [`HttpError`]; [`HttpError::Closed`] is the clean end of a keep-alive connection.
 pub fn read_request<R: BufRead>(r: &mut R, limits: &HttpLimits) -> Result<HttpRequest, HttpError> {
+    read_request_phased(r, limits, &mut |_| {})
+}
+
+/// Progress points inside [`read_request_phased`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The head is parsed and the body is about to be read.
+    Body,
+}
+
+/// Like [`read_request`], calling `on_phase` at each transition so a caller can arm a new
+/// deadline on the underlying transport.
+///
+/// # Errors
+///
+/// As [`read_request`].
+pub fn read_request_phased<R: BufRead>(
+    r: &mut R, limits: &HttpLimits, on_phase: &mut dyn FnMut(Phase),
+) -> Result<HttpRequest, HttpError> {
     let mut budget = limits.max_header_bytes;
     let request_line = read_line(r, &mut budget)?.ok_or(HttpError::Closed)?;
     let request_line =
@@ -245,6 +276,7 @@ pub fn read_request<R: BufRead>(r: &mut R, limits: &HttpLimits) -> Result<HttpRe
     match length {
         Some(n) if n > limits.max_body_bytes => return Err(HttpError::BodyTooLarge),
         Some(n) => {
+            on_phase(Phase::Body);
             let mut body = Vec::new();
             let got = r.take(n as u64).read_to_end(&mut body)?;
             if got != n {
@@ -320,32 +352,89 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// A socket wrapper enforcing one ABSOLUTE deadline across reads and writes.
+///
+/// Before every underlying operation the remaining time to the shared deadline is computed
+/// from a monotonic clock and installed as the socket timeout, so a peer trickling one byte
+/// per read still hits the deadline. The deadline is shared (`Rc<Cell>`) with the connection
+/// loop, which re-arms it per phase.
+struct DeadlineIo {
+    stream: TcpStream,
+    deadline: Rc<Cell<Instant>>,
+}
+
+impl DeadlineIo {
+    fn remaining(&self) -> io::Result<Duration> {
+        let left = self
+            .deadline
+            .get()
+            .saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "deadline exceeded"))
+        } else {
+            Ok(left)
+        }
+    }
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 fn serve_connection(
     stream: TcpStream, service: &OnvifService, limits: &HttpLimits, stop: &AtomicBool,
 ) {
     let Ok(local) = stream.local_addr() else {
         return;
     };
-    if stream.set_read_timeout(Some(limits.io_timeout)).is_err()
-        || stream.set_write_timeout(Some(limits.io_timeout)).is_err()
-    {
-        return;
-    }
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
-    let mut reader = BufReader::new(read_half);
-    let mut writer = stream;
+    let deadline = Rc::new(Cell::new(Instant::now()));
+    let mut reader = BufReader::new(DeadlineIo {
+        stream: read_half,
+        deadline: deadline.clone(),
+    });
+    let mut writer = DeadlineIo {
+        stream,
+        deadline: deadline.clone(),
+    };
 
     for served in 1..=limits.max_requests_per_connection {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let req = match read_request(&mut reader, limits) {
+        // Idle: wait for the first byte of the next request, bounded absolutely.
+        deadline.set(Instant::now() + limits.idle_timeout);
+        match reader.fill_buf() {
+            Ok(buffered) if !buffered.is_empty() => {}
+            _ => return,
+        }
+        // Head, then body, each with its own absolute deadline.
+        deadline.set(Instant::now() + limits.head_timeout);
+        let body_timeout = limits.body_timeout;
+        let req = match read_request_phased(&mut reader, limits, &mut |Phase::Body| {
+            deadline.set(Instant::now() + body_timeout);
+        }) {
             Ok(req) => req,
             Err(HttpError::Closed | HttpError::Io(_)) => return,
             Err(e) => {
                 // Framing is unreliable after a bad request: answer once and close.
+                deadline.set(Instant::now() + limits.write_timeout);
                 let _ = write_response(&mut writer, &error_response(e.status()), false);
                 return;
             }
@@ -360,6 +449,7 @@ fn serve_connection(
         let keep = req.keep_alive
             && served < limits.max_requests_per_connection
             && !stop.load(Ordering::SeqCst);
+        deadline.set(Instant::now() + limits.write_timeout);
         if write_response(&mut writer, &resp, keep).is_err() || !keep {
             return;
         }
@@ -400,7 +490,7 @@ impl HttpServer {
                     if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
                         active.fetch_sub(1, Ordering::SeqCst);
                         let mut stream = stream;
-                        let _ = stream.set_write_timeout(Some(limits.io_timeout));
+                        let _ = stream.set_write_timeout(Some(limits.write_timeout));
                         let _ = write_response(&mut stream, &error_response(503), false);
                         continue;
                     }
@@ -534,6 +624,28 @@ mod tests {
             parse(&vec![b'a'; 100_000]),
             Err(HttpError::HeaderTooLarge)
         ));
+    }
+
+    #[test]
+    fn deadline_io_times_out_reads_and_writes_once_expired() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let mut io = DeadlineIo {
+            stream: client,
+            deadline: Rc::new(Cell::new(Instant::now())),
+        };
+        let mut buf = [0_u8; 1];
+        assert_eq!(
+            io.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(io.write(b"x").unwrap_err().kind(), io::ErrorKind::TimedOut);
+        io.deadline.set(Instant::now() + Duration::from_millis(50));
+        let started = Instant::now();
+        // Nothing is ever sent: the read must give up at the deadline, not block.
+        assert!(io.read(&mut buf).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

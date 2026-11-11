@@ -202,21 +202,26 @@ impl DigestAuth {
         format!("{time:016x}{counter:016x}{}", self.mac(time, counter))
     }
 
-    /// Validate a nonce's MAC and age. Returns `Ok(true)` when valid, `Ok(false)` when
-    /// authentic but expired (the client should retry with `stale=true`).
-    fn check_nonce(&self, nonce: &str) -> Result<bool, AuthError> {
-        const BAD: AuthError = AuthError::Invalid;
-        let time = u64::from_str_radix(nonce.get(..16).ok_or(BAD)?, 16).map_err(|_| BAD)?;
-        let counter = u64::from_str_radix(nonce.get(16..32).ok_or(BAD)?, 16).map_err(|_| BAD)?;
-        let mac = nonce.get(32..).ok_or(BAD)?;
+    /// Whether `nonce` is one this process minted (MAC valid) and has not expired. A nonce
+    /// from before a restart, a forged one and an expired one are all simply not fresh.
+    fn nonce_fresh(&self, nonce: &str) -> bool {
+        let parse = |range: std::ops::Range<usize>| {
+            nonce
+                .get(range)
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+        };
+        let (Some(time), Some(counter), Some(mac)) = (parse(0..16), parse(16..32), nonce.get(32..))
+        else {
+            return false;
+        };
         if !ct_eq(mac.as_bytes(), self.mac(time, counter).as_bytes()) {
-            return Err(BAD);
+            return false;
         }
         let age = self
             .clock
             .now_unix()
             .saturating_sub(i64::try_from(time).unwrap_or(i64::MAX));
-        Ok((0..=NONCE_LIFETIME_SECONDS).contains(&age))
+        (0..=NONCE_LIFETIME_SECONDS).contains(&age)
     }
 
     /// A `WWW-Authenticate` header value with a fresh nonce.
@@ -234,7 +239,8 @@ impl DigestAuth {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Stale`] means the nonce expired: answer with `challenge(true)`. Every other
+    /// [`AuthError::Stale`] means the credentials were correct for a nonce that is expired,
+    /// unknown or forged: answer with `challenge(true)`. Every other
     /// variant is a plain failure.
     pub fn verify(&self, method: &str, target: &str, authorization: &str) -> Result<(), AuthError> {
         let p = parse_authorization(authorization)?;
@@ -249,7 +255,6 @@ impl DigestAuth {
             .ok()
             .filter(|_| p.nc.len() == 8)
             .ok_or(AuthError::Malformed("nc"))?;
-        let fresh = self.check_nonce(&p.nonce)?;
 
         let password = String::from_utf8_lossy(self.credentials.password());
         let ha1 = md5_hex(&format!(
@@ -271,7 +276,9 @@ impl DigestAuth {
         if !ok {
             return Err(AuthError::Invalid);
         }
-        if !fresh {
+        // Credentials are right but the nonce is expired, forged or from before a restart:
+        // RFC 7616 `stale=true`, so the client retries with a fresh nonce.
+        if !self.nonce_fresh(&p.nonce) {
             return Err(AuthError::Stale);
         }
 
@@ -395,13 +402,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forged_and_expired_nonces() {
+    fn forged_unknown_and_expired_nonces_are_stale_only_with_valid_credentials() {
         let (a, clock) = auth();
         let ch = a.challenge(false);
         let forged = ch.replace("nonce=\"0", "nonce=\"1");
         assert_eq!(
             a.verify("GET", URI, &respond("synthetic-pass", 1, &forged)),
+            Err(AuthError::Stale)
+        );
+        // Wrong password is a plain failure even on a bad nonce: no stale oracle.
+        assert_eq!(
+            a.verify("GET", URI, &respond("wrong", 1, &forged)),
             Err(AuthError::Invalid)
+        );
+        // A nonce minted by a previous process (different secret) is unknown here.
+        let old = DigestAuth::with_secret(
+            Credentials::new("operator", "synthetic-pass").unwrap(),
+            "tethercam",
+            Arc::new(ManualClock::new(1_750_000_000)),
+            [1; 32],
+        )
+        .challenge(false);
+        assert_eq!(
+            a.verify("GET", URI, &respond("synthetic-pass", 1, &old)),
+            Err(AuthError::Stale)
         );
         clock.advance(NONCE_LIFETIME_SECONDS + 1);
         assert_eq!(
