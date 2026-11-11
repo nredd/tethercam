@@ -10,4 +10,5 @@ All notable changes to this project are documented here. The format follows
 
 - PTP data types, `DeviceInfo` / `ObjectInfo` / `DevicePropDesc` datasets and operation, response, event and property code tables (`tethercam::ptp`)
 - PTP generic container codec (`tethercam::ptp`) with property tests and benchmarks
+- `Transport` trait, scriptable simulated camera (`transport::sim`) and PTP session engine (`ptp::session`) with stall and wedge recovery
 - Project scaffold: gate (`make all`), CI workflows, crates.io release workflow

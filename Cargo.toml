@@ -24,6 +24,7 @@ thiserror = "2"
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 
 [[bench]]
@@ -32,6 +33,10 @@ harness = false
 
 [[bench]]
 name = "ptp_dataset"
+harness = false
+
+[[bench]]
+name = "ptp_session"
 harness = false
 
 [lints.rust]
