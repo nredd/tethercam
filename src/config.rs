@@ -282,8 +282,17 @@ impl Config {
         let config: Self = serde_path_to_error::deserialize(deserializer).map_err(|error| {
             let key = error.path().to_string();
             if key.starts_with("credentials") || key == "." {
-                // Structural messages name only keys. Anything else may quote a value.
+                // "missing field" names a key from our own schema. "unknown field" echoes what
+                // the user typed, which under `credentials` may be a misplaced secret, so it
+                // is reported there without the name. Anything else may quote a value.
                 let message = error.inner().message();
+                if message.starts_with("unknown field") && key.starts_with("credentials") {
+                    // The path ends in the typed name too, so report the table only.
+                    return Error::Parse(
+                        "invalid `credentials`: unknown key; expected `username` and `password`"
+                            .into(),
+                    );
+                }
                 let structural =
                     message.starts_with("missing field") || message.starts_with("unknown field");
                 let detail = if structural { message } else { "[REDACTED]" };

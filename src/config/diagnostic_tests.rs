@@ -96,6 +96,15 @@ fn structural_errors_name_the_key_without_leaking_values() -> Result<(), Box<dyn
     let error = Config::load(&path).err().ok_or("expected parse error")?;
     assert!(error.to_string().contains("password"), "{error}");
 
+    // Unknown key under `credentials`: reported, but what the user typed is not echoed.
+    let misplaced = original.replace("[credentials]", "[credentials]\nsynthetic-secret = true");
+    assert_ne!(misplaced, original);
+    fs::write(&path, misplaced)?;
+    let error = Config::load(&path).err().ok_or("expected parse error")?;
+    let shown = format!("{error} {error:?}");
+    assert!(shown.contains("unknown key"), "{shown}");
+    assert!(!shown.contains("synthetic-secret"), "{shown}");
+
     // Wrong type for a credential: the value must not be echoed.
     let wrong_type = original
         .lines()
