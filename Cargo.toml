@@ -20,10 +20,14 @@ name = "tethercam"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.6.1", default-features = false }
 getrandom = "0.4.3"
+md-5 = { version = "0.10", default-features = false }
+roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
+sha1 = { version = "0.10", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2"
 toml = "1.2.1"
@@ -46,6 +50,10 @@ harness = false
 
 [[bench]]
 name = "ptp_session"
+harness = false
+
+[[bench]]
+name = "onvif_auth"
 harness = false
 
 [lints.rust]
