@@ -14,7 +14,7 @@ mod tests {
     use tethercam::onvif::auth::wsse::UsernameToken;
     use tethercam::onvif::http::{HttpLimits, HttpServer};
     use tethercam::onvif::model::example_model;
-    use tethercam::onvif::service::OnvifService;
+    use tethercam::onvif::service::{OnvifService, SnapshotError, SnapshotSource};
     use tethercam::onvif::time::{Clock, SystemClock, format_datetime};
 
     const USER: &str = "operator";
@@ -349,6 +349,66 @@ mod tests {
             "deadline not enforced: {took:?}"
         );
         assert_serves_new_client(server.local_addr());
+    }
+
+    #[test]
+    fn huge_configured_timeouts_do_not_overflow() {
+        let limits = HttpLimits {
+            idle_timeout: Duration::MAX,
+            head_timeout: Duration::MAX,
+            body_timeout: Duration::MAX,
+            write_timeout: Duration::MAX,
+            ..HttpLimits::default()
+        };
+        let server = start(limits);
+        assert_serves_new_client(server.local_addr());
+    }
+
+    #[derive(Debug)]
+    struct HugeSnapshot;
+
+    impl SnapshotSource for HugeSnapshot {
+        fn snapshot(&self, _token: &str) -> Result<Vec<u8>, SnapshotError> {
+            Ok(vec![0xAB; 64 * 1024 * 1024])
+        }
+    }
+
+    #[test]
+    fn client_that_never_reads_is_cut_at_the_write_deadline() {
+        // The response is far larger than any socket buffer, so the write blocks. The
+        // absolute write deadline must free the only slot.
+        let service = OnvifService::new(
+            example_model(),
+            Credentials::new(USER, PASS).unwrap(),
+            Arc::new(SystemClock),
+        )
+        .unwrap()
+        .with_snapshot_source(Arc::new(HugeSnapshot));
+        let server = HttpServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(service),
+            short_limits(),
+        )
+        .unwrap();
+        let mut s = connect(server.local_addr());
+        let target = "/onvif/snapshot/main";
+        s.write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .unwrap();
+        let challenge = read_reply(&mut s)
+            .headers
+            .lines()
+            .find_map(|l| l.strip_prefix("WWW-Authenticate: "))
+            .unwrap()
+            .to_owned();
+        let auth =
+            DigestAuth::client_response(USER, PASS, "GET", target, &challenge, 1, "c").unwrap();
+        s.write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\n\r\n").as_bytes(),
+        )
+        .unwrap();
+        // Never read. The held connection is the only slot.
+        assert_serves_new_client(server.local_addr());
+        drop(s);
     }
 
     #[test]

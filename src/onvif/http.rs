@@ -352,6 +352,16 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Longest deadline honoured; larger configured values are clamped so arming never overflows
+/// `Instant` (e.g. `Duration::MAX`).
+const MAX_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// A deadline `d` from now, clamped to [`MAX_DEADLINE`].
+fn after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d.min(MAX_DEADLINE)).unwrap_or(now)
+}
+
 /// A socket wrapper enforcing one ABSOLUTE deadline across reads and writes.
 ///
 /// Before every underlying operation the remaining time to the shared deadline is computed
@@ -419,22 +429,22 @@ fn serve_connection(
             return;
         }
         // Idle: wait for the first byte of the next request, bounded absolutely.
-        deadline.set(Instant::now() + limits.idle_timeout);
+        deadline.set(after(limits.idle_timeout));
         match reader.fill_buf() {
             Ok(buffered) if !buffered.is_empty() => {}
             _ => return,
         }
         // Head, then body, each with its own absolute deadline.
-        deadline.set(Instant::now() + limits.head_timeout);
+        deadline.set(after(limits.head_timeout));
         let body_timeout = limits.body_timeout;
         let req = match read_request_phased(&mut reader, limits, &mut |Phase::Body| {
-            deadline.set(Instant::now() + body_timeout);
+            deadline.set(after(body_timeout));
         }) {
             Ok(req) => req,
             Err(HttpError::Closed | HttpError::Io(_)) => return,
             Err(e) => {
                 // Framing is unreliable after a bad request: answer once and close.
-                deadline.set(Instant::now() + limits.write_timeout);
+                deadline.set(after(limits.write_timeout));
                 let _ = write_response(&mut writer, &error_response(e.status()), false);
                 return;
             }
@@ -449,7 +459,7 @@ fn serve_connection(
         let keep = req.keep_alive
             && served < limits.max_requests_per_connection
             && !stop.load(Ordering::SeqCst);
-        deadline.set(Instant::now() + limits.write_timeout);
+        deadline.set(after(limits.write_timeout));
         if write_response(&mut writer, &resp, keep).is_err() || !keep {
             return;
         }
@@ -489,9 +499,12 @@ impl HttpServer {
                     let Ok(stream) = stream else { continue };
                     if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
                         active.fetch_sub(1, Ordering::SeqCst);
-                        let mut stream = stream;
-                        let _ = stream.set_write_timeout(Some(limits.write_timeout));
-                        let _ = write_response(&mut stream, &error_response(503), false);
+                        // Same absolute write bound as any other response.
+                        let mut io = DeadlineIo {
+                            stream,
+                            deadline: Rc::new(Cell::new(after(limits.write_timeout))),
+                        };
+                        let _ = write_response(&mut io, &error_response(503), false);
                         continue;
                     }
                     let guard = ConnectionGuard(active.clone());

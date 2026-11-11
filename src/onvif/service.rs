@@ -12,6 +12,9 @@
 //! - A failed or stale HTTP Digest `Authorization` gets `401` plus a fresh challenge, with
 //!   `stale=true` when the credentials were right for an expired or unknown nonce (RFC 7616)
 //! - A failed WS-Security `UsernameToken` gets the `ter:NotAuthorized` fault with status 400
+//! - Pre-auth calls are answered even when credentials are supplied but wrong or stale: a
+//!   client with a skewed clock needs `GetSystemDateAndTime` to correct itself, and the reply
+//!   holds nothing but time and URLs
 //! - A request carrying both is judged by WS-Security alone; the `Authorization` header is
 //!   ignored, so a good token succeeds and a bad token fails with the SOAP fault
 //!

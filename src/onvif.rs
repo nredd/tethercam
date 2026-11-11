@@ -42,11 +42,17 @@
 //! `python-onvif-zeep`) makes these calls during setup: `GetServices` with a `GetCapabilities`
 //! fallback, `GetSystemDateAndTime`, `GetDeviceInformation`, `GetNetworkInterfaces` (the
 //! hardware address becomes the unique id), the Media `GetServiceCapabilities`, `GetProfiles`
-//! and `GetStreamUri`. UniFi Protect is closed source: its list is taken from the ONVIF Profile
-//! S / T mandatory media calls plus the common adoption probes (`GetScopes`, `GetHostname`,
-//! `GetVideoSources`, `GetVideoSourceConfigurations`, `GetVideoEncoderConfigurations`,
-//! `GetSnapshotUri`). Both are covered. Events, PTZ and Imaging services are not advertised, so
-//! well-behaved clients do not call them.
+//! and `GetStreamUri`. UniFi Protect is closed source. Its documented behavior (the
+//! [help article](https://help.ui.com/hc/en-us/articles/26301104828439-Third-Party-Cameras-in-UniFi-Protect))
+//! is: authentication `Digest & ws-username token`, a correct device clock (so
+//! `GetSystemDateAndTime` is pre-auth and accurate), discovery of the highest and lowest quality
+//! streams (so `GetProfiles` / `GetVideoEncoderConfigurations` must carry resolution and bitrate
+//! per profile; supply two profiles of different quality) and optional PTZ and audio (not
+//! advertised). Its call list is not published, so beyond that it is taken from the ONVIF
+//! Profile S / T mandatory media calls plus the common adoption probes (`GetScopes`,
+//! `GetHostname`, `GetVideoSources`, `GetVideoSourceConfigurations`,
+//! `GetVideoEncoderConfigurations`, `GetSnapshotUri`). Events, PTZ and Imaging services are not
+//! advertised, so well-behaved clients do not call them.
 //!
 //! # Security
 //!
