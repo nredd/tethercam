@@ -322,13 +322,14 @@ impl Fault {
         Self::sender(&["ter:NotAuthorized"], "Sender not authorized")
     }
 
-    /// `ter:OperationProhibited` / `ter:ActionNotSupported`: unknown operation.
+    /// `s:Receiver` / `ter:ActionNotSupported`: unknown or unimplemented operation.
     #[must_use]
     pub fn action_not_supported() -> Self {
-        Self::sender(
-            &["ter:OperationProhibited", "ter:ActionNotSupported"],
-            "Optional action not implemented",
-        )
+        Self {
+            code: FaultCode::Receiver,
+            subcodes: vec!["ter:ActionNotSupported"],
+            reason: "Optional action not implemented".to_owned(),
+        }
     }
 
     /// `ter:InvalidArgVal` with a more specific subcode, e.g. `ter:NoProfile`.
@@ -532,7 +533,7 @@ mod tests {
     #[test]
     fn fault_roundtrips_through_the_parser_shape() {
         let xml = Fault::action_not_supported().to_envelope();
-        assert!(xml.contains("<s:Subcode><s:Value>ter:OperationProhibited</s:Value><s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode></s:Subcode>"));
+        assert!(xml.contains("<s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode></s:Code>"));
         assert!(roxmltree::Document::parse(&xml).is_ok());
         assert_eq!(Fault::not_authorized().http_status(), 400);
         assert_eq!(Fault::internal().http_status(), 500);
@@ -547,6 +548,32 @@ mod tests {
         #[test]
         fn parse_never_panics_on_xmlish_text(s in "[<>/a-zA-Z0-9 =\"'&;!?:\\[\\]-]{0,400}") {
             let _ = Envelope::parse(s.as_bytes(), &LIMITS);
+        }
+
+        #[test]
+        fn excessive_depth_is_rejected(depth in 17usize..400) {
+            let xml = wrap(&format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth)));
+            prop_assert!(Envelope::parse(xml.as_bytes(), &LIMITS).is_err());
+        }
+
+        #[test]
+        fn entity_declarations_are_rejected(name in "[a-z]{1,8}", value in "[a-z0-9 ]{0,20}", external in proptest::bool::ANY) {
+            let decl = if external {
+                format!(r#"<!ENTITY {name} SYSTEM "file:///{value}">"#)
+            } else {
+                format!(r#"<!ENTITY {name} "{value}">"#)
+            };
+            let xml = format!(
+                r#"<?xml version="1.0"?><!DOCTYPE d [{decl}]><s:Envelope xmlns:s="{NS_SOAP12}"><s:Body><a>&{name};</a></s:Body></s:Envelope>"#
+            );
+            prop_assert!(Envelope::parse(xml.as_bytes(), &LIMITS).is_err());
+        }
+
+        #[test]
+        fn oversized_inputs_are_rejected(extra in 1usize..4096) {
+            let attr = "x".repeat(LIMITS.max_bytes + extra);
+            let xml = wrap(&format!(r#"<a v="{attr}"/>"#));
+            prop_assert!(matches!(Envelope::parse(xml.as_bytes(), &LIMITS), Err(SoapError::TooLarge(_))));
         }
 
         #[test]

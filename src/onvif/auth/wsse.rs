@@ -213,7 +213,9 @@ impl WsseVerifier {
         let created_at =
             parse_datetime(created).map_err(|_| AuthError::Malformed("bad Created"))?;
         let now = self.clock.now_unix();
-        if created_at.abs_diff(now) > self.config.skew_seconds.unsigned_abs() {
+        // A negative configured window is treated as zero, never as its absolute value.
+        let skew = self.config.skew_seconds.max(0);
+        if created_at.abs_diff(now) > skew.unsigned_abs() {
             return Err(AuthError::Stale);
         }
         let supplied = STANDARD
@@ -229,7 +231,7 @@ impl WsseVerifier {
         }
 
         // Only authentic tokens enter the cache, so unauthenticated traffic cannot fill it.
-        let expiry = created_at.saturating_add(self.config.skew_seconds);
+        let expiry = created_at.saturating_add(skew);
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.get(&nonce).is_some_and(|&until| until >= now) {
             return Err(AuthError::Replay);
@@ -354,6 +356,23 @@ mod tests {
         // The first nonce expired, and its Created is now stale anyway.
         assert_eq!(
             v.verify(&token("synthetic-pass", b"nonce-001", NOW)),
+            Err(AuthError::Stale)
+        );
+    }
+
+    #[test]
+    fn negative_skew_is_zero_not_absolute() {
+        let (v, _) = verifier(WsseConfig {
+            skew_seconds: -300,
+            max_nonces: 8,
+        });
+        assert_eq!(v.verify(&token("synthetic-pass", NONCE, NOW)), Ok(()));
+        assert_eq!(
+            v.verify(&token("synthetic-pass", NONCE, NOW)),
+            Err(AuthError::Replay)
+        );
+        assert_eq!(
+            v.verify(&token("synthetic-pass", b"nonce-002", NOW - 1)),
             Err(AuthError::Stale)
         );
     }

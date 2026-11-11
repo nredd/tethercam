@@ -159,6 +159,17 @@ mod tests {
     }
 
     #[test]
+    fn unauthenticated_get_services_omits_capability_details() {
+        let rig = rig();
+        let req = authed_request("device_get_services_with_capabilities", "");
+        let resp = post(&rig, "/onvif/device_service", &req);
+        assert_eq!(resp.status, 200);
+        let body = text(&resp);
+        assert!(body.contains("device_service") && body.contains("media_service"));
+        assert!(!body.contains("MaximumNumberOfProfiles") && !body.contains("SnapshotUri"));
+    }
+
+    #[test]
     fn missing_security_header_gets_challenge() {
         let rig = rig();
         let req = authed_request("device_get_device_information", "");
@@ -315,7 +326,7 @@ mod tests {
         let body = r#"<?xml version="1.0"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"><e:Header>{{SECURITY}}</e:Header><e:Body><x:Reboot xmlns:x="http://www.onvif.org/ver10/device/wsdl"/></e:Body></e:Envelope>"#
         .replace("{{SECURITY}}", &security(PASS, b"nonce-unknown-01", NOW));
         let resp = post(&rig, "/onvif/device_service", &body);
-        assert_eq!(resp.status, 400);
+        assert_eq!(resp.status, 500);
         assert!(text(&resp).contains("ter:ActionNotSupported"));
     }
 

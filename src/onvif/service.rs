@@ -11,7 +11,7 @@
 //! The three pre-auth calls are the ones the ONVIF Core Specification (access control, pre-auth
 //! access class) requires a device to answer without credentials: clients need the time to
 //! build a valid `Created`, and the service URLs to find the other endpoints. They expose
-//! nothing but the time and URLs.
+//! nothing but the time and URLs; `GetServices` ignores `IncludeCapability` without credentials.
 //!
 //! References:
 //! - [ONVIF Core Specification](https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf)
@@ -117,6 +117,8 @@ pub(crate) struct Context<'a> {
     pub(crate) local: SocketAddr,
     pub(crate) now: i64,
     pub(crate) snapshot: bool,
+    /// Whether the request carried valid credentials. Pre-auth calls reveal less without.
+    pub(crate) authenticated: bool,
 }
 
 impl Context<'_> {
@@ -304,8 +306,10 @@ impl OnvifService {
             Err(_) => return ServiceResponse::fault(&Fault::malformed()),
         };
 
+        let verdict = self.authenticate(&env, req);
+        let authenticated = matches!(verdict, Verdict::Granted);
         if !is_pre_auth(endpoint, &env.operation) {
-            match self.authenticate(&env, req) {
+            match verdict {
                 Verdict::Granted => {}
                 Verdict::Unauthenticated => return self.challenge(false),
                 Verdict::Stale => return self.challenge(true),
@@ -318,6 +322,7 @@ impl OnvifService {
             local: req.local,
             now: self.clock.now_unix(),
             snapshot: self.snapshot.is_some(),
+            authenticated,
         };
         let result = match endpoint {
             Endpoint::Device => device::handle(&env.operation, &ctx),

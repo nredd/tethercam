@@ -108,7 +108,9 @@ fn device_capabilities_xml() -> &'static str {
 }
 
 fn services(op: &Element, ctx: &Context<'_>) -> String {
-    let include = matches!(op.child_text("IncludeCapability"), Some("true" | "1"));
+    // Capability details beyond the URLs are only for authenticated callers.
+    let include =
+        ctx.authenticated && matches!(op.child_text("IncludeCapability"), Some("true" | "1"));
     let entry = |ns: &str, url: &str, caps: &str| {
         format!(
             "<tds:Service><tds:Namespace>{ns}</tds:Namespace><tds:XAddr>{}</tds:XAddr>{}\
