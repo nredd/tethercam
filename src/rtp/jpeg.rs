@@ -14,7 +14,11 @@
 //! `[Y, Cb, Cr]` when all three differ. Any other mapping is rejected.
 //!
 //! Rejected with [`JpegError`]: progressive and non-baseline frames, 12-bit or 16-bit tables,
-//! non-YCbCr component layouts, sampling other than 4:2:0 / 4:2:2, dimensions over 2040.
+//! non-YCbCr component layouts, scans that are not one interleaved Y/Cb/Cr scan, sampling other than 4:2:0 / 4:2:2, dimensions over 2040.
+//!
+//! RFC 2435 receivers assume the standard Huffman tables. `DHT` segments are not inspected,
+//! so a frame with optimized tables is packetized as-is and will not decode correctly
+//! downstream. NOTE(redd): validate `DHT` against the Annex K tables if a source needs it.
 //!
 //! References:
 //! - [RTP payload format for JPEG, RFC 2435](https://www.rfc-editor.org/rfc/rfc2435)
@@ -81,6 +85,9 @@ pub enum JpegError {
     /// Width or height is over 2040.
     #[error("JPEG dimension {0} exceeds 2040")]
     DimensionTooLarge(u16),
+    /// The scan is not a single interleaved YCbCr baseline scan matching the frame components.
+    #[error("unsupported scan layout")]
+    UnsupportedScan,
     /// A second SOF marker.
     #[error("duplicate SOF marker")]
     DuplicateFrame,
@@ -164,6 +171,7 @@ impl<'a> JpegInfo<'a> {
         let mut quant: [Option<&'a [u8]>; 4] = [None; 4];
         let mut frame: Option<Frame> = None;
         let mut restart: u16 = 0;
+        let sos;
         loop {
             if data.get(pos) != Some(&0xff) {
                 return Err(JpegError::BadMarker);
@@ -206,11 +214,15 @@ impl<'a> JpegInfo<'a> {
                     restart =
                         u16::from_be_bytes(*body.first_chunk::<2>().ok_or(JpegError::Malformed)?);
                 }
-                0xda => break,
+                0xda => {
+                    sos = body;
+                    break;
+                }
                 _ => {}
             }
         }
         let frame = frame.ok_or(JpegError::MissingFrame)?;
+        frame.check_scan(sos)?;
         let (ids, table_count) = frame.table_ids()?;
         let mut tables: [&[u8]; 3] = [&[]; 3];
         for (slot, &id) in tables.iter_mut().zip(ids.iter().take(table_count)) {
@@ -248,9 +260,39 @@ struct Frame {
     sampling: Sampling,
     /// Quantization table id of Y, Cb, Cr.
     table_of: [u8; 3],
+    /// Component identifiers of Y, Cb, Cr.
+    component_ids: [u8; 3],
 }
 
 impl Frame {
+    /// Require one interleaved scan over all three components with baseline parameters.
+    fn check_scan(self, sos: &[u8]) -> Result<(), JpegError> {
+        let [
+            count,
+            c0,
+            _,
+            c1,
+            _,
+            c2,
+            _,
+            spectral_start,
+            spectral_end,
+            approx,
+            ..,
+        ] = *sos
+        else {
+            return Err(JpegError::Malformed);
+        };
+        if count == 3
+            && [c0, c1, c2] == self.component_ids
+            && (spectral_start, spectral_end, approx) == (0, 63, 0)
+        {
+            Ok(())
+        } else {
+            Err(JpegError::UnsupportedScan)
+        }
+    }
+
     /// Table ids to send and how many: `[Y, C]` when Cb and Cr share one, else all three.
     fn table_ids(self) -> Result<([u8; 3], usize), JpegError> {
         let [y, cb, cr] = self.table_of;
@@ -305,23 +347,24 @@ fn parse_sof(body: &[u8]) -> Result<Frame, JpegError> {
         .as_chunks::<3>()
         .0
         .iter()
-        .map(|&[_, sampling, table]| (sampling, table));
+        .map(|&[id, sampling, table]| (id, sampling, table));
     let mut next = || components.next().ok_or(JpegError::Malformed);
-    let (y_sampling, y_table) = next()?;
+    let (y_id, y_sampling, y_table) = next()?;
     let chroma = [next()?, next()?];
     let sampling = match y_sampling {
         0x22 => Sampling::Yuv420,
         0x21 => Sampling::Yuv422,
         _ => return Err(JpegError::UnsupportedSampling),
     };
-    if chroma.iter().any(|&(sampling, _)| sampling != 0x11) {
+    if chroma.iter().any(|&(_, sampling, _)| sampling != 0x11) {
         return Err(JpegError::UnsupportedSampling);
     }
     Ok(Frame {
         width,
         height,
         sampling,
-        table_of: [y_table, chroma[0].1, chroma[1].1],
+        table_of: [y_table, chroma[0].2, chroma[1].2],
+        component_ids: [y_id, chroma[0].0, chroma[1].0],
     })
 }
 
@@ -715,6 +758,14 @@ mod tests {
             }))
             .is_ok()
         );
+
+        let sos = jpeg.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        let mut swapped = jpeg.clone();
+        swapped[sos + 5] = 9;
+        assert_eq!(JpegInfo::parse(&swapped), Err(JpegError::UnsupportedScan));
+        let mut spectral = jpeg.clone();
+        spectral[sos + 12] = 30;
+        assert_eq!(JpegInfo::parse(&spectral), Err(JpegError::UnsupportedScan));
 
         // 16-bit table, grayscale, missing pieces.
         let dqt = jpeg.windows(2).position(|w| w == [0xff, 0xdb]).unwrap();
