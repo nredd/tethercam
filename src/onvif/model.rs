@@ -2,6 +2,10 @@
 //!
 //! Nothing in the `onvif` module tree knows about any particular camera: the supervisor builds
 //! these values from whatever the connected body reports and hands them in.
+//!
+//! References:
+//! - [ONVIF Media Service Specification](https://www.onvif.org/specs/srv/media/ONVIF-Media-Service-Spec.pdf)
+//! - [ONVIF Core Specification](https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf)
 
 use thiserror::Error;
 

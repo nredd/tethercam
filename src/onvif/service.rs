@@ -7,6 +7,15 @@
 //! `GetServices` on the Device service. Everything else needs WS-Security or HTTP Digest.
 //! A request with no credentials at all gets `401` with a Digest challenge; a request whose
 //! credentials are present but wrong gets the ONVIF `ter:NotAuthorized` fault.
+//!
+//! The three pre-auth calls are the ones the ONVIF Core Specification (access control, pre-auth
+//! access class) requires a device to answer without credentials: clients need the time to
+//! build a valid `Created`, and the service URLs to find the other endpoints. They expose
+//! nothing but the time and URLs.
+//!
+//! References:
+//! - [ONVIF Core Specification](https://www.onvif.org/specs/core/ONVIF-Core-Specification.pdf)
+//! - [WS-Security UsernameToken Profile 1.1](https://docs.oasis-open.org/wss/v1.1/wss-v1.1-spec-os-UsernameTokenProfile.pdf)
 
 use std::net::SocketAddr;
 use std::sync::Arc;

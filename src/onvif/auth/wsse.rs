@@ -8,6 +8,10 @@
 //!   failing closed when full
 //! - constant-time comparison of username and digest
 //! - `PasswordText` is refused
+//!
+//! References:
+//! - [WS-Security UsernameToken Profile 1.1](https://docs.oasis-open.org/wss/v1.1/wss-v1.1-spec-os-UsernameTokenProfile.pdf)
+//! - [WS-Security 1.1](https://docs.oasis-open.org/wss/v1.1/wss-v1.1-spec-os-SOAPMessageSecurity.pdf)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};

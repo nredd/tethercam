@@ -6,6 +6,10 @@
 //! bounds replay of a captured `Authorization` header; the table is bounded and fails closed.
 //!
 //! `qop` is mandatory: the RFC 2069 legacy form with no `cnonce` is refused.
+//!
+//! References:
+//! - [HTTP Digest, RFC 7616](https://www.rfc-editor.org/rfc/rfc7616)
+//! - [HTTP Digest (MD5), RFC 2617](https://www.rfc-editor.org/rfc/rfc2617)
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -136,7 +140,6 @@ fn md5_hex(data: &str) -> String {
 }
 
 /// Issues Digest challenges and verifies responses.
-#[derive(Debug)]
 pub struct DigestAuth {
     credentials: Credentials,
     realm: String,
@@ -145,6 +148,15 @@ pub struct DigestAuth {
     counter: AtomicU64,
     /// Nonce to last accepted `nc`.
     nonce_counts: Mutex<HashMap<String, u32>>,
+}
+
+impl std::fmt::Debug for DigestAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestAuth")
+            .field("realm", &self.realm)
+            .field("secret", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl DigestAuth {
@@ -397,6 +409,15 @@ mod tests {
             Err(AuthError::Stale)
         );
         assert!(a.challenge(true).contains("stale=true"));
+    }
+
+    #[test]
+    fn debug_hides_secret_and_credentials() {
+        let (a, _) = auth();
+        let shown = format!("{a:?}");
+        assert!(shown.contains("redacted"));
+        assert!(!shown.contains("synthetic-pass"));
+        assert!(!shown.contains("[7, 7"));
     }
 
     #[test]

@@ -76,6 +76,17 @@ pub enum HttpError {
     LengthRequired,
 }
 
+/// Why the server could not start.
+#[derive(Debug, Error)]
+pub enum ServerError {
+    /// Binding or inspecting the listener failed.
+    #[error("bind failed: {0}")]
+    Bind(#[source] io::Error),
+    /// The accept thread could not be spawned.
+    #[error("thread spawn failed: {0}")]
+    Spawn(#[source] io::Error),
+}
+
 impl HttpError {
     fn status(&self) -> u16 {
         match self {
@@ -267,10 +278,10 @@ fn reason(status: u16) -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns the underlying write error.
+/// Returns [`HttpError::Io`] with the underlying write error.
 pub fn write_response<W: Write>(
     w: &mut W, resp: &ServiceResponse, keep_alive: bool,
-) -> io::Result<()> {
+) -> Result<(), HttpError> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n",
         resp.status,
@@ -287,7 +298,8 @@ pub fn write_response<W: Write>(
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(&resp.body)?;
-    w.flush()
+    w.flush()?;
+    Ok(())
 }
 
 fn error_response(status: u16) -> ServiceResponse {
@@ -368,12 +380,12 @@ impl HttpServer {
     ///
     /// # Errors
     ///
-    /// Returns the bind or thread-spawn error.
+    /// Returns [`ServerError`] when binding or starting the accept thread fails.
     pub fn start(
         addr: SocketAddr, service: Arc<OnvifService>, limits: HttpLimits,
-    ) -> io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        let local_addr = listener.local_addr()?;
+    ) -> Result<Self, ServerError> {
+        let listener = TcpListener::bind(addr).map_err(ServerError::Bind)?;
+        let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let accept_stop = stop.clone();
@@ -403,7 +415,8 @@ impl HttpServer {
                             });
                     drop(spawned);
                 }
-            })?;
+            })
+            .map_err(ServerError::Spawn)?;
         Ok(Self {
             local_addr,
             stop,

@@ -2,6 +2,10 @@
 //!
 //! All arithmetic is on `i64` seconds since the Unix epoch and proleptic Gregorian civil dates
 //! (Howard Hinnant's `days_from_civil` / `civil_from_days`).
+//!
+//! References:
+//! - [XML Schema `dateTime`](https://www.w3.org/TR/xmlschema-2/#dateTime)
+//! - [Civil date algorithms](https://howardhinnant.github.io/date_algorithms.html)
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicI64, Ordering};
