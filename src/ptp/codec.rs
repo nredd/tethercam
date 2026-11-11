@@ -146,7 +146,8 @@ impl<'a> Reader<'a> {
             .map_err(|_| CodecError::InvalidUtf16)
     }
 
-    /// Read a `u32`-counted array whose elements are `elem_size` bytes at minimum.
+    /// Read a `u32`-counted array whose elements are `elem_size` bytes at minimum (`0` is
+    /// treated as `1`).
     ///
     /// The count is checked against the bytes left before anything is allocated, so a hostile
     /// count cannot force a large allocation.
@@ -159,7 +160,7 @@ impl<'a> Reader<'a> {
     ) -> Result<Vec<T>, CodecError> {
         let count = self.u32()?;
         let count = usize::try_from(count).unwrap_or(usize::MAX);
-        let needed = count.saturating_mul(elem_size);
+        let needed = count.saturating_mul(elem_size.max(1));
         if needed > self.buf.len() {
             return Err(CodecError::Truncated {
                 needed,
@@ -354,6 +355,15 @@ mod tests {
         let mut w = Writer::new();
         w.array(&items, |w, v| w.u16(*v)).unwrap();
         assert_eq!(w.as_bytes(), wire);
+    }
+
+    #[test]
+    fn zero_elem_size_cannot_bypass_the_bound() {
+        let wire = [0xFF, 0xFF, 0xFF, 0xFF];
+        assert!(matches!(
+            Reader::new(&wire).array(0, Reader::u16),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 
     #[test]

@@ -46,6 +46,13 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 | `supervisor` | Camera hot-plug, reconnect with backoff, session hygiene, battery and power telemetry, on-demand start and stop of the capture pipeline |
 | `service` | Install as a `launchd` agent or `systemd` unit |
 
+The `ptp` payload layer (`src/ptp/`) sits above the container codec:
+
+- `Reader` / `Writer`: bounds-checked little-endian primitives, PTP strings (count-prefixed UTF-16LE, NUL-terminated, at most 254 characters) and `u32`-counted arrays
+- `DataType` / `Value`: every standard datatype code (scalars to 128 bits, arrays, strings), decoded and encoded by code
+- `DeviceInfo`, `ObjectInfo`, `DevicePropDesc`: dataset decode and encode. Decoders are total (typed `CodecError`, never a panic) and ignore trailing padding
+- `OperationCode`, `ResponseCode`, `EventCode`, `DevicePropCode`: `u16` newtypes with named constants. Vendor codes pass through; `Display` names standard codes and prints the rest as hex
+
 ## Streams
 
 The camera produces two things over USB:
