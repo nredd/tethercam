@@ -4,6 +4,10 @@
 //! - [TOML](https://toml.io/)
 
 #[cfg(test)]
+mod concurrency_tests;
+#[cfg(test)]
+mod diagnostic_tests;
+#[cfg(test)]
 mod tests;
 
 use std::fmt;
@@ -257,8 +261,16 @@ impl Config {
         let mut contents = Zeroizing::new(String::new());
         file.read_to_string(&mut contents)?;
         // Do not return TOML's source excerpt: it can include credentials.
-        let config: Self = toml::from_str(&contents)
-            .map_err(|_: toml::de::Error| Error::Parse("invalid TOML or unknown key".into()))?;
+        let deserializer = toml::Deserializer::parse(&contents)
+            .map_err(|_| Error::Parse("invalid TOML".into()))?;
+        let config: Self = serde_path_to_error::deserialize(deserializer).map_err(|error| {
+            let key = error.path().to_string();
+            if key.starts_with("credentials") || key == "." {
+                Error::Parse(format!("invalid `{key}`: [REDACTED]"))
+            } else {
+                Error::Parse(format!("invalid `{key}`: {}", error.inner().message()))
+            }
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -287,6 +299,9 @@ impl Config {
     /// Returns an error if validation or file creation fails.
     pub fn create(&self, path: &Path) -> Result<(), Error> {
         self.validate()?;
+        if !cfg!(unix) {
+            return Err(Error::Permissions);
+        }
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -320,19 +335,22 @@ fn check_permissions(_file: &File) -> Result<(), Error> {
 /// # Errors
 /// Returns an error if the required environment variable is absent or not absolute.
 pub fn default_path() -> Result<PathBuf, Error> {
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|p| p.join("Library/Application Support"));
-    #[cfg(not(target_os = "macos"))]
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|s| Path::new(s).is_absolute())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|p| p.join(".config"))
-        });
+    resolve_path(
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        cfg!(target_os = "macos"),
+    )
+}
+
+fn resolve_path(
+    home: Option<PathBuf>, xdg: Option<PathBuf>, macos: bool,
+) -> Result<PathBuf, Error> {
+    let base = if macos {
+        home.map(|p| p.join("Library/Application Support"))
+    } else {
+        xdg.filter(|p| p.is_absolute())
+            .or_else(|| home.map(|p| p.join(".config")))
+    };
     base.filter(|p| p.is_absolute())
         .map(|p| p.join("tethercam/config.toml"))
         .ok_or(Error::ConfigDirectory)
