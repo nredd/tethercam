@@ -1,0 +1,8 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+too-many-arguments-threshold = 8
+# Product names that are not code identifiers.
+doc-valid-idents = ["UniFi", "ONVIF", "WebRTC", "macOS", "VideoToolbox", ".."]

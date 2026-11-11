@@ -1,0 +1,8 @@
+/target
+*.log
+*.mjpeg
+*.mp4
+*.jpg
+.DS_Store
+# Local runtime config holds credentials. Never commit it.
+/tethercam.toml

@@ -1,0 +1,62 @@
+[package]
+name = "tethercam"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.90"
+description = "Turn a USB-tethered Sony Alpha camera into an ONVIF/RTSP network camera for UniFi Protect and Home Assistant"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nredd/tethercam"
+readme = "README.md"
+keywords = ["camera", "ptp", "onvif", "rtsp", "sony"]
+categories = ["multimedia::video", "hardware-support", "network-programming"]
+exclude = [".github/", "scripts/", "docs/"]
+
+[lib]
+name = "tethercam"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tethercam"
+path = "src/main.rs"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "ptp_container"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.bench]
+debug = "line-tables-only"
