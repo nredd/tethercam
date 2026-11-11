@@ -8,5 +8,6 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- PTP data types, `DeviceInfo` / `ObjectInfo` / `DevicePropDesc` datasets and operation, response, event and property code tables (`tethercam::ptp`)
 - PTP generic container codec (`tethercam::ptp`) with property tests and benchmarks
 - Project scaffold: gate (`make all`), CI workflows, crates.io release workflow
