@@ -27,7 +27,9 @@
 //! with [`SessionError::DeadlineExceeded`] and takes the normal failure path: clear halts, then
 //! reset. [`Session::transaction_within`] overrides the deadline per call for large objects.
 //! [`Session::with_clock`] injects a fake clock for deterministic tests. The deadline covers
-//! only the exchange: a cancelled or abandoned future is not bounded by it.
+//! only the exchange, and it is checked before each transfer: an exchange whose final transfer
+//! completes is a success even if it ran over, because the camera has already acted on it. A
+//! missed deadline is never retried, including in `open`. A cancelled or abandoned future is not bounded by it.
 //!
 //! Dropping a [`Session`] cannot send `CloseSession` (drop is not async), and cancelling a
 //! [`Session::scoped`] future skips its close. Always run the future to completion. If a
@@ -299,8 +301,8 @@ impl<T: Transport> Session<T> {
             && !matches!(err, SessionError::Transport(TransportError::Disconnected))
         {
             // The camera may have accepted `OpenSession` before the failure (e.g. a malformed
-            // response), and nothing else would close that session. Reset is best effort.
-            let _ = self.reset_device().await;
+            // response), and nothing else would close that session. Recovery is best effort.
+            let _ = self.clear_halts_then_reset().await;
         }
         result
     }
@@ -324,14 +326,9 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         self.clear_halts_then_reset().await?;
-        self.try_open().await.map_err(|err| {
-            if matches!(err, SessionError::DeadlineExceeded(_)) {
-                return err;
-            }
-            match recoverable(err) {
-                Ok(cause) => SessionError::Unrecoverable(cause),
-                Err(other) => other,
-            }
+        self.try_open().await.map_err(|err| match recoverable(err) {
+            Ok(cause) => SessionError::Unrecoverable(cause),
+            Err(other) => other,
         })
     }
 
@@ -523,7 +520,8 @@ impl<T: Transport> Session<T> {
                 Err(TransportError::Disconnected.into())
             }
             Err(err @ SessionError::DeadlineExceeded(_)) => {
-                self.clear_halts_then_reset().await?;
+                // Best effort: the deadline is the error the caller needs to see.
+                let _ = self.clear_halts_then_reset().await;
                 Err(err)
             }
             Err(_) => self.clear_halts_then_reset().await,
@@ -801,14 +799,14 @@ impl<T: Transport> Session<T> {
     }
 }
 
-/// Returns the cause of a recoverable failure (stall, timeout or missed deadline), and anything else (a
-/// disconnect, a malformed container, a non-OK response) as the fatal error it is.
+/// Returns the cause of a recoverable failure (stall or timeout), and anything else (a
+/// disconnect, a malformed container, a missed deadline, a non-OK response) as the fatal error
+/// it is.
 fn recoverable(err: SessionError) -> Result<TransportError, SessionError> {
     match err {
         SessionError::Transport(cause @ (TransportError::Stall | TransportError::Timeout)) => {
             Ok(cause)
         }
-        SessionError::DeadlineExceeded(_) => Ok(TransportError::Timeout),
         other => Err(other),
     }
 }
@@ -988,6 +986,7 @@ mod tests {
     struct FlakyClear {
         inner: SimCamera,
         failures: usize,
+        reset_fails: bool,
     }
 
     impl Transport for FlakyClear {
@@ -1019,10 +1018,11 @@ mod tests {
             self.inner.clear_halt(endpoint, timeout).await
         }
 
-        fn reset(
-            &mut self, timeout: Duration,
-        ) -> impl Future<Output = Result<(), TransportError>> + Send {
-            self.inner.reset(timeout)
+        async fn reset(&mut self, timeout: Duration) -> Result<(), TransportError> {
+            if self.reset_fails {
+                return Err(TransportError::Other("reset".into()));
+            }
+            self.inner.reset(timeout).await
         }
     }
 
@@ -1222,6 +1222,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_open_is_not_retried() {
+        let mut s = trickle_session();
+        s.config.transaction_timeout = Duration::from_secs(3);
+        s.transport.active = true;
+        assert_eq!(
+            s.open().await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(3)))
+        );
+        let opens = s
+            .transport()
+            .inner
+            .commands()
+            .iter()
+            .filter(|c| c.code == code::OPEN_SESSION)
+            .count();
+        assert_eq!(opens, 1, "a fresh budget must not turn expiry into success");
+        assert_eq!(s.transport().inner.reset_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_keeps_the_deadline_error_when_reset_fails() {
+        let mut s = Session::new(
+            FlakyClear {
+                inner: SimCamera::new(),
+                failures: 0,
+                reset_fails: false,
+            },
+            SessionConfig::default(),
+        );
+        s.open().await.unwrap();
+        s.transport.reset_fails = true;
+        s.config.transaction_timeout = Duration::ZERO;
+        assert_eq!(
+            s.close().await,
+            Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert!(!s.is_open());
+    }
+
+    #[tokio::test]
     async fn per_call_override_allows_a_slow_large_transfer() {
         let mut s = trickle_session();
         s.open().await.unwrap();
@@ -1252,6 +1292,7 @@ mod tests {
             FlakyClear {
                 inner: SimCamera::new(),
                 failures: 1,
+                reset_fails: false,
             },
             SessionConfig::default(),
         );
