@@ -19,6 +19,16 @@
 //!   not retried, since it may not be idempotent. A non-OK response is not a failure of the
 //!   pipe and needs no recovery
 //!
+//! Timeouts: every transfer gets [`SessionConfig::timeout`], and the whole exchange (command,
+//! data phases and response) must also finish within [`SessionConfig::transaction_timeout`],
+//! measured on a monotonic clock ([`Instant`], no async runtime needed). Each transfer is
+//! given `min(timeout, time left)`, so a camera that trickles bytes just inside the
+//! per-transfer timeout cannot hold a transaction open forever. At the deadline the call fails
+//! with [`SessionError::DeadlineExceeded`] and takes the normal failure path: clear halts, then
+//! reset. [`Session::transaction_within`] overrides the deadline per call for large objects.
+//! [`Session::with_clock`] injects a fake clock for deterministic tests. The deadline covers
+//! only the exchange: a cancelled or abandoned future is not bounded by it.
+//!
 //! Dropping a [`Session`] cannot send `CloseSession` (drop is not async), and cancelling a
 //! [`Session::scoped`] future skips its close. Always run the future to completion. If a
 //! transaction future is cancelled after its command was sent, the handle refuses further
@@ -30,7 +40,7 @@
 //! - USB Still Image Capture Device Definition 1.0, sections 5-7
 //! - PTP, ISO 15740, transaction and session semantics
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -110,6 +120,10 @@ pub enum SessionError {
     /// the camera's transfer boundaries are arbitrary, so it fails rather than guess.
     #[error("container announces an unknown length")]
     UnsupportedLength,
+    /// The transaction did not finish within its deadline, even though each transfer may
+    /// have made progress within its own timeout.
+    #[error("transaction exceeded its deadline of '{0:?}'")]
+    DeadlineExceeded(Duration),
     /// A data phase announced more bytes than the configured limit.
     #[error("data phase of '{announced}' bytes exceeds the limit of '{limit}'")]
     DataTooLarge {
@@ -145,6 +159,9 @@ pub struct SessionConfig {
     pub max_data_len: usize,
     /// Session id sent in `OpenSession`.
     pub session_id: u32,
+    /// Deadline for a whole transaction (or `OpenSession` / `CloseSession`), from the first
+    /// byte sent to the last byte of the response. See the module docs.
+    pub transaction_timeout: Duration,
 }
 
 impl Default for SessionConfig {
@@ -155,6 +172,7 @@ impl Default for SessionConfig {
             transfer_size: 16 * 1024,
             max_data_len: 64 * 1024 * 1024,
             session_id: 1,
+            transaction_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -205,6 +223,15 @@ pub struct Session<T> {
     buffer: Vec<u8>,
     /// Bytes read past the end of the container being assembled (e.g. a coalesced response).
     leftover: Vec<u8>,
+    clock: fn() -> Instant,
+    deadline: Option<Deadline>,
+}
+
+/// The deadline of the exchange in progress.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    at: Option<Instant>,
+    limit: Duration,
 }
 
 impl<T: Transport> Session<T> {
@@ -221,7 +248,17 @@ impl<T: Transport> Session<T> {
             in_flight: false,
             buffer,
             leftover: Vec::new(),
+            clock: Instant::now,
+            deadline: None,
         }
+    }
+
+    /// Replaces the monotonic clock used for transaction deadlines. Meant for deterministic
+    /// tests; the default is [`Instant::now`].
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> Instant) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Borrows the transport, e.g. to inspect a simulated camera.
@@ -342,13 +379,28 @@ impl<T: Transport> Session<T> {
     pub async fn transaction(
         &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>,
     ) -> Result<Outcome, SessionError> {
+        let limit = self.config.transaction_timeout;
+        self.transaction_within(limit, operation, params, data_out)
+            .await
+    }
+
+    /// As [`Session::transaction`], with `limit` as the whole-transaction deadline instead of
+    /// [`SessionConfig::transaction_timeout`]. Use a longer limit for operations that
+    /// legitimately move large objects.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::transaction`], plus [`SessionError::DeadlineExceeded`].
+    pub async fn transaction_within(
+        &mut self, limit: Duration, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+    ) -> Result<Outcome, SessionError> {
         // A dirty handle failed recovery: the pipe state is unknown until `close` resets it.
         if !self.open || self.dirty || self.in_flight {
             return Err(SessionError::NotOpen);
         }
         let transaction_id = self.take_transaction_id();
         let result = self
-            .exchange(operation, params, data_out, transaction_id)
+            .exchange(operation, params, data_out, (transaction_id, limit))
             .await;
         self.settle(result).await
     }
@@ -415,8 +467,9 @@ impl<T: Transport> Session<T> {
     /// One `OpenSession` attempt, resetting away a stale session the camera reports.
     async fn try_open(&mut self) -> Result<(), SessionError> {
         let params = [self.config.session_id];
+        let limit = self.config.transaction_timeout;
         let mut result = self
-            .exchange(code::OPEN_SESSION, &params, None, 0)
+            .exchange(code::OPEN_SESSION, &params, None, (0, limit))
             .await
             .map(|_| ());
         if matches!(
@@ -430,7 +483,7 @@ impl<T: Transport> Session<T> {
             // be right. A reset ends it.
             self.reset_device().await?;
             result = self
-                .exchange(code::OPEN_SESSION, &params, None, 0)
+                .exchange(code::OPEN_SESSION, &params, None, (0, limit))
                 .await
                 .map(|_| ());
         }
@@ -448,7 +501,12 @@ impl<T: Transport> Session<T> {
         }
         let transaction_id = self.take_transaction_id();
         match self
-            .exchange(code::CLOSE_SESSION, &[], None, transaction_id)
+            .exchange(
+                code::CLOSE_SESSION,
+                &[],
+                None,
+                (transaction_id, self.config.transaction_timeout),
+            )
             .await
         {
             Ok(_)
@@ -504,10 +562,43 @@ impl<T: Transport> Session<T> {
     }
 
     async fn send(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
-        Ok(self.transport.bulk_out(bytes, self.config.timeout).await?)
+        let timeout = self.transfer_timeout()?;
+        Ok(self.transport.bulk_out(bytes, timeout).await?)
     }
 
     async fn exchange(
+        &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+        (transaction_id, limit): (u32, Duration),
+    ) -> Result<Outcome, SessionError> {
+        self.deadline = Some(Deadline {
+            at: (self.clock)().checked_add(limit),
+            limit,
+        });
+        let result = self
+            .exchange_phases(operation, params, data_out, transaction_id)
+            .await;
+        self.deadline = None;
+        result
+    }
+
+    /// Timeout for the next transfer: the per-transfer timeout, capped by what is left of the
+    /// exchange's deadline.
+    fn transfer_timeout(&self) -> Result<Duration, SessionError> {
+        let Some(Deadline {
+            at: Some(at),
+            limit,
+        }) = self.deadline
+        else {
+            return Ok(self.config.timeout);
+        };
+        let remaining = at.saturating_duration_since((self.clock)());
+        if remaining.is_zero() {
+            return Err(SessionError::DeadlineExceeded(limit));
+        }
+        Ok(self.config.timeout.min(remaining))
+    }
+
+    async fn exchange_phases(
         &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>, transaction_id: u32,
     ) -> Result<Outcome, SessionError> {
         let command = Container::command(operation, transaction_id, params)?;
@@ -627,10 +718,8 @@ impl<T: Transport> Session<T> {
     /// Reads one non-empty bulk transfer into the scratch buffer, skipping zero-length packets.
     async fn read_transfer(&mut self) -> Result<usize, SessionError> {
         for _ in 0..MAX_EMPTY_READS {
-            let len = self
-                .transport
-                .bulk_in(&mut self.buffer, self.config.timeout)
-                .await?;
+            let timeout = self.transfer_timeout()?;
+            let len = self.transport.bulk_in(&mut self.buffer, timeout).await?;
             if len > 0 {
                 return Ok(len);
             }
@@ -683,13 +772,14 @@ impl<T: Transport> Session<T> {
     }
 }
 
-/// Returns the cause of a recoverable failure (stall or timeout), and anything else (a
+/// Returns the cause of a recoverable failure (stall, timeout or missed deadline), and anything else (a
 /// disconnect, a malformed container, a non-OK response) as the fatal error it is.
 fn recoverable(err: SessionError) -> Result<TransportError, SessionError> {
     match err {
         SessionError::Transport(cause @ (TransportError::Stall | TransportError::Timeout)) => {
             Ok(cause)
         }
+        SessionError::DeadlineExceeded(_) => Ok(TransportError::Timeout),
         other => Err(other),
     }
 }
@@ -905,6 +995,140 @@ mod tests {
         ) -> impl Future<Output = Result<(), TransportError>> + Send {
             self.inner.reset(timeout)
         }
+    }
+
+    thread_local! {
+        /// Fake time elapsed on this test thread.
+        static ELAPSED: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    fn fake_now() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + ELAPSED.get()
+    }
+
+    /// Delivers one byte per read and advances the fake clock by `step` per read, so every
+    /// read is within the per-transfer timeout while the transaction as a whole crawls.
+    struct Trickle {
+        inner: SimCamera,
+        step: Duration,
+        active: bool,
+        timeouts: Vec<Duration>,
+    }
+
+    impl Transport for Trickle {
+        fn bulk_out(
+            &mut self, bytes: &[u8], timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.bulk_out(bytes, timeout)
+        }
+
+        async fn bulk_in(
+            &mut self, bytes: &mut [u8], timeout: Duration,
+        ) -> Result<usize, TransportError> {
+            if !self.active {
+                return self.inner.bulk_in(bytes, timeout).await;
+            }
+            self.timeouts.push(timeout);
+            ELAPSED.set(ELAPSED.get() + self.step);
+            let one = bytes.get_mut(..1).unwrap_or_default();
+            self.inner.bulk_in(one, timeout).await
+        }
+
+        fn interrupt_in(
+            &mut self, bytes: &mut [u8], timeout: Duration,
+        ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+            self.inner.interrupt_in(bytes, timeout)
+        }
+
+        fn clear_halt(
+            &mut self, endpoint: Endpoint, timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.clear_halt(endpoint, timeout)
+        }
+
+        fn reset(
+            &mut self, timeout: Duration,
+        ) -> impl Future<Output = Result<(), TransportError>> + Send {
+            self.inner.reset(timeout)
+        }
+    }
+
+    fn trickle_session() -> Session<Trickle> {
+        ELAPSED.set(Duration::ZERO);
+        let camera = SimCamera::new().with_operation(GET_OBJECT, Reply::data(payload(100)));
+        let config = SessionConfig {
+            timeout: Duration::from_secs(5),
+            transaction_timeout: Duration::from_secs(60),
+            ..SessionConfig::default()
+        };
+        Session::new(
+            Trickle {
+                inner: camera,
+                step: Duration::from_secs(4),
+                active: false,
+                timeouts: Vec::new(),
+            },
+            config,
+        )
+        .with_clock(fake_now)
+    }
+
+    #[tokio::test]
+    async fn trickling_device_hits_the_transaction_deadline_and_session_recovers() {
+        let mut s = trickle_session();
+        s.open().await.unwrap();
+        s.transport.active = true;
+        assert_eq!(
+            s.transaction(GET_OBJECT, &[1], None).await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(60)))
+        );
+        let timeouts = &s.transport().timeouts;
+        assert_eq!(
+            timeouts.len(),
+            15,
+            "stops at the deadline, not at 112 reads"
+        );
+        assert!(timeouts.iter().all(|t| *t <= Duration::from_secs(5)));
+        assert_eq!(
+            timeouts.last(),
+            Some(&Duration::from_secs(4)),
+            "capped by time left"
+        );
+        // Normal failure path: reset ends the session; reopening works.
+        assert!(!s.is_open());
+        assert_eq!(s.transport().inner.reset_count(), 1);
+        s.transport.active = false;
+        s.open().await.unwrap();
+        assert_eq!(
+            s.transaction(GET_OBJECT, &[1], None).await.unwrap().data,
+            payload(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn per_call_override_allows_a_slow_large_transfer() {
+        let mut s = trickle_session();
+        s.open().await.unwrap();
+        s.transport.active = true;
+        let outcome = s
+            .transaction_within(Duration::from_secs(1000), GET_OBJECT, &[1], None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.data, payload(100));
+    }
+
+    #[tokio::test]
+    async fn a_zero_deadline_fails_before_any_transfer() {
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        let sent = s.transport().bulk_out_transfers().len();
+        assert_eq!(
+            s.transaction_within(Duration::ZERO, code::GET_DEVICE_INFO, &[], None)
+                .await,
+            Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert_eq!(s.transport().bulk_out_transfers().len(), sent);
     }
 
     #[tokio::test]
