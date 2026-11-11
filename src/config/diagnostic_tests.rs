@@ -23,6 +23,41 @@ fn path_resolution_isolated_from_environment() -> Result<(), Box<dyn std::error:
 }
 
 #[test]
+fn nested_unknown_keys_and_secret_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    Config::generate()?.create(&path)?;
+    let original = fs::read_to_string(&path)?;
+    let nested = original.replace("[streams]", "[streams]\nunexpected = true");
+    fs::write(&path, nested)?;
+    assert!(matches!(Config::load(&path), Err(Error::Parse(_))));
+    let malformed = original.replace(
+        "[credentials]",
+        "[credentials]\nunexpected = \"synthetic-secret\"",
+    );
+    fs::write(&path, malformed)?;
+    let error = Config::load(&path).err().ok_or("expected parse error")?;
+    assert!(!format!("{error} {error:?}").contains("synthetic-secret"));
+    Ok(())
+}
+
+#[test]
+fn bad_address_names_key_and_value() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    Config::generate()?.create(&path)?;
+    let contents = fs::read_to_string(&path)?
+        .replace("rtsp_address = \"0.0.0.0\"", "rtsp_address = \"not-an-ip\"");
+    fs::write(&path, contents)?;
+    let Err(Error::Parse(error)) = Config::load(&path) else {
+        return Err("expected parse error".into());
+    };
+    assert!(error.contains("rtsp_address"), "{error}");
+    assert!(error.contains("not-an-ip"), "{error}");
+    Ok(())
+}
+
+#[test]
 fn bad_port_names_key_and_value() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("config.toml");

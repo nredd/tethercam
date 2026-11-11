@@ -17,7 +17,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -71,7 +70,7 @@ impl Secret {
     /// Compare two secrets in constant time with respect to their contents.
     #[must_use]
     pub fn constant_time_eq(&self, other: &Self) -> bool {
-        bool::from(self.0.as_bytes().ct_eq(other.0.as_bytes()))
+        constant_time_eq::constant_time_eq(self.0.as_bytes(), other.0.as_bytes())
     }
 }
 impl Drop for Secret {
@@ -268,7 +267,15 @@ impl Config {
             if key.starts_with("credentials") || key == "." {
                 Error::Parse(format!("invalid `{key}`: [REDACTED]"))
             } else {
-                Error::Parse(format!("invalid `{key}`: {}", error.inner().message()))
+                let value = error
+                    .inner()
+                    .span()
+                    .and_then(|span| contents.get(span))
+                    .unwrap_or("[unavailable]");
+                Error::Parse(format!(
+                    "invalid `{key}`: {value}: {}",
+                    error.inner().message()
+                ))
             }
         })?;
         config.validate()?;
