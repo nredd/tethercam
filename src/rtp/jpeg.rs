@@ -10,21 +10,23 @@
 //! - Dimensions are sent in 8-pixel units, rounded up
 //! - Marker bit on the last fragment
 //!
-//! Quantization tables are sent one per component slot: `[Y, Cb]` when Cb and Cr share a table,
-//! `[Y, Cb, Cr]` when all three differ. Any other mapping is rejected.
+//! Types 0 and 1 carry one luminance and one shared chrominance table, so Cb and Cr must use
+//! the same quantization table. Two tables go in-band on the first fragment.
+//!
+//! RFC 2435 receivers assume the standard Huffman tables (T.81 Annex K), and the scan must use
+//! them with the usual selectors (`0x00` for Y, `0x11` for Cb and Cr). Any `DHT` that differs
+//! is rejected with [`JpegError::UnsupportedHuffman`].
 //!
 //! Rejected with [`JpegError`]: progressive and non-baseline frames, 12-bit or 16-bit tables,
 //! non-YCbCr component layouts, scans that are not one interleaved Y/Cb/Cr scan, sampling other than 4:2:0 / 4:2:2, dimensions over 2040.
-//!
-//! RFC 2435 receivers assume the standard Huffman tables. `DHT` segments are not inspected,
-//! so a frame with optimized tables is packetized as-is and will not decode correctly
-//! downstream. NOTE(redd): validate `DHT` against the Annex K tables if a source needs it.
 //!
 //! References:
 //! - [RTP payload format for JPEG, RFC 2435](https://www.rfc-editor.org/rfc/rfc2435)
 //! - [RTP, RFC 3550](https://www.rfc-editor.org/rfc/rfc3550)
 
 use thiserror::Error;
+
+mod huffman;
 
 use super::{ConfigError, PacketPool, Stream, StreamConfig};
 
@@ -36,17 +38,19 @@ pub const MAX_DIMENSION: u16 = 2040;
 const Q_IN_BAND: u8 = 255;
 /// Bytes in one 8-bit quantization table.
 const TABLE_LEN: usize = 64;
+/// Quantization tables carried in-band: luminance and shared chrominance.
+const TABLES: usize = 2;
 /// Fragment offsets are 24 bits.
 const MAX_SCAN_LEN: usize = 0x00ff_ffff;
 const MAIN_HEADER_LEN: usize = 8;
 const RESTART_HEADER_LEN: usize = 4;
 const QTABLE_HEADER_LEN: usize = 4;
-/// Room for RTP header, main header, restart header, three tables and one payload byte.
+/// Room for RTP header, main header, restart header, both tables and one payload byte.
 const MIN_MTU: usize = super::HEADER_LEN
     + MAIN_HEADER_LEN
     + RESTART_HEADER_LEN
     + QTABLE_HEADER_LEN
-    + 3 * TABLE_LEN
+    + TABLES * TABLE_LEN
     + 1;
 
 /// Errors from parsing or packetizing a JPEG frame.
@@ -85,6 +89,9 @@ pub enum JpegError {
     /// Width or height is over 2040.
     #[error("JPEG dimension {0} exceeds 2040")]
     DimensionTooLarge(u16),
+    /// A `DHT` that differs from the standard Huffman tables RFC 2435 assumes.
+    #[error("non-standard Huffman tables cannot be carried by RFC 2435")]
+    UnsupportedHuffman,
     /// The scan is not a single interleaved YCbCr baseline scan matching the frame components.
     #[error("unsupported scan layout")]
     UnsupportedScan,
@@ -100,7 +107,7 @@ pub enum JpegError {
     /// Quantization table id over 3.
     #[error("invalid quantization table id {0}")]
     BadTableId(u8),
-    /// Table assignment is not `[Y, C, C]` or three distinct tables.
+    /// Cb and Cr use different quantization tables; RFC 2435 types 0 and 1 share one.
     #[error("unsupported quantization table assignment")]
     UnsupportedTableLayout,
     /// EOI hit before an SOS marker.
@@ -148,15 +155,14 @@ pub struct JpegInfo<'a> {
     pub restart_interval: Option<u16>,
     /// Entropy-coded scan, from after the SOS header to before EOI.
     pub scan: &'a [u8],
-    tables: [&'a [u8]; 3],
-    table_count: usize,
+    tables: [&'a [u8]; TABLES],
 }
 
 impl<'a> JpegInfo<'a> {
-    /// Quantization tables in RFC 2435 order, 64 zigzag-ordered bytes each.
+    /// Luminance then shared chrominance quantization table, 64 zigzag-ordered bytes each.
     #[must_use]
-    pub fn tables(&self) -> &[&'a [u8]] {
-        self.tables.get(..self.table_count).unwrap_or_default()
+    pub fn tables(&self) -> &[&'a [u8]; TABLES] {
+        &self.tables
     }
 
     /// Parse the headers of a baseline JPEG. Total: returns an error on any input.
@@ -214,6 +220,7 @@ impl<'a> JpegInfo<'a> {
                     restart =
                         u16::from_be_bytes(*body.first_chunk::<2>().ok_or(JpegError::Malformed)?);
                 }
+                0xc4 => huffman::check(body)?,
                 0xda => {
                     sos = body;
                     break;
@@ -223,15 +230,7 @@ impl<'a> JpegInfo<'a> {
         }
         let frame = frame.ok_or(JpegError::MissingFrame)?;
         frame.check_scan(sos)?;
-        let (ids, table_count) = frame.table_ids()?;
-        let mut tables: [&[u8]; 3] = [&[]; 3];
-        for (slot, &id) in tables.iter_mut().zip(ids.iter().take(table_count)) {
-            *slot = quant
-                .get(usize::from(id))
-                .copied()
-                .flatten()
-                .ok_or(JpegError::MissingTable(id))?;
-        }
+        let tables = frame.tables(&quant)?;
         let rest = data.get(pos..).ok_or(JpegError::Malformed)?;
         let eoi = rest
             .windows(2)
@@ -248,7 +247,6 @@ impl<'a> JpegInfo<'a> {
             restart_interval: (restart != 0).then_some(restart),
             scan,
             tables,
-            table_count,
         })
     }
 }
@@ -270,11 +268,11 @@ impl Frame {
         let [
             count,
             c0,
-            _,
+            s0,
             c1,
-            _,
+            s1,
             c2,
-            _,
+            s2,
             spectral_start,
             spectral_end,
             approx,
@@ -285,6 +283,7 @@ impl Frame {
         };
         if count == 3
             && [c0, c1, c2] == self.component_ids
+            && [s0, s1, s2] == [0x00, 0x11, 0x11]
             && (spectral_start, spectral_end, approx) == (0, 63, 0)
         {
             Ok(())
@@ -293,13 +292,18 @@ impl Frame {
         }
     }
 
-    /// Table ids to send and how many: `[Y, C]` when Cb and Cr share one, else all three.
-    fn table_ids(self) -> Result<([u8; 3], usize), JpegError> {
-        let [y, cb, cr] = self.table_of;
+    /// The luminance and shared chrominance tables, from the `DQT` definitions seen.
+    fn tables<'a>(self, quant: &[Option<&'a [u8]>; 4]) -> Result<[&'a [u8]; TABLES], JpegError> {
+        let [y, cb, cr] = self.table_of.map(|id| {
+            quant
+                .get(usize::from(id))
+                .copied()
+                .flatten()
+                .ok_or(JpegError::MissingTable(id))
+        });
+        let (y, cb, cr) = (y?, cb?, cr?);
         if cb == cr {
-            Ok(([y, cb, 0], 2))
-        } else if y != cb && y != cr {
-            Ok(([y, cb, cr], 3))
+            Ok([y, cb])
         } else {
             Err(JpegError::UnsupportedTableLayout)
         }
@@ -378,7 +382,7 @@ impl JpegPacketizer {
     /// Create a packetizer. Use [`PAYLOAD_TYPE`] unless negotiating something else.
     ///
     /// # Errors
-    /// [`JpegError::Config`] for a payload type over 127 or an MTU under 221 (room for three
+    /// [`JpegError::Config`] for a payload type over 127 or an MTU under 157 (room for both
     /// tables and a restart header on the first fragment).
     pub fn new(config: StreamConfig) -> Result<Self, JpegError> {
         Ok(Self {
@@ -446,10 +450,10 @@ impl JpegPacketizer {
                 to_units(info.width),
                 to_units(info.height),
             ];
-            let (qheader, t0, t1, t2): (&[u8], &[u8], &[u8], &[u8]) = if first {
-                (&qtable_header, table_part(0), table_part(1), table_part(2))
+            let (qheader, t0, t1): (&[u8], &[u8], &[u8]) = if first {
+                (&qtable_header, table_part(0), table_part(1))
             } else {
-                (&[], &[], &[], &[])
+                (&[], &[], &[])
             };
             offset += chunk.len();
             let last = offset == info.scan.len();
@@ -457,7 +461,7 @@ impl JpegPacketizer {
                 pool,
                 last,
                 timestamp,
-                &[&main, restart, qheader, t0, t1, t2, chunk],
+                &[&main, restart, qheader, t0, t1, chunk],
             );
         }
         Ok(())
@@ -465,7 +469,12 @@ impl JpegPacketizer {
 }
 
 #[cfg(test)]
+mod fixtures;
+
+#[cfg(test)]
 mod tests {
+    use super::fixtures;
+    use super::huffman;
     use super::*;
     use crate::rtp::{HEADER_LEN, Header};
     use proptest::prelude::*;
@@ -516,7 +525,9 @@ mod tests {
     }
 
     pub(super) fn table(id: u8) -> Vec<u8> {
-        (0..64).map(|i| id * 64 + i + 1).collect()
+        (0..64)
+            .map(|i| id.wrapping_mul(64).wrapping_add(i).wrapping_add(1))
+            .collect()
     }
 
     /// Hand-built baseline JPEG with synthetic tables and scan data.
@@ -546,7 +557,16 @@ mod tests {
             0x11,
             spec.tables[2],
         ]);
-        out.extend_from_slice(&[0xff, 0xc4, 0x00, 0x05, 0x00, 1, 2]); // fake DHT, skipped
+        for entry in [
+            huffman::DC_LUMA,
+            huffman::AC_LUMA,
+            huffman::DC_CHROMA,
+            huffman::AC_CHROMA,
+        ] {
+            out.extend_from_slice(&[0xff, 0xc4]);
+            out.extend_from_slice(&u16::try_from(entry.len() + 2).unwrap().to_be_bytes());
+            out.extend_from_slice(entry);
+        }
         if spec.restart != 0 {
             out.extend_from_slice(&[0xff, 0xdd, 0x00, 0x04]);
             out.extend_from_slice(&spec.restart.to_be_bytes());
@@ -675,17 +695,91 @@ mod tests {
     }
 
     #[test]
-    fn three_distinct_tables() {
+    fn distinct_chroma_tables_are_rejected() {
         let jpeg = build(&Spec {
             tables: [0, 1, 2],
             ..Spec::default()
         });
-        let info = JpegInfo::parse(&jpeg).unwrap();
-        assert_eq!(info.tables().len(), 3);
-        let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
-        let mut pool = PacketPool::new();
-        packetizer.packetize(&jpeg, 0, &mut pool).unwrap();
-        assert_eq!(depacketize(&pool, 1400, &info), info.scan);
+        assert_eq!(
+            JpegInfo::parse(&jpeg),
+            Err(JpegError::UnsupportedTableLayout)
+        );
+    }
+
+    #[test]
+    fn non_standard_huffman_is_rejected() {
+        let mut jpeg = build(&Spec::default());
+        let dht = jpeg.windows(2).position(|w| w == [0xff, 0xc4]).unwrap();
+        jpeg[dht + 6] ^= 1; // first code count
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::UnsupportedHuffman));
+        let mut short = build(&Spec::default());
+        let at = short.windows(2).position(|w| w == [0xff, 0xc4]).unwrap();
+        short[at + 3] = 10;
+        assert!(JpegInfo::parse(&short).is_err());
+    }
+
+    /// Rebuild the JPEG a receiver would from RFC 2435 packets (RFC Appendix B), in the
+    /// header layout the fixtures use.
+    fn reassemble(pool: &PacketPool, mtu: usize, info: &JpegInfo<'_>) -> Vec<u8> {
+        let scan = depacketize(pool, mtu, info);
+        let (w, h) = (info.width.to_be_bytes(), info.height.to_be_bytes());
+        let y_sampling = match info.sampling {
+            Sampling::Yuv420 => 0x22,
+            Sampling::Yuv422 => 0x21,
+        };
+        let mut out = vec![0xff, 0xd8];
+        for (id, table) in info.tables().iter().enumerate() {
+            out.extend_from_slice(&[0xff, 0xdb, 0x00, 0x43, u8::try_from(id).unwrap()]);
+            out.extend_from_slice(table);
+        }
+        out.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 8, h[0], h[1], w[0], w[1], 3]);
+        out.extend_from_slice(&[1, y_sampling, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        for entry in [
+            huffman::DC_LUMA,
+            huffman::AC_LUMA,
+            huffman::DC_CHROMA,
+            huffman::AC_CHROMA,
+        ] {
+            out.extend_from_slice(&[0xff, 0xc4]);
+            out.extend_from_slice(&u16::try_from(entry.len() + 2).unwrap().to_be_bytes());
+            out.extend_from_slice(entry);
+        }
+        if let Some(interval) = info.restart_interval {
+            out.extend_from_slice(&[0xff, 0xdd, 0x00, 0x04]);
+            out.extend_from_slice(&interval.to_be_bytes());
+        }
+        out.extend_from_slice(&[
+            0xff, 0xda, 0x00, 0x0c, 3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0,
+        ]);
+        out.extend(scan);
+        out.extend_from_slice(&[0xff, 0xd9]);
+        out
+    }
+
+    #[test]
+    fn real_fixtures_round_trip_byte_for_byte() {
+        for (fixture, sampling, size, restart, kind) in [
+            (fixtures::YUV420, Sampling::Yuv420, (32, 16), None, 1),
+            (
+                fixtures::YUV422_RESTART,
+                Sampling::Yuv422,
+                (24, 16),
+                Some(2),
+                64,
+            ),
+        ] {
+            let info = JpegInfo::parse(fixture).unwrap();
+            assert_eq!((info.width, info.height), size);
+            assert_eq!(info.sampling, sampling);
+            assert_eq!(info.restart_interval, restart);
+            for mtu in [157, 200, 1400] {
+                let mut packetizer = JpegPacketizer::new(config(mtu)).unwrap();
+                let mut pool = PacketPool::new();
+                packetizer.packetize(fixture, 3, &mut pool).unwrap();
+                assert_eq!(pool.get(0).unwrap()[HEADER_LEN + 4], kind);
+                assert_eq!(reassemble(&pool, mtu, &info), fixture);
+            }
+        }
     }
 
     #[test]
@@ -807,10 +901,10 @@ mod tests {
         assert!(pool.is_empty());
         assert_eq!(packetizer.next_sequence(), before);
         assert_eq!(
-            JpegPacketizer::new(config(220)).err(),
+            JpegPacketizer::new(config(156)).err(),
             Some(JpegError::Config(ConfigError::MtuTooSmall {
-                mtu: 220,
-                min: 221
+                mtu: 156,
+                min: 157
             }))
         );
     }
@@ -856,7 +950,7 @@ mod tests {
         #[test]
         fn round_trips(
             scan_len in 1usize..20_000,
-            mtu in 221usize..2000,
+            mtu in 157usize..2000,
             restart in prop_oneof![Just(0u16), 1u16..500],
             wide: bool,
             distinct: bool,
@@ -867,7 +961,7 @@ mod tests {
                 width,
                 height,
                 y_sampling: if wide { 0x21 } else { 0x22 },
-                tables: if distinct { [0, 1, 2] } else { [0, 1, 1] },
+                tables: if distinct { [2, 3, 3] } else { [0, 1, 1] },
                 restart,
                 scan_len,
             });
