@@ -64,3 +64,7 @@ panic = "abort"
 
 [profile.bench]
 debug = "line-tables-only"
+
+[[bench]]
+name = "rtp_packetize"
+harness = false
