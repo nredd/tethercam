@@ -7,7 +7,8 @@
 //! - Type 0 (4:2:2) or 1 (4:2:0) from the SOF sampling factors, plus 64 when a `DRI` marker is
 //!   present; in that case every packet carries the restart marker header with `F = L = 1`
 //!   and count `0x3fff` (fragments are not restart-aligned)
-//! - Dimensions are sent in 8-pixel units, rounded up
+//! - Dimensions are sent in 8-pixel units; sizes that are not multiples of 8 are rejected, since
+//!   RFC 2435 cannot represent them exactly
 //! - Marker bit on the last fragment
 //!
 //! Types 0 and 1 carry one luminance and one shared chrominance table, so Cb and Cr must use
@@ -18,7 +19,7 @@
 //! is rejected with [`JpegError::UnsupportedHuffman`].
 //!
 //! Rejected with [`JpegError`]: progressive and non-baseline frames, 12-bit or 16-bit tables,
-//! non-YCbCr component layouts, scans that are not one interleaved Y/Cb/Cr scan, sampling other than 4:2:0 / 4:2:2, dimensions over 2040.
+//! non-YCbCr component layouts, scans that are not one interleaved Y/Cb/Cr scan, sampling other than 4:2:0 / 4:2:2, dimensions over 2040 or not a multiple of 8.
 //!
 //! References:
 //! - [RTP payload format for JPEG, RFC 2435](https://www.rfc-editor.org/rfc/rfc2435)
@@ -95,6 +96,9 @@ pub enum JpegError {
     /// The scan is not a single interleaved YCbCr baseline scan matching the frame components.
     #[error("unsupported scan layout")]
     UnsupportedScan,
+    /// Width or height is not a multiple of 8; RFC 2435 sends sizes in 8-pixel units.
+    #[error("JPEG dimension {0} is not a multiple of 8")]
+    UnalignedDimension(u16),
     /// A second SOF marker.
     #[error("duplicate SOF marker")]
     DuplicateFrame,
@@ -343,6 +347,9 @@ fn parse_sof(body: &[u8]) -> Result<Frame, JpegError> {
         if dimension > MAX_DIMENSION {
             return Err(JpegError::DimensionTooLarge(dimension));
         }
+        if dimension % 8 != 0 {
+            return Err(JpegError::UnalignedDimension(dimension));
+        }
     }
     if *count != 3 {
         return Err(JpegError::UnsupportedComponents);
@@ -409,7 +416,8 @@ impl JpegPacketizer {
         if info.scan.len() > MAX_SCAN_LEN {
             return Err(JpegError::ScanTooLarge(info.scan.len()));
         }
-        let to_units = |pixels: u16| u8::try_from(pixels.div_ceil(8)).unwrap_or(u8::MAX);
+        // Parsing guarantees multiples of 8 up to 2040, so these always fit.
+        let to_units = |pixels: u16| u8::try_from(pixels / 8).unwrap_or(u8::MAX);
         let kind = info.sampling.rtp_type()
             + if info.restart_interval.is_some() {
                 64
@@ -586,9 +594,23 @@ mod tests {
         }
     }
 
-    /// Reassemble the scan from packets, checking every header on the way.
-    fn depacketize(pool: &PacketPool, mtu: usize, info: &JpegInfo<'_>) -> Vec<u8> {
+    /// What a receiver learns from the packets alone.
+    struct Received {
+        width: u16,
+        height: u16,
+        sampling: Sampling,
+        restart: Option<u16>,
+        tables: Vec<Vec<u8>>,
+        scan: Vec<u8>,
+    }
+
+    /// Reassemble from packets, checking every header on the way. Takes everything from the
+    /// packets, never from the source JPEG.
+    fn depacketize(pool: &PacketPool, mtu: usize) -> Received {
         let mut scan = Vec::new();
+        let mut tables = Vec::new();
+        let (mut width, mut height, mut kind) = (0, 0, 0);
+        let mut restart = None;
         let count = pool.len();
         for (i, packet) in pool.iter().enumerate() {
             assert!(packet.len() <= mtu);
@@ -600,38 +622,39 @@ mod tests {
             assert_eq!(p[0], 0);
             let offset = u32::from_be_bytes([0, p[1], p[2], p[3]]) as usize;
             assert_eq!(offset, scan.len(), "fragments are contiguous");
-            let dri = info.restart_interval.is_some();
-            assert_eq!(p[4], info.sampling.rtp_type() + if dri { 64 } else { 0 });
             assert_eq!(p[5], 255);
-            assert_eq!(
-                usize::from(p[6]) * 8,
-                usize::from(info.width.div_ceil(8) * 8)
-            );
-            assert_eq!(
-                usize::from(p[7]) * 8,
-                usize::from(info.height.div_ceil(8) * 8)
-            );
+            let this = (u16::from(p[6]) * 8, u16::from(p[7]) * 8, p[4]);
+            if i == 0 {
+                (width, height, kind) = this;
+            }
+            assert_eq!((width, height, kind), this, "headers agree across packets");
             let mut body = &p[8..];
-            if dri {
+            if kind >= 64 {
                 let interval = u16::from_be_bytes([body[0], body[1]]);
-                assert_eq!(Some(interval), info.restart_interval);
+                assert_eq!(restart.get_or_insert(interval), &interval);
                 assert_eq!(&body[2..4], &[0xff, 0xff]);
                 body = &body[4..];
             }
             if i == 0 {
                 let len = usize::from(u16::from_be_bytes([body[2], body[3]]));
                 assert_eq!((body[0], body[1]), (0, 0));
-                assert_eq!(len, info.tables().len() * 64);
-                let mut tables = &body[4..4 + len];
-                for want in info.tables() {
-                    assert_eq!(&tables[..64], *want);
-                    tables = &tables[64..];
-                }
+                tables = body[4..4 + len].chunks(64).map(<[u8]>::to_vec).collect();
                 body = &body[4 + len..];
             }
             scan.extend_from_slice(body);
         }
-        scan
+        Received {
+            width,
+            height,
+            sampling: if kind % 64 == 0 {
+                Sampling::Yuv422
+            } else {
+                Sampling::Yuv420
+            },
+            restart,
+            tables,
+            scan,
+        }
     }
 
     #[test]
@@ -654,7 +677,7 @@ mod tests {
         let jpeg = build(&Spec {
             scan_len: 5,
             y_sampling: 0x21,
-            width: 17,
+            width: 24,
             ..Spec::default()
         });
         packetizer.packetize(&jpeg, 0x0102_0304, &mut pool).unwrap();
@@ -691,7 +714,9 @@ mod tests {
         );
         let info = JpegInfo::parse(&jpeg).unwrap();
         assert_eq!(info.restart_interval, Some(0x0102));
-        assert_eq!(depacketize(&pool, mtu, &info), info.scan);
+        let received = depacketize(&pool, mtu);
+        assert_eq!(received.scan, info.scan);
+        assert_eq!(received.restart, Some(0x0102));
     }
 
     #[test]
@@ -720,15 +745,16 @@ mod tests {
 
     /// Rebuild the JPEG a receiver would from RFC 2435 packets (RFC Appendix B), in the
     /// header layout the fixtures use.
-    fn reassemble(pool: &PacketPool, mtu: usize, info: &JpegInfo<'_>) -> Vec<u8> {
-        let scan = depacketize(pool, mtu, info);
-        let (w, h) = (info.width.to_be_bytes(), info.height.to_be_bytes());
-        let y_sampling = match info.sampling {
+    fn reassemble(pool: &PacketPool, mtu: usize) -> Vec<u8> {
+        let got = depacketize(pool, mtu);
+        let (w, h) = (got.width.to_be_bytes(), got.height.to_be_bytes());
+        let y_sampling = match got.sampling {
             Sampling::Yuv420 => 0x22,
             Sampling::Yuv422 => 0x21,
         };
+        let scan = got.scan.clone();
         let mut out = vec![0xff, 0xd8];
-        for (id, table) in info.tables().iter().enumerate() {
+        for (id, table) in got.tables.iter().enumerate() {
             out.extend_from_slice(&[0xff, 0xdb, 0x00, 0x43, u8::try_from(id).unwrap()]);
             out.extend_from_slice(table);
         }
@@ -744,7 +770,7 @@ mod tests {
             out.extend_from_slice(&u16::try_from(entry.len() + 2).unwrap().to_be_bytes());
             out.extend_from_slice(entry);
         }
-        if let Some(interval) = info.restart_interval {
+        if let Some(interval) = got.restart {
             out.extend_from_slice(&[0xff, 0xdd, 0x00, 0x04]);
             out.extend_from_slice(&interval.to_be_bytes());
         }
@@ -777,15 +803,14 @@ mod tests {
                 let mut pool = PacketPool::new();
                 packetizer.packetize(fixture, 3, &mut pool).unwrap();
                 assert_eq!(pool.get(0).unwrap()[HEADER_LEN + 4], kind);
-                assert_eq!(reassemble(&pool, mtu, &info), fixture);
+                assert_eq!(reassemble(&pool, mtu), fixture);
             }
         }
     }
 
     #[test]
     fn rejects_unsupported() {
-        let base = Spec::default();
-        let mut jpeg = build(&base);
+        let jpeg = build(&Spec::default());
         let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
 
         let mut progressive = jpeg.clone();
@@ -822,6 +847,20 @@ mod tests {
             ),
             (
                 Spec {
+                    width: 17,
+                    ..Spec::default()
+                },
+                JpegError::UnalignedDimension(17),
+            ),
+            (
+                Spec {
+                    height: 52,
+                    ..Spec::default()
+                },
+                JpegError::UnalignedDimension(52),
+            ),
+            (
+                Spec {
                     y_sampling: 0x11,
                     ..Spec::default()
                 },
@@ -852,7 +891,11 @@ mod tests {
             }))
             .is_ok()
         );
+    }
 
+    #[test]
+    fn rejects_malformed_headers() {
+        let mut jpeg = build(&Spec::default());
         let sos = jpeg.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
         let mut swapped = jpeg.clone();
         swapped[sos + 5] = 9;
@@ -909,6 +952,30 @@ mod tests {
         );
     }
 
+    /// Shape of real a7 III live view: 1024x680, 4:2:2, two tables, standard Huffman, no DRI.
+    #[test]
+    fn live_view_shape_golden() {
+        let jpeg = build(&Spec {
+            width: 1024,
+            height: 680,
+            y_sampling: 0x21,
+            scan_len: 46 * 1024,
+            ..Spec::default()
+        });
+        let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
+        let mut pool = PacketPool::new();
+        packetizer.packetize(&jpeg, 1, &mut pool).unwrap();
+        let first = pool.get(0).unwrap();
+        // type 0, Q 255, 128 x 85 units
+        assert_eq!(&first[HEADER_LEN + 4..HEADER_LEN + 8], [0, 255, 128, 85]);
+        let got = depacketize(&pool, 1400);
+        assert_eq!((got.width, got.height), (1024, 680));
+        assert_eq!(got.sampling, Sampling::Yuv422);
+        assert_eq!(got.restart, None);
+        assert_eq!(got.tables, vec![table(0), table(1)]);
+        assert_eq!(got.scan, JpegInfo::parse(&jpeg).unwrap().scan);
+    }
+
     #[test]
     fn steady_state_reuses_pool() {
         let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
@@ -954,9 +1021,10 @@ mod tests {
             restart in prop_oneof![Just(0u16), 1u16..500],
             wide: bool,
             distinct: bool,
-            width in 1u16..=2040,
-            height in 1u16..=2040,
+            width_units in 1u16..=255,
+            height_units in 1u16..=255,
         ) {
+            let (width, height) = (width_units * 8, height_units * 8);
             let jpeg = build(&Spec {
                 width,
                 height,
@@ -969,7 +1037,12 @@ mod tests {
             let mut packetizer = JpegPacketizer::new(config(mtu)).unwrap();
             let mut pool = PacketPool::new();
             packetizer.packetize(&jpeg, 5, &mut pool).unwrap();
-            prop_assert_eq!(depacketize(&pool, mtu, &info), info.scan.to_vec());
+            let got = depacketize(&pool, mtu);
+            prop_assert_eq!((got.width, got.height), (width, height));
+            prop_assert_eq!(got.sampling, if wide { Sampling::Yuv422 } else { Sampling::Yuv420 });
+            prop_assert_eq!(got.restart, (restart != 0).then_some(restart));
+            prop_assert_eq!(got.tables, vec![table(if distinct { 2 } else { 0 }), table(if distinct { 3 } else { 1 })]);
+            prop_assert_eq!(got.scan, info.scan.to_vec());
         }
     }
 }

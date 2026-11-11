@@ -4,10 +4,11 @@
 
 use std::hint::black_box;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use tethercam::rtp::h264::H264Packetizer;
-use tethercam::rtp::jpeg::{JpegPacketizer, PAYLOAD_TYPE};
+use criterion::{Criterion, Throughput};
+use tethercam::rtp::h264::{H264Error, H264Packetizer};
+use tethercam::rtp::jpeg::{JpegError, JpegPacketizer, PAYLOAD_TYPE};
 use tethercam::rtp::{PacketPool, StreamConfig};
+use thiserror::Error;
 
 const MTU: usize = 1400;
 
@@ -20,7 +21,7 @@ fn config(payload_type: u8) -> StreamConfig {
     }
 }
 
-/// Synthetic baseline JPEG: two 64-byte tables, 4:2:0, 1024x680, `scan_len` scan bytes.
+/// Synthetic baseline JPEG: two 64-byte tables, 4:2:2, 1024x680, `scan_len` scan bytes.
 fn synthetic_jpeg(scan_len: usize) -> Vec<u8> {
     let mut jpeg = vec![0xff, 0xd8];
     for id in 0..2u8 {
@@ -28,7 +29,7 @@ fn synthetic_jpeg(scan_len: usize) -> Vec<u8> {
         jpeg.extend((1..=64u8).map(|i| i.wrapping_mul(id + 1)));
     }
     jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 8, 0x02, 0xa8, 0x04, 0x00]);
-    jpeg.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    jpeg.extend_from_slice(&[3, 1, 0x21, 0, 2, 0x11, 1, 3, 0x11, 1]);
     jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x0c, 3, 1, 0, 2, 0x11, 3, 0x11, 0, 63, 0]);
     jpeg.extend((0..scan_len).map(|i| u8::try_from(i % 251).unwrap_or(0)));
     jpeg.extend_from_slice(&[0xff, 0xd9]);
@@ -45,33 +46,45 @@ fn synthetic_access_unit(nal_len: usize) -> Vec<u8> {
     au
 }
 
-fn packetize(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rtp_packetize");
-
-    let jpeg = synthetic_jpeg(48 * 1024);
-    group.throughput(Throughput::Bytes(jpeg.len() as u64));
-    group.bench_function("jpeg_48k_mtu1400", |b| {
-        let mut packetizer = JpegPacketizer::new(config(PAYLOAD_TYPE));
-        let mut pool = PacketPool::with_capacity(64 * 1024, 64);
-        let Ok(packetizer) = packetizer.as_mut() else {
-            return;
-        };
-        b.iter(|| packetizer.packetize(black_box(&jpeg), black_box(1), &mut pool));
-    });
-
-    let au = synthetic_access_unit(40 * 1000);
-    group.throughput(Throughput::Bytes(au.len() as u64));
-    group.bench_function("h264_40k_mtu1400", |b| {
-        let mut packetizer = H264Packetizer::new(config(96));
-        let mut pool = PacketPool::with_capacity(64 * 1024, 64);
-        let Ok(packetizer) = packetizer.as_mut() else {
-            return;
-        };
-        b.iter(|| packetizer.packetize(black_box(&au), black_box(1), &mut pool));
-    });
-
-    group.finish();
+/// Bench setup failures. They fail the run instead of timing a broken packetizer.
+#[derive(Debug, Error)]
+enum BenchError {
+    #[error("JPEG packetizer: {0}")]
+    Jpeg(#[from] JpegError),
+    #[error("H.264 packetizer: {0}")]
+    H264(#[from] H264Error),
+    #[error("{0} produced no packets")]
+    NoPackets(&'static str),
 }
 
-criterion_group!(benches, packetize);
-criterion_main!(benches);
+fn main() -> Result<(), BenchError> {
+    let jpeg = synthetic_jpeg(48 * 1024);
+    let mut jpeg_packetizer = JpegPacketizer::new(config(PAYLOAD_TYPE))?;
+    let mut jpeg_pool = PacketPool::with_capacity(64 * 1024, 64);
+    jpeg_packetizer.packetize(&jpeg, 1, &mut jpeg_pool)?;
+    if jpeg_pool.is_empty() {
+        return Err(BenchError::NoPackets("JPEG"));
+    }
+
+    let au = synthetic_access_unit(40 * 1000);
+    let mut h264_packetizer = H264Packetizer::new(config(96))?;
+    let mut h264_pool = PacketPool::with_capacity(64 * 1024, 64);
+    h264_packetizer.packetize(&au, 1, &mut h264_pool)?;
+    if h264_pool.is_empty() {
+        return Err(BenchError::NoPackets("H.264"));
+    }
+
+    let mut criterion = Criterion::default().configure_from_args();
+    let mut group = criterion.benchmark_group("rtp_packetize");
+    group.throughput(Throughput::Bytes(jpeg.len() as u64));
+    group.bench_function("jpeg_48k_mtu1400", |b| {
+        b.iter(|| jpeg_packetizer.packetize(black_box(&jpeg), black_box(1), &mut jpeg_pool));
+    });
+    group.throughput(Throughput::Bytes(au.len() as u64));
+    group.bench_function("h264_40k_mtu1400", |b| {
+        b.iter(|| h264_packetizer.packetize(black_box(&au), black_box(1), &mut h264_pool));
+    });
+    group.finish();
+    criterion.final_summary();
+    Ok(())
+}
