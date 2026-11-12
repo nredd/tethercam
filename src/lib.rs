@@ -14,6 +14,7 @@
 //! - [`rtp`] and [`rtsp`]: packetizers and the RTSP server
 //! - [`onvif`]: discovery, Device and Media services
 //! - [`config`], [`supervisor`], [`service`]: configuration, camera lifecycle, installation
+//! - [`cli`]: the binary's entry point logic
 //!
 //! See `docs/architecture.md` in the repository for the full layer plan.
 //!
@@ -21,6 +22,7 @@
 //! - [PTP, ISO 15740](https://www.iso.org/standard/63602.html)
 //! - [USB Still Image Capture Device class](https://www.usb.org/document-library/still-image-capture-device-definition-10-and-errata-16-mar-2007)
 
+pub mod cli;
 pub mod config;
 pub mod media;
 pub mod onvif;

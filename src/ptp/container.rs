@@ -20,6 +20,17 @@ use thiserror::Error;
 /// Size of the fixed container header in bytes.
 pub const HEADER_LEN: usize = 12;
 
+/// [`HEADER_LEN`] as it appears in the `length` field.
+const HEADER_LEN_U32: u32 = 12;
+
+/// The `length` field for a container carrying `payload_len` payload bytes.
+fn wire_length(payload_len: usize) -> Result<u32, ContainerError> {
+    payload_len
+        .checked_add(HEADER_LEN)
+        .and_then(|total| u32::try_from(total).ok())
+        .ok_or(ContainerError::PayloadTooLarge(payload_len))
+}
+
 /// Maximum number of `u32` parameters in a command or response container.
 pub const MAX_PARAMS: usize = 5;
 
@@ -188,22 +199,17 @@ impl<'a> Container<'a> {
     ///
     /// Returns [`ContainerError::PayloadTooLarge`] when header plus payload exceed `u32::MAX`.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ContainerError> {
-        let length = self
-            .payload
-            .len()
-            .checked_add(HEADER_LEN)
-            .and_then(|total| u32::try_from(total).ok())
-            .ok_or(ContainerError::PayloadTooLarge(self.payload.len()))?;
-        let header = ContainerHeader {
-            length,
-            kind: self.kind,
-            code: self.code,
-            transaction_id: self.transaction_id,
-        };
-        out.reserve(HEADER_LEN + self.payload.len());
-        out.extend_from_slice(&header.encode());
-        out.extend_from_slice(self.payload);
-        Ok(())
+        wire_length(self.payload.len()).map(|length| {
+            let header = ContainerHeader {
+                length,
+                kind: self.kind,
+                code: self.code,
+                transaction_id: self.transaction_id,
+            };
+            out.reserve(HEADER_LEN + self.payload.len());
+            out.extend_from_slice(&header.encode());
+            out.extend_from_slice(self.payload);
+        })
     }
 
     /// Builds the wire bytes of a command container with `params` as its parameters.
@@ -217,18 +223,21 @@ impl<'a> Container<'a> {
         if params.len() > MAX_PARAMS {
             return Err(ContainerError::TooManyParams(params.len()));
         }
-        let payload: Vec<u8> = params
+        // At most `MAX_PARAMS` words, so the length fits `u32` by construction.
+        let length = params
             .iter()
-            .flat_map(|param| param.to_le_bytes())
-            .collect();
-        let mut out = Vec::new();
-        Container {
+            .fold(HEADER_LEN_U32, |len, _| len.saturating_add(4));
+        let header = ContainerHeader {
+            length,
             kind: ContainerKind::Command,
             code,
             transaction_id,
-            payload: &payload,
+        };
+        let mut out = Vec::with_capacity(HEADER_LEN + params.len() * 4);
+        out.extend_from_slice(&header.encode());
+        for param in params {
+            out.extend_from_slice(&param.to_le_bytes());
         }
-        .encode_into(&mut out)?;
         Ok(out)
     }
 
@@ -291,6 +300,16 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_every_short_header() {
+        for len in 0..HEADER_LEN {
+            assert_eq!(
+                ContainerHeader::decode(&OPEN_SESSION[..len]),
+                Err(ContainerError::TruncatedHeader(len))
+            );
+        }
+    }
+
+    #[test]
     fn decode_rejects_length_below_header() {
         let mut bytes = OPEN_SESSION;
         bytes[..4].copy_from_slice(&11_u32.to_le_bytes());
@@ -298,6 +317,20 @@ mod tests {
             Container::decode(&bytes),
             Err(ContainerError::LengthTooSmall(11))
         );
+    }
+
+    #[test]
+    fn decode_accepts_every_kind() {
+        for (raw, kind) in [
+            (1_u16, ContainerKind::Command),
+            (2, ContainerKind::Data),
+            (3, ContainerKind::Response),
+            (4, ContainerKind::Event),
+        ] {
+            let mut bytes = OPEN_SESSION;
+            bytes[4..6].copy_from_slice(&raw.to_le_bytes());
+            assert_eq!(Container::decode(&bytes).unwrap().0.kind, kind);
+        }
     }
 
     #[test]
@@ -327,6 +360,41 @@ mod tests {
             Container::command(0x1001, 0, &[0; 6]),
             Err(ContainerError::TooManyParams(6))
         );
+    }
+
+    #[test]
+    fn wire_length_counts_the_header_and_rejects_overflow() {
+        assert_eq!(wire_length(0), Ok(HEADER_LEN_U32));
+        assert_eq!(
+            wire_length(usize::MAX),
+            Err(ContainerError::PayloadTooLarge(usize::MAX))
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            let max = usize::try_from(u32::MAX - HEADER_LEN_U32).unwrap();
+            assert_eq!(wire_length(max), Ok(u32::MAX));
+            assert_eq!(
+                wire_length(max + 1),
+                Err(ContainerError::PayloadTooLarge(max + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn encode_into_appends_header_then_payload() {
+        let mut out = vec![0xEE];
+        Container {
+            kind: ContainerKind::Response,
+            code: 0x2001,
+            transaction_id: 9,
+            payload: &[1, 2],
+        }
+        .encode_into(&mut out)
+        .unwrap();
+        assert_eq!(out[0], 0xEE);
+        let (container, rest) = Container::decode(&out[1..]).unwrap();
+        assert_eq!(container.payload, [1, 2]);
+        assert_eq!(rest, []);
     }
 
     #[test]

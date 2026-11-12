@@ -184,7 +184,7 @@ impl<'a> JpegInfo<'a> {
         let mut quant: [Option<&'a [u8]>; 4] = [None; 4];
         let mut frame: Option<Frame> = None;
         let mut restart: u16 = 0;
-        let sos;
+        let (sos, scan_data);
         loop {
             if data.get(pos) != Some(&0xff) {
                 return Err(JpegError::BadMarker);
@@ -199,18 +199,15 @@ impl<'a> JpegInfo<'a> {
                 0x00 | 0x01 | 0xd0..=0xd8 => return Err(JpegError::BadMarker),
                 _ => {}
             }
-            let length = usize::from(u16::from_be_bytes(
-                *data
-                    .get(pos..)
-                    .and_then(<[u8]>::first_chunk::<2>)
-                    .ok_or(JpegError::Malformed)?,
-            ));
-            let body_end = pos + length;
-            let body = length
-                .checked_sub(2)
-                .and_then(|_| data.get(pos + 2..body_end))
+            let (length, after) = data
+                .get(pos..)
+                .and_then(<[u8]>::split_first_chunk::<2>)
                 .ok_or(JpegError::Malformed)?;
-            pos = body_end;
+            let (body, tail) = usize::from(u16::from_be_bytes(*length))
+                .checked_sub(2)
+                .and_then(|body_len| after.split_at_checked(body_len))
+                .ok_or(JpegError::Malformed)?;
+            pos = data.len().saturating_sub(tail.len());
             match marker {
                 0xdb => parse_dqt(body, &mut quant)?,
                 0xc0 => {
@@ -229,7 +226,7 @@ impl<'a> JpegInfo<'a> {
                 }
                 0xc4 => huffman::check(body)?,
                 0xda => {
-                    sos = body;
+                    (sos, scan_data) = (body, tail);
                     break;
                 }
                 _ => {}
@@ -238,8 +235,7 @@ impl<'a> JpegInfo<'a> {
         let frame = frame.ok_or(JpegError::MissingFrame)?;
         frame.check_scan(sos)?;
         let tables = frame.tables(&quant)?;
-        let rest = data.get(pos..).ok_or(JpegError::Malformed)?;
-        let (scan, trailer) = split_scan(rest)?;
+        let (scan, trailer) = split_scan(scan_data)?;
         check_trailer(trailer)?;
         if scan.is_empty() {
             return Err(JpegError::EmptyScan);
@@ -263,11 +259,14 @@ impl<'a> JpegInfo<'a> {
 fn split_scan(rest: &[u8]) -> Result<(&[u8], &[u8]), JpegError> {
     let mut at = 0usize;
     loop {
-        let offset = rest
+        // The next `FF` and the split in front of it come from one lookup, so there is no
+        // separate "split failed" state to handle.
+        let (scan, trailer) = rest
             .get(at..)
             .and_then(|tail| tail.iter().position(|&b| b == 0xff))
+            .and_then(|offset| rest.split_at_checked(at + offset))
             .ok_or(JpegError::MissingEoi)?;
-        let start = at + offset;
+        let start = scan.len();
         let mut marker_at = start + 1;
         while rest.get(marker_at) == Some(&0xff) {
             marker_at += 1;
@@ -276,10 +275,7 @@ fn split_scan(rest: &[u8]) -> Result<(&[u8], &[u8]), JpegError> {
             None => return Err(JpegError::MissingEoi),
             Some(0x00) if marker_at == start + 1 => at = marker_at + 1,
             Some(0xd0..=0xd7) => at = marker_at + 1,
-            Some(_) => {
-                let (scan, trailer) = rest.split_at_checked(start).ok_or(JpegError::Malformed)?;
-                return Ok((scan, trailer));
-            }
+            Some(_) => return Ok((scan, trailer)),
         }
     }
 }
@@ -569,9 +565,8 @@ mod tests {
         }
         scan.truncate(len);
         // Never end on a lone 0xFF, which would pair with the EOI marker.
-        if scan.last() == Some(&0xff) {
-            scan.pop();
-            scan.push(0x01);
+        if let Some(last) = scan.last_mut() {
+            *last = (*last).min(0xfe);
         }
         scan
     }
@@ -992,6 +987,191 @@ mod tests {
         assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::MissingEoi));
         let no_frame = [0xff, 0xd8, 0xff, 0xda, 0x00, 0x02, 1, 0xff, 0xd9];
         assert_eq!(JpegInfo::parse(&no_frame), Err(JpegError::MissingFrame));
+    }
+
+    /// `SOI`, then a `SOF0` whose body holds `components` 3-byte entries but announces three.
+    fn sof_with(components: usize) -> Vec<u8> {
+        let mut out = vec![0xff, 0xd8, 0xff, 0xc0];
+        out.extend(u16::try_from(8 + 3 * components).unwrap().to_be_bytes());
+        out.extend_from_slice(&[8, 0, 16, 0, 16, 3]);
+        out.extend(std::iter::repeat_n([1, 0x22, 0], components).flatten());
+        out
+    }
+
+    #[test]
+    fn sof_with_fewer_than_three_components_is_malformed() {
+        for components in 0..3 {
+            assert_eq!(
+                JpegInfo::parse(&sof_with(components)),
+                Err(JpegError::Malformed),
+                "{components} components"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_that_cannot_start_a_segment_are_rejected() {
+        for marker in [0x00, 0x01, 0xd0, 0xd8] {
+            assert_eq!(
+                JpegInfo::parse(&[0xff, 0xd8, 0xff, marker]),
+                Err(JpegError::BadMarker),
+                "{marker:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_quantization_table_is_malformed() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xdb, 0x00, 0x0d, 0x00];
+        jpeg.extend([1; 10]);
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::Malformed));
+    }
+
+    #[test]
+    fn frame_and_scan_header_errors() {
+        let jpeg = build(&Spec::default());
+        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        let sos = jpeg.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+
+        // A second SOF0 right after the first.
+        let end = sof + 2 + usize::from(u16::from_be_bytes([jpeg[sof + 2], jpeg[sof + 3]]));
+        let mut twice = jpeg[..end].to_vec();
+        twice.extend_from_slice(&jpeg[sof..end]);
+        assert_eq!(JpegInfo::parse(&twice), Err(JpegError::DuplicateFrame));
+
+        // 12-bit precision.
+        let mut deep = jpeg.clone();
+        deep[sof + 4] = 12;
+        assert_eq!(JpegInfo::parse(&deep), Err(JpegError::UnsupportedPrecision));
+
+        // SOF body shorter than its fixed fields.
+        assert_eq!(
+            JpegInfo::parse(&[0xff, 0xd8, 0xff, 0xc0, 0x00, 0x05, 8, 0, 16]),
+            Err(JpegError::Malformed)
+        );
+
+        // SOS body shorter than a three-component scan header.
+        let mut short_sos = jpeg[..sos].to_vec();
+        short_sos.extend_from_slice(&[0xff, 0xda, 0x00, 0x03, 3]);
+        assert_eq!(JpegInfo::parse(&short_sos), Err(JpegError::Malformed));
+    }
+
+    #[test]
+    fn scan_over_24_bits_is_rejected() {
+        let jpeg = build(&Spec {
+            scan_len: MAX_SCAN_LEN + 1,
+            ..Spec::default()
+        });
+        let mut packetizer = JpegPacketizer::new(config(1400)).unwrap();
+        let mut pool = PacketPool::new();
+        assert_eq!(
+            packetizer.packetize(&jpeg, 0, &mut pool),
+            Err(JpegError::ScanTooLarge(MAX_SCAN_LEN + 1))
+        );
+    }
+
+    #[test]
+    fn component_count_and_fill_bytes_are_checked() {
+        let mut two = sof_with(3);
+        two[11] = 2; // announce two components
+        assert_eq!(JpegInfo::parse(&two), Err(JpegError::UnsupportedComponents));
+        // Fill bytes with nothing after them.
+        assert_eq!(
+            JpegInfo::parse(&[0xff, 0xd8, 0xff, 0xff]),
+            Err(JpegError::Malformed)
+        );
+    }
+
+    #[test]
+    fn chroma_sampling_must_be_one_by_one() {
+        let mut jpeg = build(&Spec::default());
+        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        jpeg[sof + 14] = 0x22;
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::UnsupportedSampling));
+    }
+
+    #[test]
+    fn scan_ending_in_a_lone_ff_has_no_eoi() {
+        let mut jpeg = with_before_eoi(&[]);
+        jpeg.truncate(jpeg.len() - 2);
+        jpeg.push(0xff);
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::MissingEoi));
+    }
+
+    #[test]
+    fn stray_byte_after_a_trailer_segment_is_a_bad_marker() {
+        assert_eq!(
+            JpegInfo::parse(&with_before_eoi(&[0xff, 0xfe, 0x00, 0x02, 0x12])),
+            Err(JpegError::BadMarker)
+        );
+    }
+
+    #[test]
+    fn unknown_huffman_table_id_is_unsupported() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xc4, 0x00, 0x13, 0x22];
+        jpeg.extend([0; 16]);
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::UnsupportedHuffman));
+    }
+
+    #[test]
+    fn huffman_table_with_missing_symbols_is_malformed() {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xc4, 0x00, 0x13, 0x00, 5];
+        jpeg.extend([0; 15]);
+        assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::Malformed));
+    }
+
+    #[test]
+    fn bad_segment_lengths_are_malformed() {
+        // Length below the two length bytes, then a length past the end of the data.
+        for tail in [&[0x00, 0x01][..], &[0x00, 0x09, 0x01]] {
+            let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+            jpeg.extend_from_slice(tail);
+            assert_eq!(JpegInfo::parse(&jpeg), Err(JpegError::Malformed));
+        }
+    }
+
+    #[test]
+    fn short_huffman_table_header_is_malformed() {
+        assert_eq!(
+            JpegInfo::parse(&[0xff, 0xd8, 0xff, 0xc4, 0x00, 0x05, 0x00, 0x01, 0x02]),
+            Err(JpegError::Malformed)
+        );
+    }
+
+    #[test]
+    fn short_restart_interval_is_malformed() {
+        assert_eq!(
+            JpegInfo::parse(&[0xff, 0xd8, 0xff, 0xdd, 0x00, 0x03, 0x01]),
+            Err(JpegError::Malformed)
+        );
+    }
+
+    #[test]
+    fn quantization_table_ids_are_checked() {
+        let jpeg = build(&Spec::default());
+        let dqt = jpeg.windows(2).position(|w| w == [0xff, 0xdb]).unwrap();
+        let mut bad_id = jpeg.clone();
+        bad_id[dqt + 4] = 4;
+        assert_eq!(JpegInfo::parse(&bad_id), Err(JpegError::BadTableId(4)));
+
+        // Point each component at table 2, which no `DQT` defines.
+        let sof = jpeg.windows(2).position(|w| w == [0xff, 0xc0]).unwrap();
+        for table_at in [sof + 12, sof + 15, sof + 18] {
+            let mut missing = jpeg.clone();
+            missing[table_at] = 2;
+            assert_eq!(JpegInfo::parse(&missing), Err(JpegError::MissingTable(2)));
+        }
+    }
+
+    #[test]
+    fn truncated_trailer_segments_are_malformed() {
+        for extra in [&[0xff, 0xfe][..], &[0xff, 0xfe, 0x00, 0x01]] {
+            assert_eq!(
+                JpegInfo::parse(&with_before_eoi(extra)),
+                Err(JpegError::Malformed),
+                "{extra:02x?}"
+            );
+        }
     }
 
     #[test]

@@ -90,12 +90,9 @@ impl Header {
     /// # Errors
     /// Returns an error for a short header, unsupported version, or optional flags.
     pub fn decode(input: &[u8]) -> Result<Self, HeaderError> {
-        let header: [u8; 12] = input
-            .get(..HEADER_LEN)
-            .ok_or(HeaderError::Truncated)?
-            .try_into()
-            .map_err(|_| HeaderError::Truncated)?;
-        let [flags, payload, s0, s1, t0, t1, t2, t3, i0, i1, i2, i3] = header;
+        let &[flags, payload, s0, s1, t0, t1, t2, t3, i0, i1, i2, i3] = input
+            .first_chunk::<HEADER_LEN>()
+            .ok_or(HeaderError::Truncated)?;
         if flags >> 6 != 2 {
             return Err(HeaderError::Version);
         }
@@ -395,6 +392,14 @@ mod tests {
         pool.clear();
         assert!(pool.is_empty());
         assert_eq!(pool.data.capacity(), capacity);
+    }
+
+    #[test]
+    fn pool_with_capacity_reserves_without_packets() {
+        let pool = PacketPool::with_capacity(64, 4);
+        assert!(pool.is_empty());
+        assert!(pool.data.capacity() >= 64);
+        assert!(pool.ends.capacity() >= 4);
     }
 
     proptest! {

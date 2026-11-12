@@ -55,17 +55,20 @@ pub struct AnnexB<'a> {
     rest: &'a [u8],
 }
 
-fn find_start_code(data: &[u8]) -> Option<usize> {
-    data.windows(3).position(|w| w == [0, 0, 1])
+/// Split `data` at its first `00 00 01` start code into the bytes before it and the bytes after
+/// it. `None` when there is no start code.
+fn split_at_start_code(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    data.windows(3)
+        .position(|w| w == [0, 0, 1])
+        .and_then(|at| data.split_at_checked(at))
+        .and_then(|(before, from)| from.get(3..).map(|after| (before, after)))
 }
 
 impl<'a> AnnexB<'a> {
     /// Iterate over the NAL units in `data`.
     #[must_use]
     pub fn new(data: &'a [u8]) -> Self {
-        let rest = find_start_code(data)
-            .and_then(|at| data.get(at + 3..))
-            .unwrap_or_default();
+        let rest = split_at_start_code(data).map_or_else(Default::default, |(_, after)| after);
         Self { rest }
     }
 }
@@ -75,13 +78,8 @@ impl<'a> Iterator for AnnexB<'a> {
 
     fn next(&mut self) -> Option<&'a [u8]> {
         while !self.rest.is_empty() {
-            let (nal, tail) = match find_start_code(self.rest) {
-                Some(at) => (
-                    self.rest.get(..at)?,
-                    self.rest.get(at + 3..).unwrap_or_default(),
-                ),
-                None => (self.rest, <&[u8]>::default()),
-            };
+            let (nal, tail) =
+                split_at_start_code(self.rest).unwrap_or((self.rest, <&[u8]>::default()));
             self.rest = tail;
             let end = nal.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
             if let Some(trimmed) = nal.get(..end).filter(|n| !n.is_empty()) {
@@ -221,7 +219,7 @@ impl ParameterSets {
     #[must_use]
     pub fn profile_level_id(&self) -> Option<String> {
         let sps = self.sps.first()?;
-        let [_, a, b, c] = *sps.get(..4)?.first_chunk::<4>()?;
+        let [_, a, b, c] = *sps.first_chunk::<4>()?;
         Some(format!("{a:02x}{b:02x}{c:02x}"))
     }
 }
@@ -297,28 +295,43 @@ mod tests {
             );
             assert_eq!(header.marker, i + 1 == count, "marker only on last packet");
             let payload = &packet[HEADER_LEN..];
-            match payload[0] & 0x1f {
-                1..=23 => {
+            let nal_type = payload[0] & 0x1f;
+            if nal_type == 28 {
+                let fu = payload[1];
+                if fu & 0x80 != 0 {
                     assert!(current.is_none());
-                    nals.push(payload.to_vec());
+                    current = Some(vec![(payload[0] & 0xe0) | (fu & 0x1f)]);
                 }
-                28 => {
-                    let fu = payload[1];
-                    if fu & 0x80 != 0 {
-                        assert!(current.is_none());
-                        current = Some(vec![(payload[0] & 0xe0) | (fu & 0x1f)]);
-                    }
-                    let nal = current.as_mut().unwrap();
-                    nal.extend_from_slice(&payload[2..]);
-                    if fu & 0x40 != 0 {
-                        nals.push(current.take().unwrap());
-                    }
+                let nal = current.as_mut().unwrap();
+                nal.extend_from_slice(&payload[2..]);
+                if fu & 0x40 != 0 {
+                    nals.push(current.take().unwrap());
                 }
-                other => panic!("unexpected NAL type {other}"),
+            } else {
+                assert!(
+                    (1..=23).contains(&nal_type),
+                    "unexpected NAL type {nal_type}"
+                );
+                assert!(current.is_none());
+                nals.push(payload.to_vec());
             }
         }
         assert!(current.is_none());
         nals
+    }
+
+    #[test]
+    fn profile_level_id_needs_a_full_first_sps() {
+        let sets = |sps: Vec<Vec<u8>>| ParameterSets {
+            sps,
+            pps: vec![vec![0x68]],
+        };
+        assert_eq!(sets(vec![]).profile_level_id(), None);
+        assert_eq!(sets(vec![vec![0x67, 0x42, 0xc0]]).profile_level_id(), None);
+        assert_eq!(
+            sets(vec![vec![0x67, 0x42, 0xc0, 0x1f]]).profile_level_id(),
+            Some("42c01f".to_owned())
+        );
     }
 
     #[test]
@@ -362,6 +375,10 @@ mod tests {
             ]
         );
         assert_eq!(packetizer.next_sequence(), 0);
+        assert_eq!(
+            depacketize(&pool, 1400, 0x1000, 65_534),
+            vec![vec![0x67, 0x42, 0x00, 0x1f], vec![0x68, 0xce, 0x3c]]
+        );
     }
 
     #[test]

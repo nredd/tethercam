@@ -265,17 +265,17 @@ impl Value {
             Self::UInt64(v) => writer.u64(*v),
             Self::Int128(v) => writer.i128(*v),
             Self::UInt128(v) => writer.u128(*v),
-            Self::Int8Array(v) => writer.array(v, |w, x| w.i8(*x))?,
-            Self::UInt8Array(v) => writer.array(v, |w, x| w.u8(*x))?,
-            Self::Int16Array(v) => writer.array(v, |w, x| w.i16(*x))?,
-            Self::UInt16Array(v) => writer.array(v, |w, x| w.u16(*x))?,
-            Self::Int32Array(v) => writer.array(v, |w, x| w.i32(*x))?,
-            Self::UInt32Array(v) => writer.array(v, |w, x| w.u32(*x))?,
-            Self::Int64Array(v) => writer.array(v, |w, x| w.i64(*x))?,
-            Self::UInt64Array(v) => writer.array(v, |w, x| w.u64(*x))?,
-            Self::Int128Array(v) => writer.array(v, |w, x| w.i128(*x))?,
-            Self::UInt128Array(v) => writer.array(v, |w, x| w.u128(*x))?,
-            Self::String(v) => writer.string(v)?,
+            Self::Int8Array(v) => return writer.array(v, |w, x| w.i8(*x)),
+            Self::UInt8Array(v) => return writer.array(v, |w, x| w.u8(*x)),
+            Self::Int16Array(v) => return writer.array(v, |w, x| w.i16(*x)),
+            Self::UInt16Array(v) => return writer.array(v, |w, x| w.u16(*x)),
+            Self::Int32Array(v) => return writer.array(v, |w, x| w.i32(*x)),
+            Self::UInt32Array(v) => return writer.array(v, |w, x| w.u32(*x)),
+            Self::Int64Array(v) => return writer.array(v, |w, x| w.i64(*x)),
+            Self::UInt64Array(v) => return writer.array(v, |w, x| w.u64(*x)),
+            Self::Int128Array(v) => return writer.array(v, |w, x| w.i128(*x)),
+            Self::UInt128Array(v) => return writer.array(v, |w, x| w.u128(*x)),
+            Self::String(v) => return writer.string(v),
         }
         Ok(())
     }
@@ -367,6 +367,44 @@ mod tests {
     }
 
     #[test]
+    fn every_variant_round_trips() {
+        let values = [
+            Value::Int8(-8),
+            Value::UInt8(8),
+            Value::Int16(-16),
+            Value::UInt16(16),
+            Value::Int32(-32),
+            Value::UInt32(32),
+            Value::Int64(-64),
+            Value::UInt64(64),
+            Value::Int128(-128),
+            Value::UInt128(128),
+            Value::Int8Array(vec![-1, 2]),
+            Value::UInt8Array(vec![1, 2]),
+            Value::Int16Array(vec![-1, 2]),
+            Value::UInt16Array(vec![1, 2]),
+            Value::Int32Array(vec![-1, 2]),
+            Value::UInt32Array(vec![1, 2]),
+            Value::Int64Array(vec![-1, 2]),
+            Value::UInt64Array(vec![1, 2]),
+            Value::Int128Array(vec![-1, 2]),
+            Value::UInt128Array(vec![1, 2]),
+            Value::String("text".into()),
+        ];
+        for (value, dt) in values.into_iter().zip(ALL) {
+            assert_eq!(value.data_type(), dt);
+            let wire = value.to_bytes().unwrap();
+            assert_eq!(Value::from_bytes(dt, &wire), Ok(value));
+        }
+    }
+
+    #[test]
+    fn overlong_string_fails_to_encode() {
+        let value = Value::String("a".repeat(255));
+        assert_eq!(value.to_bytes(), Err(CodecError::StringTooLong(256)));
+    }
+
+    #[test]
     fn golden_array() {
         let value = Value::UInt16Array(vec![0x5001, 0x5002]);
         let wire = [2, 0, 0, 0, 0x01, 0x50, 0x02, 0x50];
@@ -377,10 +415,15 @@ mod tests {
     #[test]
     fn every_type_reports_truncation_on_empty_input() {
         for dt in ALL {
-            assert!(matches!(
-                Value::from_bytes(dt, &[]),
-                Err(CodecError::Truncated { .. })
-            ));
+            let err = Value::from_bytes(dt, &[]).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&CodecError::Truncated {
+                    needed: 0,
+                    available: 0
+                }),
+                "{dt:?}"
+            );
         }
     }
 
@@ -388,9 +431,8 @@ mod tests {
     fn value_data_type_matches_decode_request() {
         for dt in ALL {
             let wire = [0_u8; 32];
-            if let Ok(value) = Value::from_bytes(dt, &wire) {
-                assert_eq!(value.data_type(), dt);
-            }
+            let value = Value::from_bytes(dt, &wire).unwrap();
+            assert_eq!(value.data_type(), dt);
         }
     }
 }

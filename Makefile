@@ -1,4 +1,4 @@
-.PHONY: help build test fmt fmt-check lint doc check deny bench bench-check cross clean all
+.PHONY: help build test fmt fmt-check lint doc check deny bench bench-check cross coverage coverage-report clean all
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -38,7 +38,25 @@ cross:  ## Compile-check the embedded Linux targets
 	cargo check --all-features --target aarch64-unknown-linux-gnu
 	cargo check --all-features --target armv7-unknown-linux-gnueabihf
 
+# Files listed in `coverage-pending.txt` are the only `src/` code allowed below 100%.
+COVERAGE_IGNORE = $$(scripts/coverage-pending.sh regex)
+
+coverage:  ## Enforce 100% line, function and region coverage of src/ (needs cargo-llvm-cov)
+	scripts/test-coverage-pending.sh
+	scripts/coverage-pending.sh validate
+	@if git rev-parse --verify --quiet origin/main >/dev/null; then scripts/coverage-pending.sh shrink origin/main; fi
+	ignore="$(COVERAGE_IGNORE)"; \
+	cargo llvm-cov nextest --all-features --show-missing-lines \
+		--fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
+		$${ignore:+--ignore-filename-regex "$$ignore"}
+
+coverage-report:  ## Write lcov and HTML reports to coverage/ from the last `make coverage` run
+	mkdir -p coverage
+	ignore="$(COVERAGE_IGNORE)"; \
+	cargo llvm-cov report --lcov --output-path coverage/lcov.info $${ignore:+--ignore-filename-regex "$$ignore"}; \
+	cargo llvm-cov report --html --output-dir coverage $${ignore:+--ignore-filename-regex "$$ignore"}
+
 clean:  ## Clean artifacts
 	cargo clean
 
-all: fmt-check lint check test doc bench-check deny  ## Run the full gate (what CI runs)
+all: fmt-check lint check test doc bench-check deny coverage  ## Run the full gate (what CI runs)

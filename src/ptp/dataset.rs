@@ -90,15 +90,18 @@ impl DeviceInfo {
         writer.u16(self.vendor_extension_version);
         writer.string(&self.vendor_extension_desc)?;
         writer.u16(self.functional_mode);
-        writer.array(&self.operations_supported, |w, c| w.u16(c.0))?;
-        writer.array(&self.events_supported, |w, c| w.u16(c.0))?;
-        writer.array(&self.device_properties_supported, |w, c| w.u16(c.0))?;
-        writer.array(&self.capture_formats, |w, c| w.u16(*c))?;
-        writer.array(&self.image_formats, |w, c| w.u16(*c))?;
-        writer.string(&self.manufacturer)?;
-        writer.string(&self.model)?;
-        writer.string(&self.device_version)?;
-        writer.string(&self.serial_number)
+        // One expression: an array can only fail past `u32::MAX` elements, which no test can
+        // build, so the arrays share a single error path instead of one `?` each.
+        writer
+            .array(&self.operations_supported, |w, c| w.u16(c.0))
+            .and_then(|()| writer.array(&self.events_supported, |w, c| w.u16(c.0)))
+            .and_then(|()| writer.array(&self.device_properties_supported, |w, c| w.u16(c.0)))
+            .and_then(|()| writer.array(&self.capture_formats, |w, c| w.u16(*c)))
+            .and_then(|()| writer.array(&self.image_formats, |w, c| w.u16(*c)))
+            .and_then(|()| writer.string(&self.manufacturer))
+            .and_then(|()| writer.string(&self.model))
+            .and_then(|()| writer.string(&self.device_version))
+            .and_then(|()| writer.string(&self.serial_number))
     }
 
     /// The dataset's wire form.
@@ -375,8 +378,8 @@ impl DevicePropDesc {
             }
         };
         check(&self.current)?;
-        match &self.form {
-            PropertyForm::None => {}
+        let enumeration_count = match &self.form {
+            PropertyForm::None => 0,
             PropertyForm::Range {
                 minimum,
                 maximum,
@@ -385,13 +388,15 @@ impl DevicePropDesc {
                 check(minimum)?;
                 check(maximum)?;
                 check(step)?;
+                0
             }
             PropertyForm::Enumeration(values) => {
-                u16::try_from(values.len())
+                let count = u16::try_from(values.len())
                     .map_err(|_| CodecError::CollectionTooLong(values.len()))?;
                 values.iter().try_for_each(check)?;
+                count
             }
-        }
+        };
 
         writer.u16(self.code.0);
         writer.u16(data_type.code());
@@ -412,9 +417,7 @@ impl DevicePropDesc {
             }
             PropertyForm::Enumeration(values) => {
                 writer.u8(2);
-                let count = u16::try_from(values.len())
-                    .map_err(|_| CodecError::CollectionTooLong(values.len()))?;
-                writer.u16(count);
+                writer.u16(enumeration_count);
                 for value in values {
                     value.encode(writer)?;
                 }
@@ -650,10 +653,13 @@ mod tests {
         let wire = [
             0x01, 0x50, 0x02, 0x00, 0x00, 0x64, 0x32, 0x02, 0xFF, 0xFF, 0x01,
         ];
-        assert!(matches!(
+        assert_eq!(
             DevicePropDesc::decode(&wire),
-            Err(CodecError::Truncated { .. })
-        ));
+            Err(CodecError::Truncated {
+                needed: 1,
+                available: 0
+            })
+        );
     }
 
     #[test]
@@ -682,6 +688,164 @@ mod tests {
         ];
         for len in 0..wire.len() {
             assert!(DevicePropDesc::decode(&wire[..len]).is_err(), "len {len}");
+        }
+    }
+
+    fn long() -> String {
+        "a".repeat(255)
+    }
+
+    #[test]
+    fn device_info_rejects_each_overlong_string() {
+        let fields: [fn(&mut DeviceInfo, String); 5] = [
+            |i, v| i.vendor_extension_desc = v,
+            |i, v| i.manufacturer = v,
+            |i, v| i.model = v,
+            |i, v| i.device_version = v,
+            |i, v| i.serial_number = v,
+        ];
+        for set in fields {
+            let mut info = DeviceInfo::default();
+            set(&mut info, long());
+            assert_eq!(info.to_bytes(), Err(CodecError::StringTooLong(256)));
+        }
+    }
+
+    #[test]
+    fn device_info_stops_writing_at_the_first_error() {
+        let info = DeviceInfo {
+            manufacturer: long(),
+            model: "model".into(),
+            ..DeviceInfo::default()
+        };
+        let mut writer = Writer::new();
+        assert_eq!(info.write(&mut writer), Err(CodecError::StringTooLong(256)));
+        // Everything before `manufacturer` (2 + 4 + 2 + 1 + 2 + 5 * 4 bytes) was written;
+        // `model` and later were not.
+        assert_eq!(writer.as_bytes().len(), 31);
+    }
+
+    #[test]
+    fn object_info_rejects_each_overlong_string() {
+        let fields: [fn(&mut ObjectInfo, String); 4] = [
+            |i, v| i.filename = v,
+            |i, v| i.capture_date = v,
+            |i, v| i.modification_date = v,
+            |i, v| i.keywords = v,
+        ];
+        for set in fields {
+            let mut info = ObjectInfo::default();
+            set(&mut info, long());
+            assert_eq!(info.to_bytes(), Err(CodecError::StringTooLong(256)));
+        }
+    }
+
+    #[test]
+    fn prop_desc_range_every_truncation_is_an_error() {
+        let wire = [
+            0x01, 0x50, 0x02, 0x00, 0x00, 0x64, 0x32, 0x01, 0x00, 0x64, 0x01,
+        ];
+        for len in 0..wire.len() {
+            assert!(DevicePropDesc::decode(&wire[..len]).is_err(), "len {len}");
+        }
+    }
+
+    fn uint8_desc(form: PropertyForm) -> DevicePropDesc {
+        DevicePropDesc {
+            code: DevicePropCode::BATTERY_LEVEL,
+            get_set: GetSet::Get,
+            factory_default: Value::UInt8(1),
+            current: Value::UInt8(1),
+            form,
+        }
+    }
+
+    fn string_desc(factory_default: String, current: String, form: PropertyForm) -> DevicePropDesc {
+        DevicePropDesc {
+            code: DevicePropCode::ARTIST,
+            get_set: GetSet::GetSet,
+            factory_default: Value::String(factory_default),
+            current: Value::String(current),
+            form,
+        }
+    }
+
+    #[test]
+    fn prop_desc_encode_rejects_each_mismatched_form_value() {
+        let mismatch = Err(CodecError::DataTypeMismatch {
+            expected: 0x0002,
+            actual: 0x0004,
+        });
+        let bad = Value::UInt16(1);
+        let good = Value::UInt8(1);
+        for (minimum, maximum, step) in [
+            (bad.clone(), good.clone(), good.clone()),
+            (good.clone(), bad.clone(), good.clone()),
+            (good.clone(), good.clone(), bad.clone()),
+        ] {
+            let desc = uint8_desc(PropertyForm::Range {
+                minimum,
+                maximum,
+                step,
+            });
+            assert_eq!(desc.to_bytes(), mismatch);
+        }
+        let desc = uint8_desc(PropertyForm::Enumeration(vec![good, bad]));
+        assert_eq!(desc.to_bytes(), mismatch);
+    }
+
+    #[test]
+    fn prop_desc_enumeration_count_is_capped_at_u16() {
+        let max = usize::from(u16::MAX);
+        let ok = uint8_desc(PropertyForm::Enumeration(vec![Value::UInt8(0); max]));
+        let wire = ok.to_bytes().unwrap();
+        assert_eq!(DevicePropDesc::decode(&wire), Ok(ok));
+        let too_many = uint8_desc(PropertyForm::Enumeration(vec![Value::UInt8(0); max + 1]));
+        assert_eq!(
+            too_many.to_bytes(),
+            Err(CodecError::CollectionTooLong(max + 1))
+        );
+    }
+
+    #[test]
+    fn prop_desc_encode_rejects_overlong_strings_wherever_they_sit() {
+        let value = || Value::String(long());
+        let empty = String::new;
+        let too_long = Err(CodecError::StringTooLong(256));
+        let cases = [
+            string_desc(long(), empty(), PropertyForm::None),
+            string_desc(empty(), long(), PropertyForm::None),
+            string_desc(
+                empty(),
+                empty(),
+                PropertyForm::Range {
+                    minimum: value(),
+                    maximum: Value::String(empty()),
+                    step: Value::String(empty()),
+                },
+            ),
+            string_desc(
+                empty(),
+                empty(),
+                PropertyForm::Range {
+                    minimum: Value::String(empty()),
+                    maximum: value(),
+                    step: Value::String(empty()),
+                },
+            ),
+            string_desc(
+                empty(),
+                empty(),
+                PropertyForm::Range {
+                    minimum: Value::String(empty()),
+                    maximum: Value::String(empty()),
+                    step: value(),
+                },
+            ),
+            string_desc(empty(), empty(), PropertyForm::Enumeration(vec![value()])),
+        ];
+        for desc in cases {
+            assert_eq!(desc.to_bytes(), too_long);
         }
     }
 }

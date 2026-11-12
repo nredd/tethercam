@@ -52,11 +52,12 @@ On the camera:
 ## Development
 
 ```sh
-make help   # list targets
-make all    # the full gate: format check, clippy, tests, docs, benchmarks, dependency audit
+make help       # list targets
+make all        # the full gate: format check, clippy, tests, docs, benchmarks, dependency audit, coverage
+make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-cov)
 ```
 
-Tools: `cargo-nextest` and `cargo-deny`. Everything runs without a camera attached.
+Tools: `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached.
 Repository rules are in [`AGENTS.md`](AGENTS.md); releases are described in
 [`docs/releasing.md`](docs/releasing.md).
 

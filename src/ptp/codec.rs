@@ -111,12 +111,15 @@ impl<'a> Reader<'a> {
     }
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], CodecError> {
-        let available = self.buf.len();
-        let head = self.take(N)?;
-        <[u8; N]>::try_from(head).map_err(|_| CodecError::Truncated {
-            needed: N,
-            available,
-        })
+        let (head, tail) = self
+            .buf
+            .split_first_chunk::<N>()
+            .ok_or(CodecError::Truncated {
+                needed: N,
+                available: self.buf.len(),
+            })?;
+        self.buf = tail;
+        Ok(*head)
     }
 
     reader_ints! {
@@ -320,10 +323,13 @@ mod tests {
             Reader::new(&[2, 0x00, 0xD8, 0, 0]).string(),
             Err(CodecError::InvalidUtf16)
         );
-        assert!(matches!(
+        assert_eq!(
             Reader::new(&[3, b'a', 0]).string(),
-            Err(CodecError::Truncated { .. })
-        ));
+            Err(CodecError::Truncated {
+                needed: 6,
+                available: 2
+            })
+        );
     }
 
     #[test]
@@ -360,18 +366,55 @@ mod tests {
     #[test]
     fn zero_elem_size_cannot_bypass_the_bound() {
         let wire = [0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(matches!(
+        assert_eq!(
             Reader::new(&wire).array(0, Reader::u16),
-            Err(CodecError::Truncated { .. })
-        ));
+            Err(CodecError::Truncated {
+                needed: 0xFFFF_FFFF,
+                available: 0
+            })
+        );
     }
 
     #[test]
     fn hostile_array_count_does_not_allocate() {
         let wire = [0xFF, 0xFF, 0xFF, 0xFF, 0x00];
-        assert!(matches!(
+        assert_eq!(
             Reader::new(&wire).array(1, Reader::u8),
-            Err(CodecError::Truncated { .. })
-        ));
+            Err(CodecError::Truncated {
+                needed: 0xFFFF_FFFF,
+                available: 1
+            })
+        );
+    }
+
+    #[test]
+    fn element_error_aborts_the_array() {
+        // Two `u16` elements are announced and the byte bound passes, but the second is short.
+        let wire = [2, 0, 0, 0, 0x01, 0x10, 0x02];
+        assert_eq!(
+            Reader::new(&wire).array(1, Reader::u16),
+            Err(CodecError::Truncated {
+                needed: 2,
+                available: 1
+            })
+        );
+    }
+
+    /// Zero-sized elements make a slice longer than `u32::MAX` free to build.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn array_longer_than_u32_is_rejected() {
+        let len = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let write_zst = |w: &mut Writer, (): &()| w.u8(0);
+        let items = vec![(); len];
+        let mut w = Writer::new();
+        assert_eq!(
+            w.array(&items, write_zst),
+            Err(CodecError::CollectionTooLong(len))
+        );
+        assert_eq!(w.as_bytes(), []);
+        // The same writer still works for a short array.
+        w.array(&[(), ()], write_zst).unwrap();
+        assert_eq!(w.as_bytes(), [2, 0, 0, 0, 0, 0]);
     }
 }
