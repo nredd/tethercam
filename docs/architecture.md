@@ -162,6 +162,7 @@ Not yet established, tracked as issues:
   failures through the same non-generic helpers used by the real sockets and threads. Loopback
   tests exercise request deadlines, pipelining, connection caps and wildcard shutdown; IPv4
   must succeed, while IPv6 may skip only an explicitly unavailable address family
+- WS-Discovery UDP tests use OS-assigned loopback ports, check fixed-port sharing and ephemeral-port exclusivity, and exercise socket setup failures without privileged host changes. A concrete receive syscall seam covers fatal errors without invalidating descriptors. Multicast packet round-trips and captured client probes remain tracked in #33
 - Property tests for every parser; golden-byte tests for every encoder against captures
 - `criterion` benchmarks for per-frame paths, compiled and smoke-run in CI
 - Hardware-in-the-loop tests are `#[ignore]`d and run by hand with a camera attached
