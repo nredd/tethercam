@@ -23,6 +23,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --test repository_policy
   test:
+    env:
+      TETHERCAM_USBIP: ${{ matrix.os != 'macos-latest' && '1' || '0' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -39,12 +41,10 @@ jobs:
         with:
           tool: cargo-nextest
       - if: runner.os == 'Linux'
-        run: |
-          scripts/usbip-ci.sh prepare
-          echo 'TETHERCAM_USBIP=1' >> "$GITHUB_ENV"
+        run: cargo run --features repo-tools --bin tethercam-tools -- usbip prepare
       - run: make test
       - if: always() && runner.os == 'Linux'
-        run: scripts/usbip-ci.sh detach
+        run: cargo run --features repo-tools --bin tethercam-tools -- usbip detach
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15

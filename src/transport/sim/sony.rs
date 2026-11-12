@@ -123,6 +123,15 @@ pub enum Defect {
     BadLiveViewAfterFirst,
 }
 
+/// Whether the synthetic body advertises optional diagnostic resolution controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionControls {
+    /// Do not advertise optional controls.
+    Absent,
+    /// Advertise size, drive mode and autofocus status.
+    Present,
+}
+
 /// How a simulated Sony body behaves. [`Default`] is an older-generation body such as the
 /// a7 III: protocol 2.00, and live view that works after a short warm-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +164,8 @@ pub struct SonySimConfig {
     pub emit_object_added: bool,
     /// Whether an image already waits in memory when the body powers up.
     pub stale_image: bool,
+    /// Advertise resolution, single-drive and autofocus status diagnostic controls.
+    pub resolution_controls: ResolutionControls,
     /// The JPEG served as live view.
     pub live_view_jpeg: Vec<u8>,
     /// The bytes served for a captured still.
@@ -178,6 +189,7 @@ impl Default for SonySimConfig {
             defect: Defect::None,
             emit_object_added: true,
             stale_image: false,
+            resolution_controls: ResolutionControls::Absent,
             live_view_jpeg: vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x01, 0x02, 0xFF, 0xD9],
             still: vec![0xFF, 0xD8, 0xFF, 0xE1, 0xAA, 0xBB, 0xFF, 0xD9],
         }
@@ -357,6 +369,15 @@ impl SonyResponder {
                 Form::Range(Value::UInt16(2500), Value::UInt16(9900), Value::UInt16(100)),
             ),
         ];
+        if config.resolution_controls == ResolutionControls::Present {
+            props.extend([
+                plain(0xd203, 1, Value::UInt8(2), Value::UInt8(0)),
+                plain(0x5004, 1, Value::UInt8(4), Value::UInt8(0)),
+                plain(0x5013, 1, Value::UInt16(1), Value::UInt16(0)),
+                plain(0xd213, 0, Value::UInt16(2), Value::UInt16(0)),
+                plain(0x500d, 0, Value::UInt32(10_000), Value::UInt32(0)),
+            ]);
+        }
         let status = match config.live_view {
             LiveViewMode::Works => Some(1),
             LiveViewMode::Unsupported => Some(2),

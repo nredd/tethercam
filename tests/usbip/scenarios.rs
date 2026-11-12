@@ -71,7 +71,7 @@ async fn control(socket: &mut TcpStream, seq: u32, setup: [u8; 8]) -> io::Result
 #[tokio::test]
 async fn standard_control_requests_validate_and_preserve_usb_state()
 -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::start(0).await?;
+    let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
     let mut socket = import(&server).await?;
     let (status, configuration) = control(&mut socket, 1, [0x80, 6, 0, 2, 0, 0, 9, 0]).await?;
     assert_eq!(status, 0);
@@ -155,9 +155,7 @@ fn total_codec_rejects_invalid_fields_and_encodes_network_order() {
     }
     assert!(wire::word(&good, usize::MAX).is_err());
     assert_eq!(
-        wire::descriptor(1, 0, 0x0c03)
-            .expect("wrong mode")
-            .get(10..12),
+        descriptor(1, 0, 0x0c03).expect("wrong mode").get(10..12),
         Some([3, 0x0c].as_slice())
     );
 }
@@ -165,7 +163,7 @@ fn total_codec_rejects_invalid_fields_and_encodes_network_order() {
 #[tokio::test]
 async fn fragmented_devlist_and_pending_interrupt_unlink() -> Result<(), Box<dyn std::error::Error>>
 {
-    let server = Server::start(0).await?;
+    let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
     assert!(server.address.ip().is_loopback());
     let mut list = TcpStream::connect(server.address).await?;
     for byte in wire::operation(0x8005, 0) {
@@ -184,7 +182,7 @@ async fn fragmented_devlist_and_pending_interrupt_unlink() -> Result<(), Box<dyn
     })
     .await?;
     server
-        .state
+        .model
         .lock()
         .await
         .camera
@@ -224,7 +222,7 @@ async fn fragmented_devlist_and_pending_interrupt_unlink() -> Result<(), Box<dyn
 #[tokio::test]
 async fn oversized_urb_and_duplicate_import_fail_closed() -> Result<(), Box<dyn std::error::Error>>
 {
-    let server = Server::start(0).await?;
+    let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
     let mut socket = import(&server).await?;
     let mut duplicate = TcpStream::connect(server.address).await?;
     duplicate.write_all(&wire::operation(0x8003, 0)).await?;
@@ -251,7 +249,7 @@ async fn oversized_urb_and_duplicate_import_fail_closed() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn pending_urb_count_and_memory_are_bounded() -> Result<(), Box<dyn std::error::Error>> {
     for (count, length) in [(33, 64), (5, 1_048_576)] {
-        let server = Server::start(0).await?;
+        let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
         let mut socket = import(&server).await?;
         for seq in 1..=count {
             socket.write_all(&header(1, seq, 1, 1, length)).await?;
@@ -272,7 +270,7 @@ async fn pending_urb_count_and_memory_are_bounded() -> Result<(), Box<dyn std::e
 async fn completed_out_history_and_queued_work_have_an_export_lifetime_budget()
 -> Result<(), Box<dyn std::error::Error>> {
     for commands_without_reads in [false, true] {
-        let server = Server::start(0).await?;
+        let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
         let mut socket = import(&server).await?;
         let mut completed = 0;
         for seq in 1..=128 {
@@ -299,7 +297,7 @@ async fn completed_out_history_and_queued_work_have_an_export_lifetime_budget()
         }
         assert!(completed > 0 && completed < 64);
         assert_eq!(
-            server.state.lock().await.camera.bulk_out_transfers().len(),
+            server.model.lock().await.camera.bulk_out_transfers().len(),
             completed
         );
         let mut imported_again = import(&server).await?;
@@ -312,7 +310,7 @@ async fn completed_out_history_and_queued_work_have_an_export_lifetime_budget()
             io::ErrorKind::UnexpectedEof
         );
         assert_eq!(
-            server.state.lock().await.camera.bulk_out_transfers().len(),
+            server.model.lock().await.camera.bulk_out_transfers().len(),
             completed
         );
     }
@@ -322,7 +320,7 @@ async fn completed_out_history_and_queued_work_have_an_export_lifetime_budget()
 #[tokio::test]
 async fn control_history_capacity_cannot_be_bypassed_by_reimport()
 -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::start(0).await?;
+    let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
     server.state.lock().await.controls.resize(4095, [0; 8]);
     let mut socket = import(&server).await?;
     assert_eq!(
@@ -355,7 +353,7 @@ async fn control_history_capacity_cannot_be_bypassed_by_reimport()
 
 #[tokio::test]
 async fn pending_urb_has_a_deadline() -> Result<(), Box<dyn std::error::Error>> {
-    let server = Server::start(0).await?;
+    let server = Server::start(0, tethercam::test_support::Sony::default()).await?;
     let mut socket = import(&server).await?;
     socket.write_all(&header(1, 1, 3, 1, 64)).await?;
     let mut reply = [0; 48];
@@ -366,4 +364,11 @@ async fn pending_urb_has_a_deadline() -> Result<(), Box<dyn std::error::Error>> 
     );
     assert_eq!(server.state.lock().await.errors, [] as [String; 0]);
     Ok(())
+}
+
+fn descriptor(kind: u8, index: u8, product: u16) -> Option<Vec<u8>> {
+    use tethercam::test_support::{DeviceModel, Sony};
+    let mut model = Sony::default();
+    model.product = product;
+    model.identity().descriptor(kind, index)
 }

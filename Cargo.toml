@@ -9,8 +9,9 @@ repository = "https://github.com/nredd/tethercam"
 readme = "README.md"
 keywords = ["camera", "ptp", "onvif", "rtsp", "sony"]
 categories = ["multimedia::video", "hardware-support", "network-programming"]
-# Repository-only tests require unpublished workflow/ruleset and hosted USB/IP setup inputs.
-exclude = [".github/", "scripts/", "docs/", "tests/repository_policy.rs", "tests/usb_emulated.rs", "tests/usbip/"]
+default-run = "tethercam"
+# Repository-policy tests require unpublished workflow/ruleset inputs.
+exclude = [".github/", "docs/", "tests/repository_policy.rs"]
 
 [lib]
 name = "tethercam"
@@ -20,7 +21,18 @@ path = "src/lib.rs"
 name = "tethercam"
 path = "src/main.rs"
 
+[[bin]]
+name = "tethercam-tools"
+path = "src/tooling/main.rs"
+required-features = ["repo-tools"]
+
+[features]
+# Public verification API, not normal camera runtime. Both features are off by default.
+test-support = []
+repo-tools = ["test-support", "dep:serde_json"]
+
 [dependencies]
+serde_json = { version = "1.0.154", optional = true }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.6.1", default-features = false }
 futures-core = { version = "0.3", default-features = false }
@@ -68,6 +80,25 @@ tokio = { version = "1", default-features = false, features = ["io-util", "macro
 jpeg-encoder = { version = "0.7", default-features = false }
 serde_json = "1.0.154"
 serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
+
+[[test]]
+name = "usb_emulated"
+required-features = ["repo-tools"]
+
+[[example]]
+name = "diagnostic"
+required-features = ["test-support"]
+
+[[example]]
+name = "verification-client-fixture"
+path = "tests/fixtures/verification_client.rs"
+required-features = ["repo-tools"]
+
+[package.metadata.docs.rs]
+features = ["test-support"]
+
+[package.metadata.test-support]
+role = "Opt-in reusable verification fixtures and loopback USB/IP engine, not camera runtime"
 
 [[bench]]
 name = "ptp_container"

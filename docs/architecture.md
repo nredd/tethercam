@@ -1,7 +1,7 @@
 # Architecture
 
 `tethercam` makes a USB-tethered Sony Alpha camera look like an ordinary ONVIF network camera.
-One process, one binary, Rust only.
+One normal application process, Rust only. Optional verification APIs/tools do not change default application startup.
 
 ```text
  Sony Alpha body                      tethercam                         consumers
@@ -256,15 +256,30 @@ Not yet established, tracked as issues:
 
 - Every layer is tested without physical hardware against the simulated camera. Hosted Linux
   test and coverage jobs also exercise the real `nusb` backend through VHCI and a test-only
-  pure-Rust USB/IP Sony export (`tests/usbip/`, bound only to loopback). No libusb or native
+  pure-Rust USB/IP export (`src/test_support/`, with scenarios in `tests/usbip/`, bound only to loopback). Sony/SICDD and independent vendor-class echo personalities share one generic protocol engine. No libusb or native
   dependency is used. USB/IP network headers are big endian; USB setup/descriptors are little
   endian. URBs, pending memory and timeouts are bounded; interrupted transfers support unlink.
   An export-wide, non-refundable admission budget also bounds simulator histories and queued
   replies. Class cancellation uses `SimCamera::cancel_transaction` to discard the matching
   bulk transaction, preserve its session and resume at the next transaction id.
-  Setup and cleanup share `scripts/usbip-ci.sh`, with permissions changed only on the exact
-  synthetic VHCI device node. The sole local coverage constraint is the thin `nusb_backend.rs`
-  adapter when `CI` is unset and VHCI is absent; CI never exempts it; `make coverage` enforces exact 100% line, function and region counts per instrumented file across the actual `src/` root. llvm-cov's default filename exclusions are explicitly disabled: separately named test modules and nested test directories count too. The former default report silently omitted seven such modules (#61). The JSON validator accepts logical and physical source-root aliases, rejects malformed/empty inventories, and ignores only files outside that root. Non-executable module declarations need no coverage. Scope/schema negative fixtures run before each fresh workspace coverage collection; unfiltered JSON, lcov and HTML reports remain available through `make coverage-report`
+  Explicit Rust utility setup/cleanup changes permissions only on exact synthetic VHCI identities;
+  Cargo and tests remain unprivileged. Local native integration requires preconfigured delegated
+  controls/node access and never provisions the host. The sole local coverage constraint is the
+  thin `nusb_backend.rs` adapter when `CI` is absent and VHCI is absent; CI never exempts it.
+  `make coverage` cleans profiles, disables implicit filename exclusions and delegates zero-
+  uncovered line/function/region enforcement and empty-aggregate guards to cargo-llvm-cov alone.
+  Named and nested actual source tests count; actual external source aliases do not. Native
+  fixture-crate acceptance exercises uncovered source/support/nested tests, empty/stale inputs
+  and malformed profile merging. No bespoke report validator or `grcov` remains.
+  Unfiltered JSON, LCOV and HTML remain available through `make coverage-report`.
+  The public off-by-default `test-support` feature includes reusable engine/personality/diagnostic
+  APIs; `repo-tools` adds a thin developer binary for native setup, client inputs, subprocess
+  verification and aggregate profiling. The protocol state machine is shared through a private
+  boxed model-I/O boundary, with typed model access retained for explicit fixture mutation.
+  Persistent frame state survives select cancellation, and shutdown joins every owned
+  connection without a detached reader. Runtime application layers do not depend on this
+  verification layer. See [`verification.md`](verification.md) for bounds, feature/package roles,
+  privilege boundaries, helper interfaces and resource-accounting scope.
 - ONVIF HTTP tests inject timeout-setting, listener-inspection, accept and thread-spawn
   failures through the same non-generic helpers used by the real sockets and threads. Loopback
   tests exercise request deadlines, pipelining, connection caps and wildcard shutdown; IPv4
