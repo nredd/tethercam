@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use super::connection::Connection;
 use super::digest::{Authenticator, Credentials};
 use super::message::Limits;
-use super::sdp::{SdpError, TrackInfo};
+use super::sdp::SdpError;
 use super::source::{Fanout, MediaSource};
 
 /// Longest accepted timeout or interval (one year). Anything longer is a configuration mistake
@@ -141,14 +141,20 @@ async fn accept_ready(
 /// State shared by every connection.
 pub(crate) struct Shared<S: MediaSource> {
     pub(crate) fanout: Arc<Fanout<S>>,
+    pub(crate) mounts: Vec<Mount<S>>,
     pub(crate) auth: Authenticator,
     pub(crate) config: ServerConfig,
-    pub(crate) track: TrackInfo,
     pub(crate) sessions: Arc<Semaphore>,
     pub(crate) next_connection: std::sync::atomic::AtomicU64,
 }
 
-/// An RTSP 1.0 server over one [`MediaSource`].
+/// A separately addressed stream sharing the listener, authentication and resource limits.
+pub(crate) struct Mount<S: MediaSource> {
+    pub(crate) path: String,
+    pub(crate) fanout: Arc<Fanout<S>>,
+}
+
+/// An RTSP 1.0 server over one or more independently addressed media sources.
 pub struct RtspServer<S: MediaSource> {
     listener: TcpListener,
     shared: Arc<Shared<S>>,
@@ -164,12 +170,25 @@ impl<S: MediaSource> RtspServer<S> {
     pub async fn bind(
         addr: SocketAddr, source: Arc<S>, credentials: Credentials, config: ServerConfig,
     ) -> Result<Self, ServerError> {
+        Self::bind_mounts(addr, source, Vec::new(), credentials, config).await
+    }
+
+    /// Bind several streams to one listener. The primary source uses `config.mount_path`.
+    /// Additional paths must be distinct, non-nested absolute paths. Authentication, connection
+    /// and session limits remain shared across every mount.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] for invalid paths, tracks, limits or listener failures.
+    pub async fn bind_mounts(
+        addr: SocketAddr, source: Arc<S>, additional: Vec<(String, Arc<S>)>,
+        credentials: Credentials, config: ServerConfig,
+    ) -> Result<Self, ServerError> {
         if !config.mount_path.starts_with('/')
             || config.mount_path.ends_with('/')
             || config
                 .mount_path
                 .chars()
-                .any(|c| c.is_control() || c == ' ')
+                .any(|c| c.is_control() || c.is_whitespace())
         {
             return Err(ServerError::Config("mount_path must look like /name"));
         }
@@ -208,13 +227,36 @@ impl<S: MediaSource> RtspServer<S> {
         }
         let track = source.track();
         track.validate()?;
+        let mut paths = vec![config.mount_path.clone()];
+        let mut mounts = Vec::new();
+        for (path, source) in additional {
+            if !path.starts_with('/')
+                || path.ends_with('/')
+                || path.chars().any(|c| c.is_control() || c.is_whitespace())
+                || paths.iter().any(|p| {
+                    p == &path
+                        || path.starts_with(&format!("{p}/"))
+                        || p.starts_with(&format!("{path}/"))
+                })
+            {
+                return Err(ServerError::Config(
+                    "mounts must be distinct non-nested absolute paths",
+                ));
+            }
+            source.track().validate()?;
+            paths.push(path.clone());
+            mounts.push(Mount {
+                path,
+                fanout: Fanout::new(source, config.client_queue),
+            });
+        }
         let listener = TcpListener::bind(addr).await?;
         let shared = Shared {
             fanout: Fanout::new(source, config.client_queue),
+            mounts,
             auth: Authenticator::new(credentials, config.nonce_lifetime),
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             next_connection: std::sync::atomic::AtomicU64::new(1),
-            track,
             config,
         };
         Ok(Self {
@@ -232,7 +274,7 @@ impl<S: MediaSource> RtspServer<S> {
         local_address(self.listener.local_addr())
     }
 
-    /// The fan-out, e.g. to read [`Fanout::dropped_packets`].
+    /// The primary mount's fan-out, e.g. to read [`Fanout::dropped_packets`].
     #[must_use]
     pub fn fanout(&self) -> &Arc<Fanout<S>> {
         &self.shared.fanout

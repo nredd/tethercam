@@ -507,9 +507,11 @@ fn accept_connections(
     limits: HttpLimits, stop: &Arc<AtomicBool>, active: &Arc<AtomicUsize>,
     spawn: &mut dyn FnMut(ThreadTask) -> io::Result<JoinHandle<()>>,
 ) {
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
     for stream in incoming {
+        tasks.retain(|task| !task.is_finished());
         if stop.load(Ordering::SeqCst) {
-            return;
+            break;
         }
         let Ok(stream) = stream else { continue };
         if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
@@ -523,15 +525,21 @@ fn accept_connections(
         }
         let guard = ConnectionGuard(active.clone());
         let (service, stop) = (service.clone(), stop.clone());
-        let spawned = spawn(Box::new(move || {
+        if let Ok(task) = spawn(Box::new(move || {
             let _guard = guard;
             serve_connection(stream, &service, &limits, &stop);
-        }));
-        drop(spawned);
+        })) {
+            tasks.push(task);
+        }
+    }
+    // No detached connection threads survive shutdown. Their existing absolute I/O deadlines
+    // and actor snapshot budgets still apply; shutdown never cancels a PTP operation.
+    for task in tasks {
+        let _ = task.join();
     }
 }
 
-/// A running server. Dropping it stops accepting and lets in-flight connections finish.
+/// A running server. Dropping it stops accepting and joins in-flight connections.
 #[derive(Debug)]
 pub struct HttpServer {
     local_addr: SocketAddr,
@@ -617,6 +625,23 @@ impl Drop for HttpServer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exhausted_accept_iterator_joins_every_spawned_connection() {
+        let listener = super::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = super::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        drop(peer);
+        let active = super::Arc::new(super::AtomicUsize::new(0));
+        super::accept_connections(
+            &mut [Ok(stream)].into_iter(),
+            &super::Arc::new(service()),
+            super::HttpLimits::default(),
+            &super::Arc::new(super::AtomicBool::new(false)),
+            &active,
+            &mut |task| super::spawn_thread("synthetic-http-connection", task),
+        );
+        assert_eq!(active.load(super::Ordering::SeqCst), 0);
+    }
     use super::*;
     use proptest::prelude::*;
 

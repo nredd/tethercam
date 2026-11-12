@@ -26,6 +26,71 @@ mod suite {
     const REALM: &str = "tethercam";
     const WAIT: Duration = Duration::from_secs(5);
 
+    #[tokio::test]
+    async fn validates_all_mount_paths_and_tracks_before_binding() {
+        let source = TestSource::new().source;
+        for path in [
+            "relative",
+            "/trailing/",
+            "/white space",
+            "/control\u{7f}",
+            "/stream",
+            "/stream/child",
+        ] {
+            let result = RtspServer::bind_mounts(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::clone(&source),
+                vec![(path.into(), Arc::clone(&source))],
+                Credentials::new(USER, PASS, REALM).unwrap(),
+                ServerConfig::default(),
+            )
+            .await;
+            assert!(result.is_err(), "{path}");
+        }
+        let cfg = ServerConfig {
+            mount_path: "/root/child".into(),
+            ..ServerConfig::default()
+        };
+        assert!(
+            RtspServer::bind_mounts(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::clone(&source),
+                vec![("/root".into(), Arc::clone(&source))],
+                Credentials::new(USER, PASS, REALM).unwrap(),
+                cfg
+            )
+            .await
+            .is_err()
+        );
+        let mut track = track("H264");
+        track.clock_rate = 0;
+        let invalid = Arc::new(ScriptedSource::new(track, Vec::new(), false, None));
+        assert!(
+            RtspServer::bind_mounts(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::clone(&source),
+                vec![("/other".into(), invalid)],
+                Credentials::new(USER, PASS, REALM).unwrap(),
+                ServerConfig::default()
+            )
+            .await
+            .is_err()
+        );
+        let server = RtspServer::bind_mounts(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&source),
+            vec![
+                ("/jpeg".into(), Arc::clone(&source)),
+                ("/third".into(), Arc::clone(&source)),
+            ],
+            Credentials::new(USER, PASS, REALM).unwrap(),
+            ServerConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(server.local_addr().unwrap().port(), 0);
+    }
+
     struct TestSource {
         tx: mpsc::UnboundedSender<Packet>,
         source: Arc<ScriptedSource>,

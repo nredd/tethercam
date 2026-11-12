@@ -130,6 +130,14 @@ impl<F, C: Clock> Pacer<F, C> {
         previous
     }
 
+    /// Forget the retained frame and timeline after a source disconnect. Keep the rate,
+    /// clock and lifetime counters; a later first frame establishes a new epoch.
+    pub fn clear(&mut self) {
+        self.latest = None;
+        self.next_slot = 0;
+        self.fresh = false;
+    }
+
     /// When the next slot is due, or `None` before the first frame.
     #[must_use]
     pub fn next_due(&self) -> Option<Duration> {
@@ -229,6 +237,20 @@ mod tests {
     /// `(slot, frame, fresh)` of the next emission, if any.
     fn poll(p: &mut Pacer<u32, ManualClock>) -> Option<(u64, u32, bool)> {
         p.poll().map(|o| (o.slot, *o.frame, o.fresh))
+    }
+
+    #[test]
+    fn disconnect_clears_the_frame_but_preserves_lifetime_counters() {
+        let (mut p, clock) = pacer(10);
+        p.push(1);
+        assert_eq!(poll(&mut p), Some((0, 1, true)));
+        p.clear();
+        assert_eq!(p.next_due(), None);
+        assert_eq!(poll(&mut p), None);
+        clock.advance(MS(500));
+        p.push(2);
+        assert_eq!(poll(&mut p), Some((0, 2, true)));
+        assert_eq!(p.stats().emitted, 2);
     }
 
     #[test]

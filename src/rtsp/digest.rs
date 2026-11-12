@@ -150,6 +150,21 @@ impl Credentials {
     /// [`DigestError::InvalidCredentials`] when `username` or `password` is empty, `username`
     /// contains `:`, or any field has control characters, quotes or backslashes.
     pub fn new(username: &str, password: &str, realm: &str) -> Result<Self, DigestError> {
+        Self::validate(username, password, realm)?;
+        let base = format!("{username}:{realm}:{password}");
+        Ok(Self {
+            username: username.to_owned(),
+            realm: realm.to_owned(),
+            ha1_sha256: Algorithm::Sha256.hash_hex(&[base.as_bytes()]),
+            ha1_md5: Algorithm::Md5.hash_hex(&[base.as_bytes()]),
+        })
+    }
+
+    /// Validate Digest syntax without retaining or hashing the credentials.
+    ///
+    /// # Errors
+    /// Returns [`DigestError::InvalidCredentials`] for the same inputs as [`Self::new`].
+    pub fn validate(username: &str, password: &str, realm: &str) -> Result<(), DigestError> {
         let bad = |s: &str| s.chars().any(|c| c.is_control() || c == '"' || c == '\\');
         if username.is_empty() || username.contains(':') || bad(username) {
             return Err(DigestError::InvalidCredentials("username"));
@@ -160,13 +175,7 @@ impl Credentials {
         if realm.is_empty() || bad(realm) {
             return Err(DigestError::InvalidCredentials("realm"));
         }
-        let base = format!("{username}:{realm}:{password}");
-        Ok(Self {
-            username: username.to_owned(),
-            realm: realm.to_owned(),
-            ha1_sha256: Algorithm::Sha256.hash_hex(&[base.as_bytes()]),
-            ha1_md5: Algorithm::Md5.hash_hex(&[base.as_bytes()]),
-        })
+        Ok(())
     }
 
     fn ha1(&self, algorithm: Algorithm) -> &str {

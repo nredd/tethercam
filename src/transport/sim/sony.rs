@@ -118,6 +118,9 @@ pub enum Defect {
     TruncatedTable,
     /// The captured image's `ObjectInfo` is garbage.
     BadObjectInfo,
+    /// The first live-view image is valid; later images have only SOI/EOI markers. This keeps
+    /// PTP transactions valid while exercising runtime media failure and orderly cleanup.
+    BadLiveViewAfterFirst,
 }
 
 /// How a simulated Sony body behaves. [`Default`] is an older-generation body such as the
@@ -539,6 +542,9 @@ impl SonyResponder {
             writer.u32(0);
         }
         put_bytes(&mut writer, &self.config.live_view_jpeg);
+        if self.config.defect == Defect::BadLiveViewAfterFirst {
+            self.config.live_view_jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        }
         Reply::data(writer.into_bytes())
     }
 

@@ -211,6 +211,12 @@ impl EndpointReference {
         }
     }
 
+    /// Use an already validated persisted UUID without reparsing its canonical text.
+    #[must_use]
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        Self(format!("urn:uuid:{uuid}"))
+    }
+
     /// Generate a fresh random (version 4) reference. The caller persists it.
     pub fn generate(entropy: &mut impl Entropy) -> Self {
         Self(format!("urn:uuid:{}", random_uuid(entropy)))

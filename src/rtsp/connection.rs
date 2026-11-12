@@ -25,7 +25,7 @@ use super::message::{Incoming, Method, Request, Response, encode_interleaved, pa
 use super::rtcp::{RtpHeader, SenderInfo, ntp_timestamp, write_sender_report};
 use super::server::Shared;
 use super::setup::{TransportSpec, format_transport, parse_transport};
-use super::source::{MediaSource, Packet, Subscription};
+use super::source::{Fanout, MediaSource, Packet, Subscription};
 
 #[derive(Debug, thiserror::Error)]
 #[error("RTSP connection I/O: {0}")]
@@ -62,6 +62,8 @@ struct Playing<S: MediaSource> {
 
 struct Session<S: MediaSource> {
     id: String,
+    mount: String,
+    fanout: Arc<Fanout<S>>,
     spec: TransportSpec,
     udp: Option<UdpPair>,
     playing: Option<Playing<S>>,
@@ -234,11 +236,29 @@ impl<S: MediaSource> Connection<S> {
         }
     }
 
+    fn mount(&self, uri: &str, setup: bool) -> Option<(&str, &Arc<Fanout<S>>)> {
+        let path = uri_path(uri)?;
+        std::iter::once((self.shared.config.mount_path.as_str(), &self.shared.fanout))
+            .chain(
+                self.shared
+                    .mounts
+                    .iter()
+                    .map(|m| (m.path.as_str(), &m.fanout)),
+            )
+            .find(|(mount, fanout)| {
+                if setup {
+                    path == format!("{mount}/{}", fanout.source().track().control)
+                } else {
+                    path == *mount
+                }
+            })
+    }
+
     fn describe(&self, request: &Request) -> Response {
-        if uri_path(&request.uri) != Some(self.shared.config.mount_path.as_str()) {
+        let Some((_, fanout)) = self.mount(&request.uri, false) else {
             return Response::new(404);
-        }
-        let track = self.shared.fanout.source().track();
+        };
+        let track = fanout.source().track();
         let Ok(sdp) = track.to_sdp(self.local.ip(), "tethercam") else {
             return Response::new(500);
         };
@@ -251,11 +271,11 @@ impl<S: MediaSource> Connection<S> {
     }
 
     async fn setup(&mut self, request: &Request) -> Response {
-        let track = self.shared.fanout.source().track();
-        let expected = format!("{}/{}", self.shared.config.mount_path, track.control);
-        if uri_path(&request.uri) != Some(expected.as_str()) {
+        let Some((mount, fanout)) = self.mount(&request.uri, true) else {
             return Response::new(404);
-        }
+        };
+        let mount = mount.to_owned();
+        let fanout = Arc::clone(fanout);
         let Some(header) = request.headers.get("transport") else {
             return Response::new(400);
         };
@@ -266,7 +286,7 @@ impl<S: MediaSource> Connection<S> {
             (None, None) => {}
             (None, Some(_)) => return Response::new(455),
             (Some(id), Some(s)) if s.id == id => {
-                if s.playing.is_some() {
+                if s.playing.is_some() || s.mount != mount {
                     return Response::new(455);
                 }
             }
@@ -309,6 +329,8 @@ impl<S: MediaSource> Connection<S> {
             let id = hex(&raw);
             self.session = Some(Session {
                 id: id.clone(),
+                mount,
+                fanout,
                 spec,
                 udp,
                 playing: None,
@@ -344,8 +366,8 @@ impl<S: MediaSource> Connection<S> {
         else {
             return Response::new(454);
         };
-        let track = self.shared.fanout.source().track();
-        let mount = &self.shared.config.mount_path;
+        let track = session.fanout.source().track();
+        let mount = &session.mount;
         let path = uri_path(&request.uri);
         if path != Some(mount.as_str())
             && path != Some(format!("{mount}/{}", track.control).as_str())
@@ -353,7 +375,7 @@ impl<S: MediaSource> Connection<S> {
             return Response::new(404);
         }
         let interval = self.shared.config.rtcp_interval;
-        let fanout = Arc::clone(&self.shared.fanout);
+        let fanout = Arc::clone(&session.fanout);
         if session.playing.is_none() {
             session.playing = Some(Playing {
                 subscription: fanout.subscribe(),
@@ -451,10 +473,10 @@ impl<S: MediaSource> Connection<S> {
     async fn send_report(&mut self) -> ConnectionResult<()> {
         let timeout = self.shared.config.write_timeout;
         let interval = self.shared.config.rtcp_interval;
-        let clock_rate = u128::from(self.shared.track.clock_rate);
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
+        let clock_rate = u128::from(session.fanout.source().track().clock_rate);
         let Some(playing) = session.playing.as_mut() else {
             return Ok(());
         };

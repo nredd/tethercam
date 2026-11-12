@@ -80,6 +80,21 @@ pub struct I420Frame {
     v: Vec<u8>,
 }
 
+impl Default for I420Frame {
+    /// A valid 2x2 black scratch frame. Decoders resize it to the incoming image dimensions.
+    fn default() -> Self {
+        Self {
+            width: 2,
+            height: 2,
+            stride_y: 2,
+            stride_c: 1,
+            y: vec![16; 4],
+            u: vec![128],
+            v: vec![128],
+        }
+    }
+}
+
 impl I420Frame {
     /// A black frame (limited range: Y 16, Cb and Cr 128) with tight strides.
     ///

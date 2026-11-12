@@ -25,6 +25,7 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.6.1", default-features = false }
 futures-core = { version = "0.3", default-features = false }
 getrandom = "0.4.3"
+if-addrs = { version = "0.15", default-features = false }
 md-5 = { version = "0.10", default-features = false }
 # Pure-Rust USB (usbfs on Linux, IOKit on macOS). No libusb. The `tokio` feature runs its blocking
 # syscalls (open, claim, control transfers) on the tokio blocking pool instead of panicking.
@@ -37,7 +38,7 @@ sha2 = { version = "0.10", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3.27.0"
 thiserror = "2"
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 toml = "1.2.1"
 uuid = { version = "1.29.2", features = ["serde", "std"], default-features = false }
 zeroize = "1.9.1"
@@ -49,13 +50,16 @@ zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 rusty_h264-encoder = { version = "0.17", default-features = false, features = ["std", "asm"] }
 rusty_h264-common = { version = "0.17", default-features = false, features = ["std"] }
 log = { version = "0.4.35", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-log = { version = "0.2", default-features = false, features = ["std", "log-tracer"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
 
 [dev-dependencies]
 syn = { version = "2", features = ["full", "visit"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 # Synthetic JPEG fixtures for tests and benches (any subsampling, any size).
 jpeg-encoder = { version = "0.7", default-features = false }
 serde_json = "1.0.154"
@@ -87,6 +91,10 @@ harness = false
 
 [[bench]]
 name = "media"
+harness = false
+
+[[bench]]
+name = "pipeline"
 harness = false
 
 [lints.rust]
