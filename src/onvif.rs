@@ -1,6 +1,6 @@
 //! ONVIF endpoint: Device and Media services, WS-Security and a small HTTP server.
 //!
-//! WS-Discovery lives next to this module and is out of scope here.
+//! WS-Discovery is the separate [`discovery`] submodule.
 //!
 //! The layers, bottom to top:
 //!
@@ -70,6 +70,7 @@
 
 pub mod auth;
 pub mod device;
+pub mod discovery;
 pub mod http;
 pub mod media;
 pub mod model;
