@@ -129,7 +129,9 @@ that exception. Hosted Linux requires the adapter's full coverage too.
 
 Acceptance tests run native instrumented fixture crates: uncovered ordinary source, test support
 and nested source tests fail; empty/cleaned/stale data cannot silently reuse success; malformed
-profiles fail merging. Workflow tests bind Linux jobs to explicit native provisioning and the
+profiles fail merging. All-feature `make test`, including extracted-package tests, therefore needs
+`cargo-llvm-cov` and the toolchain's `llvm-tools-preview` as well as `cargo-nextest`; both Test and
+Coverage CI jobs provision these prerequisites explicitly. Workflow tests bind Linux jobs to explicit native provisioning and the
 unskippable native adapter scenario. `make coverage-report` writes unfiltered JSON, LCOV and HTML
 under `coverage/`; it does not replace the enforcement result with a custom policy.
 

@@ -205,6 +205,18 @@ fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<()
     assert!(steps.iter().any(|step| step["run"]
         == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
         && step["if"] == "always() && runner.os == 'Linux'"));
+    // All-feature make test executes native coverage acceptance crates, not only nextest.
+    for job in [coverage, tests] {
+        let steps = job["steps"]
+            .as_array()
+            .ok_or("missing native acceptance steps")?;
+        assert!(steps.iter().any(|step| {
+            step["with"]["components"] == "llvm-tools-preview" && step.get("if").is_none()
+        }));
+        assert!(steps.iter().any(|step| {
+            step["with"]["tool"] == "cargo-llvm-cov,cargo-nextest" && step.get("if").is_none()
+        }));
+    }
     Ok(())
 }
 
