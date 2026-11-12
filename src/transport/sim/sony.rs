@@ -112,6 +112,8 @@ pub enum Priority {
 pub enum Defect {
     /// No defect.
     None,
+    /// The extended-info dataset is truncated.
+    BadExtInfo,
     /// The property table announces a property it does not contain.
     TruncatedTable,
     /// The captured image's `ObjectInfo` is garbage.
@@ -435,6 +437,9 @@ impl SonyResponder {
             .unwrap_or(u16::MAX)
             .min(self.config.max_version);
         self.negotiated = version;
+        if self.config.defect == Defect::BadExtInfo {
+            return Reply::data(vec![1]);
+        }
         let mut writer = Writer::new();
         writer.u16(version);
         writer.u32(u32::try_from(self.props.len()).unwrap_or_default());

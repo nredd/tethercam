@@ -437,7 +437,15 @@ impl SimCamera {
         queue_of: fn(&mut Self) -> &mut VecDeque<Vec<u8>>, camera: &mut Self, endpoint: Endpoint,
         buffer: &mut [u8], timeout: Duration,
     ) -> Result<usize, TransportError> {
-        let short = camera.begin(endpoint)?;
+        let short = match camera.begin(endpoint) {
+            Err(TransportError::Timeout) => {
+                if let Some(sink) = camera.idle_sink {
+                    sink(timeout);
+                }
+                return Err(TransportError::Timeout);
+            }
+            result => result?,
+        };
         let sink = camera.idle_sink;
         let queue = queue_of(camera);
         let Some(transfer) = queue.pop_front() else {

@@ -12,6 +12,8 @@
 //! - libgphoto2 `camlibs/ptp2/library.c`, Sony capture
 //! - `watsonmw/alphawire` `src/aw/aw-control.c`, `AwControl_SetControlToggle`
 
+use std::time::{Duration, Instant};
+
 use super::camera::{SonyCamera, SonyEvent};
 use super::capability::Capability;
 use super::error::SonyError;
@@ -75,7 +77,12 @@ impl<T: Transport> SonyCamera<'_, T> {
     async fn download_captured(&mut self) -> Result<Vec<u8>, SonyError> {
         let outcome = self
             .session
-            .transaction(op::GET_OBJECT, &[handle::CAPTURED_IMAGE], None)
+            .transaction_within(
+                self.config.download_timeout,
+                op::GET_OBJECT,
+                &[handle::CAPTURED_IMAGE],
+                None,
+            )
             .await?;
         Ok(outcome.data)
     }
@@ -119,24 +126,40 @@ impl<T: Transport> SonyCamera<'_, T> {
 
     /// One look: drains events, then re-reads the properties.
     async fn check_image(&mut self) -> Result<bool, SonyError> {
-        let events = self.pump_events().await?;
+        self.check_image_within(None).await
+    }
+
+    async fn check_image_within(
+        &mut self, budget: Option<(Instant, Duration)>,
+    ) -> Result<bool, SonyError> {
+        let events = self.pump_events_inner(budget).await?;
         if events
             .iter()
             .any(|event| matches!(event, SonyEvent::ObjectAdded { .. }))
         {
             return Ok(true);
         }
-        self.refresh_properties().await?;
+        if let Some((started, limit)) = budget {
+            let remaining = self.remaining(started, limit);
+            if remaining.is_zero() {
+                return Err(SonyError::CaptureTimeout { timeout: limit });
+            }
+            self.refresh_properties().await?;
+        } else {
+            self.refresh_properties().await?;
+        }
         Ok(self.image_in_memory())
     }
 
     async fn wait_for_image(&mut self) -> Result<(), SonyError> {
         let started = self.session.now();
-        while self.waited(started) < self.config.capture_timeout {
-            if self.check_image().await? {
-                return Ok(());
+        let limit = self.config.capture_timeout;
+        while !self.remaining(started, limit).is_zero() {
+            match self.check_image_within(Some((started, limit))).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => self.pause_within(started, limit).await,
+                Err(err) => return Err(err),
             }
-            self.pause().await;
         }
         Err(SonyError::CaptureTimeout {
             timeout: self.config.capture_timeout,

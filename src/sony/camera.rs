@@ -33,20 +33,23 @@ pub struct SonyConfig {
     pub protocol: Protocol,
     /// Attempts at `SDIOGetExtDeviceInfo`, which can answer empty right after phase 2.
     pub ext_info_attempts: u32,
-    /// Deadline for those attempts together, from the first, on the session's clock. A slow
-    /// camera could otherwise spend a whole transfer timeout on every attempt.
+    /// Time allowed to start attempts on the session's clock. An in-flight transaction may
+    /// finish after this budget, bounded by the session's normal transaction timeout.
     pub ext_info_timeout: Duration,
     /// Pause between polls and retries.
     pub poll_interval: Duration,
     /// Longest wait for an event on the interrupt pipe. An idle pipe holds the poll for all of
     /// it on real hardware, so this is what every event pump costs when nothing happened.
     pub event_poll_timeout: Duration,
-    /// Deadline for live view to become ready, from the first poll.
+    /// Time allowed to start readiness polls; one normal transaction may finish afterward.
     pub live_view_ready_timeout: Duration,
-    /// Deadline per live-view frame, before any model quirk adds to it.
+    /// Time allowed to start frame attempts, before quirks; one transaction may finish afterward.
     pub live_view_timeout: Duration,
-    /// Deadline for a captured image to appear after the shutter is released.
+    /// Time allowed to start capture-completion checks; one transaction may finish afterward.
     pub capture_timeout: Duration,
+    /// Whole-transaction deadline for a captured-image download, independent of the capture wait.
+    /// Defaults to five minutes for full-resolution images on slow links.
+    pub download_timeout: Duration,
 }
 
 impl Default for SonyConfig {
@@ -63,6 +66,7 @@ impl Default for SonyConfig {
             live_view_ready_timeout: Duration::from_secs(10),
             live_view_timeout: Duration::from_millis(2500),
             capture_timeout: Duration::from_secs(35),
+            download_timeout: Duration::from_secs(300),
         }
     }
 }
@@ -196,8 +200,17 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
         Battery::read(&self.properties)
     }
 
-    pub(super) async fn pause(&self) {
-        sleep(self.config.poll_interval).await;
+    pub(super) async fn pause_within(&self, started: Instant, limit: Duration) {
+        sleep(
+            self.config
+                .poll_interval
+                .min(self.remaining(started, limit)),
+        )
+        .await;
+    }
+
+    pub(super) fn remaining(&self, started: Instant, limit: Duration) -> Duration {
+        limit.saturating_sub(self.waited(started))
     }
 
     /// Time since `started`, on the session's (injectable) clock.
@@ -290,13 +303,22 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
     ///
     /// [`SonyError::Session`] from polling or refreshing.
     pub async fn pump_events(&mut self) -> Result<Vec<SonyEvent>, SonyError> {
+        self.pump_events_inner(None).await
+    }
+
+    pub(super) async fn pump_events_inner(
+        &mut self, budget: Option<(Instant, Duration)>,
+    ) -> Result<Vec<SonyEvent>, SonyError> {
         let mut events = Vec::new();
         for _ in 0..MAX_EVENTS_PER_PUMP {
-            let Some(raw) = self
-                .session
-                .poll_event_within(self.config.event_poll_timeout)
-                .await?
-            else {
+            let remaining = budget.map_or(self.config.event_poll_timeout, |(started, limit)| {
+                self.remaining(started, limit)
+                    .min(self.config.event_poll_timeout)
+            });
+            if remaining.is_zero() && budget.is_some() {
+                return Ok(events);
+            }
+            let Some(raw) = self.session.poll_event_within(remaining).await? else {
                 break;
             };
             events.push(classify(raw));
@@ -305,6 +327,9 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
             .iter()
             .any(|event| matches!(event, SonyEvent::PropertyChanged(_)))
         {
+            if budget.is_some_and(|(started, limit)| self.remaining(started, limit).is_zero()) {
+                return Ok(events);
+            }
             self.refresh_properties().await?;
         }
         Ok(events)
@@ -319,7 +344,8 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
     /// error.
     pub async fn wait_live_view_ready(&mut self) -> Result<(), SonyError> {
         let started = self.session.now();
-        while self.waited(started) < self.config.live_view_ready_timeout {
+        let limit = self.config.live_view_ready_timeout;
+        while !self.remaining(started, limit).is_zero() {
             self.refresh_properties().await?;
             if !self.capabilities().supports(Capability::LiveView) {
                 return Err(SonyError::LiveViewUnsupported);
@@ -327,7 +353,7 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
             match self.properties.integer(prop::LIVE_VIEW_STATUS) {
                 Some(1) => return Ok(()),
                 Some(2) => return Err(SonyError::LiveViewUnsupported),
-                _ => self.pause().await,
+                _ => self.pause_within(started, limit).await,
             }
         }
         Err(SonyError::LiveViewNotReady)
@@ -345,11 +371,11 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
             ResponseCode::INVALID_OBJECT_HANDLE.code(),
             ResponseCode::ACCESS_DENIED.code(),
         ];
-        match self
+        let result = self
             .session
             .transaction(op::GET_OBJECT, &[handle::LIVE_VIEW], None)
-            .await
-        {
+            .await;
+        match result {
             Ok(outcome) => Ok(extract_jpeg(outcome.data)?),
             Err(SessionError::Response { code, .. }) if not_ready.contains(&code) => {
                 Err(SonyError::LiveViewNotReady)
@@ -373,9 +399,9 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
             .live_view_timeout
             .saturating_add(self.quirks.extra_live_view_wait);
         let started = self.session.now();
-        while self.waited(started) < limit {
+        while !self.remaining(started, limit).is_zero() {
             match self.fetch_live_view_frame().await {
-                Err(SonyError::LiveViewNotReady) => self.pause().await,
+                Err(SonyError::LiveViewNotReady) => self.pause_within(started, limit).await,
                 other => return other,
             }
         }
@@ -401,6 +427,7 @@ fn is_refusal(err: &SonyError) -> bool {
         SonyError::ExtInfoUnavailable { .. }
             | SonyError::Session(
                 SessionError::Response { .. }
+                    | SessionError::DeadlineExceeded(_)
                     | SessionError::Transport(TransportError::Stall | TransportError::Timeout)
             )
     )
@@ -427,14 +454,15 @@ async fn negotiate_ext_info<T: Transport>(
         connect_phase(session, 1).await?;
         connect_phase(session, 2).await?;
     }
-    ext_device_info(session, config, fallback)
-        .await
-        .map_err(|second| SonyError::ProtocolRefused {
+    match ext_device_info(session, config, fallback).await {
+        Err(second) if is_refusal(&second) => Err(SonyError::ProtocolRefused {
             requested: start,
             requested_error: Box::new(first),
             fallback,
             fallback_error: Box::new(second),
-        })
+        }),
+        other => other,
+    }
 }
 
 /// `SDIOGetExtDeviceInfo` for `protocol`, retried while the camera answers empty or busy.
@@ -444,9 +472,11 @@ async fn ext_device_info<T: Transport>(
     let params = [u32::from(protocol.version()), 1];
     let started = session.now();
     let mut made = 0;
-    // The attempt cap and the deadline both bound the loop; one attempt is always made.
     while made < config.ext_info_attempts
-        && (made == 0 || session.now().saturating_duration_since(started) < config.ext_info_timeout)
+        && !config
+            .ext_info_timeout
+            .saturating_sub(session.now().saturating_duration_since(started))
+            .is_zero()
     {
         made += 1;
         match session
@@ -460,7 +490,16 @@ async fn ext_device_info<T: Transport>(
             | Err(SessionError::Response {
                 code: code::DEVICE_BUSY,
                 ..
-            }) => sleep(config.poll_interval).await,
+            }) => {
+                sleep(
+                    config.poll_interval.min(
+                        config
+                            .ext_info_timeout
+                            .saturating_sub(session.now().saturating_duration_since(started)),
+                    ),
+                )
+                .await;
+            }
             Err(err) => return Err(err.into()),
         }
     }
@@ -522,6 +561,49 @@ mod tests {
         );
         let other = event(0xC206, &[1]);
         assert_eq!(classify(other.clone()), SonyEvent::Other(other));
+    }
+
+    #[tokio::test]
+    async fn extended_info_budget_expires_without_reset() {
+        use crate::ptp::session::SessionConfig;
+        use crate::transport::sim::sony::{SonySimConfig, sony_camera};
+        use std::cell::Cell;
+        thread_local! { static TICKS: Cell<u64> = const { Cell::new(0) }; }
+        fn now() -> Instant {
+            static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            TICKS.with(|ticks| {
+                let value = ticks.get();
+                ticks.set(value + 1);
+                *BASE.get_or_init(Instant::now) + Duration::from_millis(value)
+            })
+        }
+        TICKS.with(|ticks| ticks.set(0));
+        let sim = SonySimConfig {
+            ext_info_busy: u32::MAX,
+            ..SonySimConfig::default()
+        };
+        let mut session = Session::new(sony_camera(sim), SessionConfig::default()).with_clock(now);
+        session.open().await.unwrap();
+        connect_phase(&mut session, 1).await.unwrap();
+        connect_phase(&mut session, 2).await.unwrap();
+        let config = SonyConfig {
+            ext_info_timeout: Duration::from_millis(20),
+            poll_interval: Duration::ZERO,
+            ..SonyConfig::default()
+        };
+        assert!(matches!(
+            ext_device_info(&mut session, &config, Protocol::V200).await,
+            Err(SonyError::ExtInfoUnavailable { attempts: 1.. })
+        ));
+        assert!(session.is_open());
+        assert_eq!(session.transport().reset_count(), 0);
+        session.get_device_info().await.unwrap();
+        session.close().await.unwrap();
+        assert_eq!(
+            session.transport().commands().last().unwrap().code,
+            code::CLOSE_SESSION
+        );
+        assert_eq!(session.transport().reset_count(), 0);
     }
 
     #[test]

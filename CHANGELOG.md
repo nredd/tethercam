@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Keep Sony sessions open when wait budgets expire, classify protocol fallback errors, and allow longer still-image downloads
 - WS-Discovery sockets bound to an ephemeral port no longer set `SO_REUSEPORT`, which let Linux give two sockets the same port (cross-talk between parallel tests)
 - Do not advertise IPv6 link-local addresses in WS-Discovery `XAddrs`
 

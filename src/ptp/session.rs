@@ -23,7 +23,8 @@
 //! given `min(timeout, time left)`, so a camera that trickles bytes just inside the
 //! per-transfer timeout cannot hold a transaction open forever. At the deadline the call fails
 //! with [`SessionError::DeadlineExceeded`] and takes the normal failure path: clear halts, then
-//! reset. [`Session::transaction_within`] overrides the deadline per call for large objects.
+//! reset. A deadline that expires before the command is sent leaves the session untouched.
+//! [`Session::transaction_within`] overrides the deadline per call for large objects.
 //! [`Session::with_clock`] injects a fake clock for deterministic tests. The deadline covers
 //! only the exchange, and it is checked before each transfer: an exchange whose final transfer
 //! completes is a success even if it ran over, because the camera has already acted on it. A
@@ -306,6 +307,7 @@ impl<T: Transport> Session<T> {
         let result = self.open_with_recovery().await;
         if let Err(err) = &result
             && !matches!(err, SessionError::Transport(TransportError::Disconnected))
+            && (!matches!(err, SessionError::DeadlineExceeded(_)) || self.in_flight)
         {
             // The camera may have accepted `OpenSession` before the failure (e.g. a malformed
             // response), and nothing else would close that session. Recovery is best effort.
@@ -399,6 +401,10 @@ impl<T: Transport> Session<T> {
         let result = self
             .exchange(operation, params, data_out, (transaction_id, limit))
             .await;
+        if matches!(result, Err(SessionError::DeadlineExceeded(_))) && !self.in_flight {
+            self.next_transaction = transaction_id;
+            return result;
+        }
         self.settle(result).await
     }
 
@@ -633,12 +639,14 @@ impl<T: Transport> Session<T> {
     ) -> Result<Outcome, SessionError> {
         let command = Container::command(operation, transaction_id, params)?;
         self.leftover.clear();
+        // An expired deadline before the first transfer leaves the camera untouched.
+        let timeout = self.transfer_timeout()?;
         // A timeout or disconnect does not prove the camera saw nothing, so assume it did.
         // Only a stall guarantees the command was not accepted.
         self.in_flight = true;
-        if let Err(err) = self.send(&command).await {
-            self.in_flight = !matches!(err, SessionError::Transport(TransportError::Stall));
-            return Err(err);
+        if let Err(err) = self.transport.bulk_out(&command, timeout).await {
+            self.in_flight = err != TransportError::Stall;
+            return Err(self.classify(err));
         }
         if let Some((data, len)) = data_out
             && let Err(err) = self.send_data(operation, transaction_id, data, len).await
@@ -1317,6 +1325,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_deadline_does_not_send_or_reset() {
+        ELAPSED.set(Duration::ZERO);
+        let mut s = session(SimCamera::new()).with_clock(fake_now);
+        s.open().await.unwrap();
+        let count = s.transport().commands().len();
+        assert_eq!(
+            s.transaction_within(Duration::ZERO, code::GET_DEVICE_INFO, &[], None)
+                .await,
+            Err(SessionError::DeadlineExceeded(Duration::ZERO))
+        );
+        assert_eq!(s.transport().commands().len(), count);
+        assert_eq!(s.transport().reset_count(), 0);
+        assert_eq!(s.transport().clear_halt_count(), 0);
+        assert!(s.is_open());
+        s.get_device_info().await.unwrap();
+        assert_eq!(
+            s.poll_event_within(Duration::from_millis(1)).await.unwrap(),
+            None
+        );
+        assert_eq!(s.transport().reset_count(), 0);
+        s.close().await.unwrap();
+        assert_eq!(
+            s.transport().commands().last().unwrap().code,
+            code::CLOSE_SESSION
+        );
+
+        ELAPSED.set(Duration::ZERO);
+        let camera = SimCamera::new().with_operation(SEND_OBJECT, Reply::accepting_data());
+        let mut s = session(camera).with_clock(ticking_now);
+        s.open().await.unwrap();
+        assert_eq!(
+            s.transaction_within(Duration::from_secs(2), SEND_OBJECT, &[], Some(&[1]))
+                .await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(2)))
+        );
+        assert_eq!(s.transport().reset_count(), 1);
+        assert!(!s.is_open());
+    }
+
+    #[tokio::test]
     async fn simulator_deadline_and_early_response_paths() {
         ELAPSED.set(Duration::ZERO);
         let mut s = session(SimCamera::new()).with_clock(ticking_now);
@@ -1554,6 +1602,9 @@ mod tests {
             Err(SessionError::DeadlineExceeded(Duration::ZERO))
         );
         assert!(!s.is_open());
+        assert_eq!(s.transport().reset_count(), 0);
+        assert_eq!(s.transport().clear_halt_count(), 0);
+        assert_eq!(s.transport().commands(), []);
 
         let mut s = session(SimCamera::new());
         s.open().await.unwrap();
@@ -1564,6 +1615,7 @@ mod tests {
         );
         assert!(!s.is_open());
         assert!(!s.transport().session_open(), "the reset ended the session");
+        assert_eq!(s.transport().reset_count(), 1);
     }
 
     #[tokio::test]
