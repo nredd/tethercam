@@ -1,4 +1,3 @@
-src/config.rs #28
 src/media/annexb.rs #32
 src/media/clock.rs #32
 src/media/encoder.rs #32

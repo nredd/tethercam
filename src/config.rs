@@ -145,13 +145,20 @@ pub struct Config {
     pub credentials: Credentials,
 }
 
-fn random_hex(bytes: usize) -> Result<String, Error> {
-    use std::fmt::Write as _;
+fn random_hex(
+    bytes: usize, fill: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<String, Error> {
     let mut random = Zeroizing::new(vec![0_u8; bytes]);
-    getrandom::fill(&mut random).map_err(|_| Error::Random)?;
+    fill(&mut random).map_err(|_| Error::Random)?;
     let mut result = String::with_capacity(bytes * 2);
     for byte in random.iter() {
-        write!(&mut result, "{byte:02x}").map_err(|_| Error::Random)?;
+        for nibble in [byte >> 4, byte & 0x0f] {
+            result.push(char::from(if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            }));
+        }
     }
     Ok(result)
 }
@@ -162,8 +169,14 @@ impl Config {
     /// # Errors
     /// Returns an error if the operating system cannot provide randomness.
     pub fn generate() -> Result<Self, Error> {
+        Self::generate_with(&mut getrandom::fill)
+    }
+
+    fn generate_with(
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<Self, Error> {
         let mut id = [0_u8; 16];
-        getrandom::fill(&mut id).map_err(|_| Error::Random)?;
+        fill(&mut id).map_err(|_| Error::Random)?;
         let id = uuid::Builder::from_random_bytes(id).into_uuid();
         Ok(Self {
             rtsp_address: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -182,8 +195,8 @@ impl Config {
                 mjpeg: true,
             },
             credentials: Credentials {
-                username: Secret::new(random_hex(16)?),
-                password: Secret::new(random_hex(32)?),
+                username: Secret::new(random_hex(16, fill)?),
+                password: Secret::new(random_hex(32, fill)?),
             },
         })
     }
@@ -317,21 +330,36 @@ impl Config {
     /// # Errors
     /// Returns an error if generation, creation, loading, or validation fails.
     pub fn load_or_create(path: &Path) -> Result<Self, Error> {
-        match Self::load(path) {
+        Self::load_or_create_with(
+            path,
+            &mut Self::load,
+            &mut Self::generate,
+            &mut Self::create,
+            &mut sync_directory,
+        )
+    }
+
+    fn load_or_create_with(
+        path: &Path, load: &mut dyn FnMut(&Path) -> Result<Self, Error>,
+        generate: &mut dyn FnMut() -> Result<Self, Error>,
+        create: &mut dyn FnMut(&Self, &Path) -> Result<(), Error>,
+        sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<Self, Error> {
+        match load(path) {
             Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                let config = Self::generate()?;
-                match config.create(path) {
+                let config = generate()?;
+                match create(&config, path) {
                     Ok(()) => Ok(config),
                     Err(Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let config = Self::load(path)?;
-                        sync_directory(config_parent(path))?;
+                        let config = load(path)?;
+                        sync(config_parent(path))?;
                         Ok(config)
                     }
                     Err(error) => Err(error),
                 }
             }
             Ok(config) => {
-                sync_directory(config_parent(path))?;
+                sync(config_parent(path))?;
                 Ok(config)
             }
             Err(error) => Err(error),
@@ -346,22 +374,59 @@ impl Config {
     }
 
     fn create_with_sync(
-        &self, path: &Path, sync: &mut impl FnMut(&Path) -> io::Result<()>,
+        &self, path: &Path, sync: &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<(), Error> {
+        self.create_with_storage(path, sync, cfg!(unix), &mut FileStorage)
+    }
+
+    fn create_with_storage(
+        &self, path: &Path, sync: &mut dyn FnMut(&Path) -> io::Result<()>, unix: bool,
+        storage: &mut dyn Storage,
     ) -> Result<(), Error> {
         self.validate()?;
-        if !cfg!(unix) {
-            return Err(Error::Permissions);
-        }
+        check_supported_permissions(unix)?;
         let parent = config_parent(path);
         create_directories(parent, sync)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        let contents = Zeroizing::new(toml::to_string_pretty(self).map_err(|_| Error::Serialize)?);
-        temp.write_all(contents.as_bytes())?;
-        temp.as_file().sync_all()?;
+        let mut temp = storage.new_file(parent)?;
+        let contents = Zeroizing::new(storage.serialize(self).map_err(|_| Error::Serialize)?);
+        storage.write(&mut temp, contents.as_bytes())?;
+        storage.sync(&temp)?;
         temp.persist_noclobber(path)
             .map_err(|e| Error::Io(e.error))?;
         sync(parent)?;
         Ok(())
+    }
+}
+
+trait Storage {
+    fn new_file(&mut self, parent: &Path) -> io::Result<tempfile::NamedTempFile>;
+    fn serialize(&mut self, config: &Config) -> Result<String, toml::ser::Error>;
+    fn write(&mut self, file: &mut tempfile::NamedTempFile, bytes: &[u8]) -> io::Result<()>;
+    fn sync(&mut self, file: &tempfile::NamedTempFile) -> io::Result<()>;
+}
+
+struct FileStorage;
+
+impl Storage for FileStorage {
+    fn new_file(&mut self, parent: &Path) -> io::Result<tempfile::NamedTempFile> {
+        tempfile::NamedTempFile::new_in(parent)
+    }
+    fn serialize(&mut self, config: &Config) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(config)
+    }
+    fn write(&mut self, file: &mut tempfile::NamedTempFile, bytes: &[u8]) -> io::Result<()> {
+        file.write_all(bytes)
+    }
+    fn sync(&mut self, file: &tempfile::NamedTempFile) -> io::Result<()> {
+        file.as_file().sync_all()
+    }
+}
+
+fn check_supported_permissions(unix: bool) -> Result<(), Error> {
+    if unix {
+        Ok(())
+    } else {
+        Err(Error::Permissions)
     }
 }
 
@@ -376,7 +441,7 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 fn create_directories(
-    path: &Path, sync: &mut impl FnMut(&Path) -> io::Result<()>,
+    path: &Path, sync: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
         .parent()
@@ -395,8 +460,14 @@ fn create_directories(
 
 #[cfg(unix)]
 fn check_permissions(file: &File) -> Result<(), Error> {
+    check_permission_metadata(&mut || file.metadata())
+}
+#[cfg(unix)]
+fn check_permission_metadata(
+    metadata: &mut dyn FnMut() -> io::Result<fs::Metadata>,
+) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
-    if file.metadata()?.permissions().mode() & 0o077 != 0 {
+    if metadata()?.permissions().mode() & 0o077 != 0 {
         return Err(Error::Permissions);
     }
     Ok(())
