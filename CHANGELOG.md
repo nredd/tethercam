@@ -8,7 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- WS-Discovery sockets bound to an ephemeral port no longer set `SO_REUSEPORT`, which let Linux give two sockets the same port (cross-talk between parallel tests)
 - Do not advertise IPv6 link-local addresses in WS-Discovery `XAddrs`
+
 ### Removed
 
 - `Session::scoped`; callers explicitly open and close sessions

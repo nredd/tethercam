@@ -125,19 +125,11 @@ fn open(interface: &Interface, port: u16, join: bool) -> io::Result<UdpSocket> {
     let multicast = MulticastInterface::from(interface);
     let (domain, bind_addr) = multicast.binding(port);
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    // Other WS-Discovery stacks on the host share the port.
-    socket.set_reuse_address(true)?;
-    // BSD-derived stacks (macOS) need `SO_REUSEPORT` to share a UDP port with another responder.
-    #[cfg(all(
-        unix,
-        not(any(
-            target_os = "solaris",
-            target_os = "illumos",
-            target_os = "cygwin",
-            target_os = "nuttx"
-        ))
-    ))]
-    socket.set_reuse_port(true)?;
+    // Sharing only matters for the well-known port. An ephemeral port (0) must stay exclusive:
+    // with `SO_REUSEPORT` set, Linux may hand the same ephemeral port to two sockets.
+    if port != 0 {
+        share_port(&socket)?;
+    }
     if matches!(multicast, MulticastInterface::V6(_)) {
         socket.set_only_v6(true)?;
     }
@@ -151,6 +143,23 @@ fn open(interface: &Interface, port: u16, join: bool) -> io::Result<UdpSocket> {
     }
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+/// Lets other WS-Discovery stacks on the host bind the same port.
+fn share_port(socket: &Socket) -> io::Result<()> {
+    socket.set_reuse_address(true)?;
+    // BSD-derived stacks (macOS) need `SO_REUSEPORT` to share a UDP port with another responder.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "solaris",
+            target_os = "illumos",
+            target_os = "cygwin",
+            target_os = "nuttx"
+        ))
+    ))]
+    socket.set_reuse_port(true)?;
+    Ok(())
 }
 
 fn configure_multicast(socket: &Socket, interface: MulticastInterface) -> io::Result<()> {
