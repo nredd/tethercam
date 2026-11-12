@@ -59,6 +59,11 @@ make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-co
 
 Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached.
 `make coverage` also rejects pending entries whose lines, functions and regions are fully covered; remove those entries from `coverage-pending.txt`.
+`make bench-check` smoke-runs each case once; `make bench` records full Criterion measurements.
+The RTSP fan-out benchmark keeps subscribers alive across bursts, measuring steady-state packet
+delivery rather than subscription churn. Its shared workload also runs for 100 consecutive bursts
+at each client count in the test suite, catching stalls that a one-iteration smoke run misses.
+
 Repository rules are in [`AGENTS.md`](AGENTS.md); releases are described in
 [`docs/releasing.md`](docs/releasing.md). The checked-in branch ruleset, required CI inventory and
 staged `gh` activation/read-back commands are in [`docs/branch-ruleset.md`](docs/branch-ruleset.md).
