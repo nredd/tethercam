@@ -303,12 +303,12 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
     ///
     /// [`SonyError::Session`] from polling or refreshing.
     pub async fn pump_events(&mut self) -> Result<Vec<SonyEvent>, SonyError> {
-        self.pump_events_inner(None).await
+        Ok(self.pump_events_inner(None).await?.0)
     }
 
     pub(super) async fn pump_events_inner(
         &mut self, budget: Option<(Instant, Duration)>,
-    ) -> Result<Vec<SonyEvent>, SonyError> {
+    ) -> Result<(Vec<SonyEvent>, bool), SonyError> {
         let mut events = Vec::new();
         for _ in 0..MAX_EVENTS_PER_PUMP {
             let remaining = budget.map_or(self.config.event_poll_timeout, |(started, limit)| {
@@ -316,7 +316,7 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
                     .min(self.config.event_poll_timeout)
             });
             if remaining.is_zero() && budget.is_some() {
-                return Ok(events);
+                return Ok((events, false));
             }
             let Some(raw) = self.session.poll_event_within(remaining).await? else {
                 break;
@@ -328,11 +328,12 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
             .any(|event| matches!(event, SonyEvent::PropertyChanged(_)))
         {
             if budget.is_some_and(|(started, limit)| self.remaining(started, limit).is_zero()) {
-                return Ok(events);
+                return Ok((events, false));
             }
             self.refresh_properties().await?;
+            return Ok((events, true));
         }
-        Ok(events)
+        Ok((events, false))
     }
 
     /// Polls the property table until the camera reports live view ready.
