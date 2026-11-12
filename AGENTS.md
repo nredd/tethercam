@@ -20,7 +20,7 @@ Hard rules:
 - Must build for `aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` (`make cross`). No macOS-only code outside `cfg`-gated modules with a portable fallback
 - Per-frame paths get a `criterion` benchmark in `benches/`
 - Security is not optional: no unauthenticated network surface, no default or hardcoded credentials, secrets never logged, constant-time credential comparison
-- `tests/debug_guard.rs` checks raw `password`, `authorization`, `response`, `headers`, `nonce`, `nonces`, `www_authenticate`, `seen`, request `body`, and ONVIF response `body` fields; extend this list when adding another sensitive field name
+- `tests/debug_guard.rs` checks raw `password`, `authorization`, `response`, `headers`, `nonce`, `nonces`, `www_authenticate`, `seen`, and request and response `body` fields; extend this list when adding another sensitive field name
 - This repository is PUBLIC. Never commit real IP addresses, hostnames, serial numbers, MAC addresses, credentials or anything identifying a private network. Use `192.0.2.0/24` (TEST-NET-1) and obviously synthetic values in docs, tests and fixtures
 
 Layout:

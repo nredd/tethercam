@@ -7,17 +7,18 @@ mod suite {
     use std::fmt::Write as _;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use tethercam::rtsp::message::Limits;
+    use tethercam::rtsp::source::ScriptedSource;
     use tethercam::rtsp::{
-        Algorithm, ClientDigest, Credentials, MediaKind, MediaSource, Packet, RtspServer,
-        ServerConfig, TrackInfo,
+        Algorithm, ClientDigest, Credentials, MediaKind, Packet, RtspServer, ServerConfig,
+        TrackInfo,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpStream, UdpSocket};
-    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
@@ -26,22 +27,44 @@ mod suite {
     const REALM: &str = "tethercam";
     const WAIT: Duration = Duration::from_secs(5);
 
+    struct Counter {
+        source: Arc<ScriptedSource>,
+        starts: bool,
+    }
+
+    impl Counter {
+        fn load(&self, _: Ordering) -> usize {
+            if self.starts {
+                self.source.starts()
+            } else {
+                self.source.stops()
+            }
+        }
+    }
+
     struct TestSource {
         tx: mpsc::UnboundedSender<Packet>,
-        rx: Mutex<mpsc::UnboundedReceiver<Packet>>,
-        starts: AtomicUsize,
-        stops: AtomicUsize,
+        source: Arc<ScriptedSource>,
+        starts: Counter,
+        stops: Counter,
     }
 
     impl TestSource {
-        fn new() -> Arc<Self> {
-            let (tx, rx) = mpsc::unbounded_channel();
-            Arc::new(Self {
+        fn new() -> Self {
+            let (source, tx) = ScriptedSource::channel(track("H264"));
+            let source = Arc::new(source);
+            Self {
                 tx,
-                rx: Mutex::new(rx),
-                starts: AtomicUsize::new(0),
-                stops: AtomicUsize::new(0),
-            })
+                starts: Counter {
+                    source: Arc::clone(&source),
+                    starts: true,
+                },
+                stops: Counter {
+                    source: Arc::clone(&source),
+                    starts: false,
+                },
+                source,
+            }
         }
 
         fn packet(seq: u16) -> Vec<u8> {
@@ -56,34 +79,28 @@ mod suite {
         }
     }
 
-    impl MediaSource for TestSource {
-        fn track(&self) -> TrackInfo {
-            TrackInfo {
-                kind: MediaKind::Video,
-                payload_type: 96,
-                codec: "H264".into(),
-                clock_rate: 90_000,
-                fmtp: Some("packetization-mode=1".into()),
-                control: "trackID=0".into(),
-            }
+    fn track(codec: &str) -> TrackInfo {
+        TrackInfo {
+            kind: MediaKind::Video,
+            payload_type: 96,
+            codec: codec.into(),
+            clock_rate: 90_000,
+            fmtp: Some("packetization-mode=1".into()),
+            control: "trackID=0".into(),
         }
+    }
 
-        async fn next_packet(&self) -> Option<Packet> {
-            self.rx.lock().await.recv().await
-        }
+    impl std::ops::Deref for TestSource {
+        type Target = Arc<ScriptedSource>;
 
-        fn on_first_subscriber(&self) {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn on_last_unsubscribe(&self) {
-            self.stops.fetch_add(1, Ordering::SeqCst);
+        fn deref(&self) -> &Self::Target {
+            &self.source
         }
     }
 
     struct Running {
         addr: SocketAddr,
-        source: Arc<TestSource>,
+        source: TestSource,
         stop: Option<oneshot::Sender<()>>,
         task: JoinHandle<()>,
     }
@@ -480,6 +497,13 @@ mod suite {
         let mut client = Client::connect(server.addr).await;
         client.algorithm = Algorithm::Md5;
         client.login(&base).await;
+        let description = client
+            .request("DESCRIBE", &base, &[("Accept", "application/sdp")])
+            .await;
+        assert_eq!(description.status, 200);
+        assert_eq!(description.header("content-type"), Some("application/sdp"));
+        assert!(description.body.contains("a=control:trackID=0"));
+        assert_eq!(server.source.starts.load(Ordering::SeqCst), 0);
         let transport = format!("RTP/AVP;unicast;client_port={media_port}-{control_port}");
         let reply = client
             .request("SETUP", &track, &[("Transport", &transport)])
@@ -965,6 +989,91 @@ mod suite {
     }
 
     #[tokio::test]
+    async fn setup_rejects_wrong_sessions_and_renegotiation_while_playing() {
+        let server = start(config()).await;
+        let base = server.url("/stream");
+        let track = server.url("/stream/trackID=0");
+        let transport = ("Transport", "RTP/AVP/TCP;interleaved=0-1");
+        let mut client = Client::connect(server.addr).await;
+        client.login(&base).await;
+        assert_eq!(
+            client
+                .request("SETUP", &track, &[transport, ("Session", "wrong")])
+                .await
+                .status,
+            454
+        );
+        let setup = client.request("SETUP", &track, &[transport]).await;
+        let session = setup.session();
+        assert_eq!(
+            client
+                .request("SETUP", &track, &[transport, ("Session", "wrong")])
+                .await
+                .status,
+            454
+        );
+        assert_eq!(
+            client
+                .request("PLAY", &base, &[("Session", &session)])
+                .await
+                .status,
+            200
+        );
+        assert_eq!(
+            client
+                .request("SETUP", &track, &[transport, ("Session", &session)])
+                .await
+                .status,
+            455
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_reports_exhausted_udp_port_range() {
+        let server = start(ServerConfig {
+            udp_ports: Some(u16::MAX..=u16::MAX),
+            ..config()
+        })
+        .await;
+        let base = server.url("/stream");
+        let track = server.url("/stream/trackID=0");
+        let mut client = Client::connect(server.addr).await;
+        client.login(&base).await;
+        let reply = client
+            .request(
+                "SETUP",
+                &track,
+                &[("Transport", "RTP/AVP;unicast;client_port=5000-5001")],
+            )
+            .await;
+        assert_eq!(reply.status, 500);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interleaved_client_frames_before_and_after_setup() {
+        let server = start(config()).await;
+        let base = server.url("/stream");
+        let track = server.url("/stream/trackID=0");
+        let mut client = Client::connect(server.addr).await;
+        client.login(&base).await;
+        client.send_raw(b"$\x01\x00\x01x").await;
+        assert_eq!(client.request("OPTIONS", &base, &[]).await.status, 200);
+        let setup = client
+            .request(
+                "SETUP",
+                &track,
+                &[("Transport", "RTP/AVP/TCP;interleaved=0-1")],
+            )
+            .await;
+        assert_eq!(setup.status, 200);
+        client.send_raw(b"$\x01\x00\x01x").await;
+        assert_eq!(client.request("OPTIONS", &base, &[]).await.status, 200);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn sessions_belong_to_their_connection() {
         let server = start(config()).await;
         let base = server.url("/stream");
@@ -1176,6 +1285,41 @@ mod suite {
         server.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn bind_reports_track_and_address_errors_and_exposes_fanout() {
+        let creds = || Credentials::new(USER, PASS, REALM).unwrap();
+        let (invalid, _tx) = ScriptedSource::channel(track(""));
+        let invalid = Arc::new(invalid);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        assert!(
+            RtspServer::bind(addr, invalid, creds(), config())
+                .await
+                .is_err()
+        );
+        let server = RtspServer::bind(addr, TestSource::new().source, creds(), config())
+            .await
+            .unwrap();
+        assert_eq!(server.fanout().dropped_packets(), 0);
+        assert!(
+            RtspServer::bind(
+                server.local_addr().unwrap(),
+                TestSource::new().source,
+                creds(),
+                config()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn response_reason_phrases_include_less_common_statuses() {
+        use tethercam::rtsp::message::reason_phrase;
+        assert_eq!(reason_phrase(405), "Method Not Allowed");
+        assert_eq!(reason_phrase(500), "Internal Server Error");
+        assert_eq!(reason_phrase(999), "Unknown");
+    }
+
     #[test]
     fn bind_rejects_bad_configuration() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1235,7 +1379,7 @@ mod suite {
             ] {
                 let result = RtspServer::bind(
                     "127.0.0.1:0".parse().unwrap(),
-                    TestSource::new(),
+                    TestSource::new().source,
                     Credentials::new(USER, PASS, REALM).unwrap(),
                     config,
                 )

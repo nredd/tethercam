@@ -8,6 +8,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +102,40 @@ pub enum ServerError {
 
 fn local_address(result: io::Result<SocketAddr>) -> Result<SocketAddr, ServerError> {
     result.map_err(ServerError::LocalAddress)
+}
+
+async fn accept_result(
+    accepted: io::Result<(tokio::net::TcpStream, SocketAddr)>,
+) -> Option<(tokio::net::TcpStream, SocketAddr)> {
+    if let Ok(connection) = accepted {
+        Some(connection)
+    } else {
+        // Typically EMFILE or ECONNABORTED: back off instead of spinning.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        None
+    }
+}
+
+type Accepted = io::Result<(tokio::net::TcpStream, SocketAddr)>;
+type Accept = for<'a> fn(&'a TcpListener) -> Pin<Box<dyn Future<Output = Accepted> + Send + 'a>>;
+
+fn accept_socket(listener: &TcpListener) -> Pin<Box<dyn Future<Output = Accepted> + Send + '_>> {
+    Box::pin(listener.accept())
+}
+
+async fn accept_ready(
+    listener: &TcpListener, accept: Accept,
+    inspect: fn(&tokio::net::TcpStream) -> io::Result<SocketAddr>,
+) -> (tokio::net::TcpStream, SocketAddr, SocketAddr) {
+    loop {
+        let Some((stream, peer)) = accept_result(accept(listener).await).await else {
+            continue;
+        };
+        let Ok(local) = inspect(&stream) else {
+            continue;
+        };
+        return (stream, peer, local);
+    }
 }
 
 /// State shared by every connection.
@@ -209,21 +244,22 @@ impl<S: MediaSource> RtspServer<S> {
         let connections = Arc::new(Semaphore::new(self.shared.config.max_connections));
         let mut tasks = JoinSet::new();
         tokio::pin!(shutdown);
+        let accept = accept_ready(
+            &self.listener,
+            accept_socket,
+            tokio::net::TcpStream::local_addr,
+        );
+        tokio::pin!(accept);
         loop {
             tokio::select! {
                 () = &mut shutdown => break,
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-                accepted = self.listener.accept() => {
-                    let Ok((stream, peer)) = accepted else {
-                        // Typically EMFILE or ECONNABORTED: back off instead of spinning.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue;
-                    };
+                (stream, peer, local) = &mut accept => {
+                    accept.set(accept_ready(&self.listener, accept_socket, tokio::net::TcpStream::local_addr));
                     let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
                         drop(stream);
                         continue;
                     };
-                    let Ok(local) = stream.local_addr() else { continue };
                     let connection = Connection::new(
                         stream,
                         peer,
@@ -248,10 +284,73 @@ mod tests {
     use super::*;
     use std::error::Error;
 
+    static ACCEPT_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ADDRESS_ATTEMPTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn scripted_accept(
+        listener: &TcpListener,
+    ) -> Pin<Box<dyn Future<Output = Accepted> + Send + '_>> {
+        Box::pin(async move {
+            if ACCEPT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(io::Error::other("synthetic accept failure"))
+            } else {
+                listener.accept().await
+            }
+        })
+    }
+
+    fn scripted_address(stream: &tokio::net::TcpStream) -> io::Result<SocketAddr> {
+        if ADDRESS_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Err(io::Error::other("synthetic address failure"))
+        } else {
+            stream.local_addr()
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_accept_and_address_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _first = tokio::net::TcpStream::connect(address).await.unwrap();
+        let _second = tokio::net::TcpStream::connect(address).await.unwrap();
+        let attempt = accept_ready(&listener, scripted_accept, scripted_address);
+        tokio::pin!(attempt);
+        std::future::poll_fn(|cx| {
+            assert!(attempt.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(ACCEPT_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (_, _, local) = tokio::time::timeout(Duration::from_secs(2), &mut attempt)
+            .await
+            .unwrap();
+        assert_eq!(local, address);
+        assert_eq!(ACCEPT_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            ADDRESS_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_error_backs_off() {
+        let failure = Err(io::Error::other("synthetic accept failure"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), accept_result(failure))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn local_address_preserves_io_error() {
         let error = local_address(Err(io::Error::other("synthetic failure"))).unwrap_err();
-        assert!(matches!(error, ServerError::LocalAddress(_)));
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&ServerError::LocalAddress(io::Error::other("other")))
+        );
         assert!(error.to_string().contains("synthetic failure"));
         assert!(error.source().is_some());
         let address = "192.0.2.1:554".parse().unwrap();

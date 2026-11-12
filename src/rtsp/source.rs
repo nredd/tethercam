@@ -25,6 +25,9 @@ use tokio::task::JoinHandle;
 use super::rtcp::RtpHeader;
 use super::sdp::TrackInfo;
 
+mod scripted;
+pub use scripted::ScriptedSource;
+
 /// One ready-to-send RTP packet. Cloning is a reference-count bump, so fan-out copies nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet(Arc<[u8]>);
@@ -279,30 +282,30 @@ impl<S: MediaSource> Drop for Subscription<S> {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::atomic::AtomicUsize;
-
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
     use crate::rtsp::sdp::MediaKind;
 
     /// A source fed by the test through [`TestSource::push`].
     pub(crate) struct TestSource {
         pub(crate) tx: mpsc::UnboundedSender<Packet>,
-        rx: AsyncMutex<mpsc::UnboundedReceiver<Packet>>,
-        pub(crate) starts: AtomicUsize,
-        pub(crate) stops: AtomicUsize,
+        source: Arc<ScriptedSource>,
     }
 
     impl TestSource {
-        pub(crate) fn new() -> Arc<Self> {
-            let (tx, rx) = mpsc::unbounded_channel();
-            Arc::new(Self {
+        pub(crate) fn new() -> Self {
+            let track = TrackInfo {
+                kind: MediaKind::Video,
+                payload_type: 96,
+                codec: "H264".into(),
+                clock_rate: 90_000,
+                fmtp: None,
+                control: "trackID=0".into(),
+            };
+            let (source, tx) = ScriptedSource::channel(track);
+            Self {
                 tx,
-                rx: AsyncMutex::new(rx),
-                starts: AtomicUsize::new(0),
-                stops: AtomicUsize::new(0),
-            })
+                source: Arc::new(source),
+            }
         }
 
         pub(crate) fn push(&self, seq: u16) {
@@ -312,28 +315,11 @@ pub(crate) mod testing {
         }
     }
 
-    impl MediaSource for TestSource {
-        fn track(&self) -> TrackInfo {
-            TrackInfo {
-                kind: MediaKind::Video,
-                payload_type: 96,
-                codec: "H264".into(),
-                clock_rate: 90_000,
-                fmtp: None,
-                control: "trackID=0".into(),
-            }
-        }
+    impl std::ops::Deref for TestSource {
+        type Target = Arc<ScriptedSource>;
 
-        async fn next_packet(&self) -> Option<Packet> {
-            self.rx.lock().await.recv().await
-        }
-
-        fn on_first_subscriber(&self) {
-            self.starts.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn on_last_unsubscribe(&self) {
-            self.stops.fetch_add(1, Ordering::SeqCst);
+        fn deref(&self) -> &Self::Target {
+            &self.source
         }
     }
 }
@@ -347,7 +333,7 @@ mod tests {
     use super::testing::TestSource;
     use super::*;
 
-    async fn recv_seq(sub: &mut Subscription<TestSource>) -> u16 {
+    async fn recv_seq(sub: &mut Subscription<ScriptedSource>) -> u16 {
         let p = timeout(Duration::from_secs(5), sub.recv())
             .await
             .unwrap()
@@ -357,6 +343,10 @@ mod tests {
 
     /// Hooks run on the control task, so tests wait for them instead of assuming a timing.
     async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        eventually_dyn(what, &cond).await;
+    }
+
+    async fn eventually_dyn(what: &str, cond: &dyn Fn() -> bool) {
         for _ in 0..400 {
             if cond() {
                 return;
@@ -364,6 +354,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    struct DefaultHooks;
+
+    impl MediaSource for DefaultHooks {
+        fn track(&self) -> TrackInfo {
+            track()
+        }
+
+        fn next_packet(&self) -> impl Future<Output = Option<Packet>> + Send {
+            std::future::ready(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_source_hooks_are_noops() {
+        let source = DefaultHooks;
+        source.on_first_subscriber();
+        source.on_last_unsubscribe();
+        assert_eq!(source.track().codec, "H264");
+        assert_eq!(source.next_packet().await, None);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "timed out waiting for missing event")]
+    async fn eventually_reports_timeout() {
+        eventually("missing event", || false).await;
     }
 
     #[tokio::test]
@@ -388,15 +405,15 @@ mod tests {
         let fan = Fanout::new(Arc::clone(&src), 8);
         let a = fan.subscribe();
         let b = fan.subscribe();
-        eventually("start", || src.starts.load(Ordering::SeqCst) == 1).await;
+        eventually("start", || src.starts() == 1).await;
         drop(a);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(src.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(src.stops(), 0);
         drop(b);
-        eventually("stop", || src.stops.load(Ordering::SeqCst) == 1).await;
+        eventually("stop", || src.stops() == 1).await;
         let _again = fan.subscribe();
-        eventually("restart", || src.starts.load(Ordering::SeqCst) == 2).await;
-        assert_eq!(src.starts.load(Ordering::SeqCst), 2);
+        eventually("restart", || src.starts() == 2).await;
+        assert_eq!(src.starts(), 2);
     }
 
     #[tokio::test]
@@ -413,72 +430,28 @@ mod tests {
         assert_eq!(fan.dropped_packets(), 8);
     }
 
-    /// Source that records whether the start hook ran before the first poll.
-    struct OrderedSource {
-        started: std::sync::atomic::AtomicBool,
-        polled_before_start: std::sync::atomic::AtomicBool,
-    }
-
-    impl MediaSource for OrderedSource {
-        fn track(&self) -> TrackInfo {
-            TrackInfo {
-                kind: crate::rtsp::sdp::MediaKind::Video,
-                payload_type: 96,
-                codec: "H264".into(),
-                clock_rate: 90_000,
-                fmtp: None,
-                control: "trackID=0".into(),
-            }
-        }
-
-        fn next_packet(&self) -> impl Future<Output = Option<Packet>> + Send {
-            if !self.started.load(Ordering::SeqCst) {
-                self.polled_before_start.store(true, Ordering::SeqCst);
-            }
-            std::future::ready(None)
-        }
-
-        fn on_first_subscriber(&self) {
-            // Give a racing pump every chance to poll first.
-            std::thread::sleep(Duration::from_millis(20));
-            self.started.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Source that is always ready, to prove the pump yields and can be stopped.
-    struct FirehoseSource {
-        stops: std::sync::atomic::AtomicUsize,
-    }
-
-    impl MediaSource for FirehoseSource {
-        fn track(&self) -> TrackInfo {
-            OrderedSource {
-                started: false.into(),
-                polled_before_start: false.into(),
-            }
-            .track()
-        }
-
-        fn next_packet(&self) -> impl Future<Output = Option<Packet>> + Send {
-            std::future::ready(Some(Packet::new(vec![
-                0x80, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ])))
-        }
-
-        fn on_last_unsubscribe(&self) {
-            self.stops.fetch_add(1, Ordering::SeqCst);
+    fn track() -> TrackInfo {
+        TrackInfo {
+            kind: crate::rtsp::sdp::MediaKind::Video,
+            payload_type: 96,
+            codec: "H264".into(),
+            clock_rate: 90_000,
+            fmtp: None,
+            control: "trackID=0".into(),
         }
     }
 
     #[tokio::test]
     async fn always_ready_source_does_not_starve_the_runtime_and_stops() {
-        let source = Arc::new(FirehoseSource { stops: 0.into() });
+        let track = track();
+        let packet = Packet::new(vec![0x80, 96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let source = Arc::new(ScriptedSource::new(track, vec![packet], true, None));
         let fan = Fanout::new(Arc::clone(&source), 4);
         let sub = fan.subscribe();
         // Without a yield in the pump this sleep would never return on a current-thread runtime.
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(sub);
-        eventually("stop", || source.stops.load(Ordering::SeqCst) == 1).await;
+        eventually("stop", || source.stops() == 1).await;
         let dropped = fan.dropped_packets();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -490,77 +463,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_hook_runs_before_the_source_is_polled() {
-        let source = Arc::new(OrderedSource {
-            started: false.into(),
-            polled_before_start: false.into(),
-        });
+        let source = Arc::new(ScriptedSource::new(track(), vec![], false, None));
         let fan = Fanout::new(Arc::clone(&source), 4);
         let _sub = fan.subscribe();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!source.polled_before_start.load(Ordering::SeqCst));
-    }
-
-    /// Source whose `next_packet` blocks until released, recording overlap and hook order.
-    struct GatedSource {
-        gate: tokio::sync::Semaphore,
-        in_flight: std::sync::atomic::AtomicUsize,
-        max_in_flight: std::sync::atomic::AtomicUsize,
-        hooks_during_poll: std::sync::atomic::AtomicUsize,
-        events: Mutex<Vec<&'static str>>,
-    }
-
-    struct InFlight<'a>(&'a GatedSource);
-
-    impl Drop for InFlight<'_> {
-        fn drop(&mut self) {
-            self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    impl GatedSource {
-        fn event(&self, what: &'static str) {
-            if self.in_flight.load(Ordering::SeqCst) != 0 {
-                self.hooks_during_poll.fetch_add(1, Ordering::SeqCst);
-            }
-            self.events.lock().unwrap().push(what);
-        }
-    }
-
-    impl MediaSource for GatedSource {
-        fn track(&self) -> TrackInfo {
-            OrderedSource {
-                started: false.into(),
-                polled_before_start: false.into(),
-            }
-            .track()
-        }
-
-        async fn next_packet(&self) -> Option<Packet> {
-            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-            let _guard = InFlight(self);
-            self.gate.acquire().await.ok()?.forget();
-            Some(Packet::new(vec![0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
-        }
-
-        fn on_first_subscriber(&self) {
-            self.event("start");
-        }
-
-        fn on_last_unsubscribe(&self) {
-            self.event("stop");
-        }
+        timeout(Duration::from_secs(5), source.wait_for_polls(1))
+            .await
+            .unwrap();
+        assert_eq!(source.polls_without_subscriber(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rapid_resubscribe_never_overlaps_source_calls_or_hooks() {
-        let source = Arc::new(GatedSource {
-            gate: tokio::sync::Semaphore::new(0),
-            in_flight: 0.into(),
-            max_in_flight: 0.into(),
-            hooks_during_poll: 0.into(),
-            events: Mutex::new(Vec::new()),
-        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let packet = Packet::new(vec![0x80, 96, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let source = Arc::new(ScriptedSource::new(
+            track(),
+            vec![packet],
+            true,
+            Some(Arc::clone(&gate)),
+        ));
         let fan = Fanout::new(Arc::clone(&source), 4);
         for round in 0..60 {
             let sub = fan.subscribe();
@@ -569,40 +490,36 @@ mod tests {
             }
             drop(sub);
         }
-        let mut last = fan.subscribe();
-        eventually("final start", || {
-            source.events.lock().unwrap().last() == Some(&"start")
+        let barrier = fan.subscribe();
+        eventually("barrier start", || source.starts() > source.stops()).await;
+        drop(barrier);
+        eventually("churn stopped", || {
+            source.starts() == source.stops() && source.stops() > 0 && source.in_flight() == 0
         })
         .await;
+        let previous_polls = source.polls();
+        let mut last = fan.subscribe();
+        timeout(
+            Duration::from_secs(5),
+            source.wait_for_polls(previous_polls + 1),
+        )
+        .await
+        .unwrap();
         // A packet released now must reach the live subscriber, exactly one poll in flight.
-        source.gate.add_permits(1);
+        gate.add_permits(1);
         let packet = timeout(Duration::from_secs(5), last.recv()).await.unwrap();
         assert!(packet.is_some());
         drop(last);
-        eventually("final stop", || {
-            source.events.lock().unwrap().last() == Some(&"stop")
-        })
-        .await;
-        eventually("poll cancelled", || {
-            source.in_flight.load(Ordering::SeqCst) == 0
-        })
-        .await;
+        eventually("final stop", || source.events().last() == Some(&"stop")).await;
+        eventually("poll cancelled", || source.in_flight() == 0).await;
 
-        let events = source.events.lock().unwrap().clone();
+        let events = source.events();
         let expected: Vec<&str> = (0..events.len())
             .map(|i| if i % 2 == 0 { "start" } else { "stop" })
             .collect();
         assert_eq!(events, expected, "hooks must strictly alternate");
-        assert_eq!(
-            source.max_in_flight.load(Ordering::SeqCst),
-            1,
-            "overlapping polls"
-        );
-        assert_eq!(
-            source.hooks_during_poll.load(Ordering::SeqCst),
-            0,
-            "hook ran during a poll"
-        );
+        assert_eq!(source.max_in_flight(), 1, "overlapping polls");
+        assert_eq!(source.hooks_during_poll(), 0, "hook ran during a poll");
     }
 
     #[tokio::test]
@@ -615,18 +532,15 @@ mod tests {
             drop(fan.subscribe());
         }
         let keep = fan.subscribe();
-        eventually("start", || src.starts.load(Ordering::SeqCst) >= 1).await;
+        eventually("start", || src.starts() >= 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let (starts, stops) = (
-            src.starts.load(Ordering::SeqCst),
-            src.stops.load(Ordering::SeqCst),
-        );
+        let (starts, stops) = (src.starts(), src.stops());
         assert!(
             starts <= 2 && starts == stops + 1,
             "starts {starts} stops {stops}"
         );
         drop(keep);
-        eventually("stop", || src.stops.load(Ordering::SeqCst) == starts).await;
+        eventually("stop", || src.stops() == starts).await;
     }
 
     #[tokio::test]

@@ -69,7 +69,8 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 ### RTSP server contract
 
 - `rtsp::MediaSource` hands the server ready RTP packets as bytes plus a `TrackInfo` (codec, clock
-  rate, `fmtp`) for SDP. The server pulls only while a client is playing
+  rate, `fmtp`) for SDP. The server pulls only while a client is playing. `rtsp::source::ScriptedSource`
+  supplies a finite or repeating packet list, optionally gated, or a channel-fed stream for tests and examples
 - `on_first_subscriber` / `on_last_unsubscribe` fire on the first `PLAY` and the last leaver, so
   the supervisor can start and stop the capture pipeline
 - Each client has a bounded queue; a full queue drops packets for that client only
@@ -103,7 +104,7 @@ They map to:
 
 ## Security model
 
-- RTSP: Digest authentication on every request, including from loopback
+- RTSP: Digest authentication on every request, including from loopback. Response debug output reports body length without body bytes
 - ONVIF: An allocation-free XML preflight limits nesting, elements, 64 attributes per element,
   32 namespace declarations, 256-byte names and namespace URIs, and 4096-byte attribute values
   before namespace resolution. DTDs, entity declarations, CDATA and processing

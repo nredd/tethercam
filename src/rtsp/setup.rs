@@ -61,8 +61,8 @@ fn parse_pair<T: std::str::FromStr + Copy>(
 }
 
 fn parse_spec(spec: &str) -> Option<TransportSpec> {
-    let mut parts = spec.split(';').map(str::trim);
-    let protocol = parts.next()?;
+    let (protocol, params) = spec.split_once(';').unwrap_or((spec, ""));
+    let protocol = protocol.trim();
     let tcp = if protocol.eq_ignore_ascii_case("RTP/AVP/TCP") {
         true
     } else if protocol.eq_ignore_ascii_case("RTP/AVP")
@@ -73,7 +73,7 @@ fn parse_spec(spec: &str) -> Option<TransportSpec> {
         return None;
     };
     let (mut interleaved, mut client_port) = (None, None);
-    for param in parts {
+    for param in params.split(';').map(str::trim) {
         let (key, value) = param.split_once('=').unwrap_or((param, ""));
         match key.to_ascii_lowercase().as_str() {
             "multicast" => return None,
@@ -192,6 +192,8 @@ mod tests {
             "RTP/AVP/TCP;interleaved=3-3",
             "RTP/AVP/TCP;interleaved=255",
             "RTP/AVP/TCP;interleaved=a-b",
+            "RTP/AVP/TCP;interleaved=1-b",
+            "RTP/AVP/TCP;interleaved=bad",
             "RTP/AVP;client_port=5000-5001;mode=RECORD",
             "RAW/RAW/UDP;unicast",
         ] {

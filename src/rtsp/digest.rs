@@ -252,8 +252,15 @@ impl Authenticator {
     pub fn challenge(
         &self, conn: ConnectionId, stale: bool, now: Instant,
     ) -> Result<Vec<String>, DigestError> {
+        self.challenge_with(conn, stale, now, &mut getrandom::fill)
+    }
+
+    fn challenge_with(
+        &self, conn: ConnectionId, stale: bool, now: Instant,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<Vec<String>, DigestError> {
         let mut raw = [0_u8; 16];
-        getrandom::fill(&mut raw).map_err(DigestError::Random)?;
+        fill(&mut raw).map_err(DigestError::Random)?;
         let nonce = hex(&raw);
         {
             let mut nonces = self.nonces.lock().unwrap_or_else(PoisonError::into_inner);
@@ -263,10 +270,7 @@ impl Authenticator {
                     .iter()
                     .min_by_key(|(_, s)| s.issued)
                     .map(|(k, _)| k.clone());
-                match oldest {
-                    Some(k) => nonces.remove(&k),
-                    None => break,
-                };
+                nonces.retain(|key, _| Some(key) != oldest.as_ref());
             }
             nonces.insert(
                 nonce.clone(),
@@ -573,30 +577,30 @@ mod tests {
     #[test]
     fn malformed_digest_returns_typed_error() {
         use super::{DigestParams, DigestParseError};
-        assert!(matches!(
-            DigestParams::parse("not digest"),
-            Err(DigestParseError::Scheme)
-        ));
-        assert!(matches!(
-            DigestParams::parse(&"x".repeat(super::MAX_HEADER_LEN + 1)),
-            Err(DigestParseError::TooLong)
-        ));
-        assert!(matches!(
-            DigestParams::parse("Digest bad"),
-            Err(DigestParseError::Parameter)
-        ));
-        assert!(matches!(
-            DigestParams::parse("Digest x=1,x=2"),
-            Err(DigestParseError::Duplicate)
-        ));
-        assert!(matches!(
-            DigestParams::parse("Digest x=\"unterminated"),
-            Err(DigestParseError::Parameter)
-        ));
-        assert!(matches!(
-            DigestParams::parse("Digest x=\"trailing\\"),
-            Err(DigestParseError::Parameter)
-        ));
+        assert_eq!(
+            DigestParams::parse("not digest").unwrap_err(),
+            DigestParseError::Scheme
+        );
+        assert_eq!(
+            DigestParams::parse(&"x".repeat(super::MAX_HEADER_LEN + 1)).unwrap_err(),
+            DigestParseError::TooLong
+        );
+        assert_eq!(
+            DigestParams::parse("Digest bad").unwrap_err(),
+            DigestParseError::Parameter
+        );
+        assert_eq!(
+            DigestParams::parse("Digest x=1,x=2").unwrap_err(),
+            DigestParseError::Duplicate
+        );
+        assert_eq!(
+            DigestParams::parse("Digest x=\"unterminated").unwrap_err(),
+            DigestParseError::Parameter
+        );
+        assert_eq!(
+            DigestParams::parse("Digest x=\"trailing\\").unwrap_err(),
+            DigestParseError::Parameter
+        );
     }
 
     #[test]
@@ -646,6 +650,36 @@ mod tests {
 
     fn nonce(a: &Authenticator, now: Instant) -> String {
         nonce_of(&a.challenge(CONN, false, now).unwrap()[0])
+    }
+
+    #[test]
+    fn client_digest_debug_redacts_secrets() {
+        let digest = ClientDigest {
+            algorithm: Algorithm::Md5,
+            username: "camera",
+            password: "synthetic-password",
+            realm: REALM,
+            nonce: "synthetic-nonce",
+            method: "PLAY",
+            uri: URI,
+            nc: 1,
+            cnonce: "synthetic-cnonce",
+        };
+        let debug = format!("{digest:?}");
+        assert!(debug.contains("camera"));
+        assert!(!debug.contains("synthetic-password"));
+        assert!(!debug.contains("synthetic-nonce"));
+    }
+
+    #[test]
+    fn challenge_propagates_random_failure() {
+        let error = auth().challenge_with(CONN, false, Instant::now(), &mut |_| {
+            Err(getrandom::Error::new_custom(42))
+        });
+        assert_eq!(
+            error.unwrap_err().to_string(),
+            DigestError::Random(getrandom::Error::new_custom(42)).to_string()
+        );
     }
 
     #[test]

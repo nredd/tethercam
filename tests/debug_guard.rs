@@ -33,7 +33,7 @@ fn sensitive_fields(type_name: &str, fields: &syn::Fields) -> bool {
         };
         let name = name.to_string();
         let sensitive_body =
-            name == "body" && (type_name.contains("Request") || type_name == "ServiceResponse");
+            name == "body" && (type_name.contains("Request") || type_name.contains("Response"));
         let replay_cache = name == "seen" && type_name == "WsseVerifier";
         if !sensitive_body
             && !replay_cache
@@ -118,6 +118,7 @@ fn guard_detects_raw_secrets_and_header_maps() {
         #[derive(Debug)] struct Request { body: Vec<u8> }
         #[derive(Debug)] struct ServiceResponse { body: Vec<u8> }
         #[derive(Debug)] struct WsseVerifier { seen: Vec<u8> }
+        #[derive(Debug)] struct Response { body: Vec<u8> }
         #[derive(Debug)] struct Challenge { nonce: String, www_authenticate: String }
         #[derive(Debug)] struct Safe { password: Secret, headers: Headers }
         #[derive(std::fmt::Debug)] struct Qualified { password: String }
@@ -137,6 +138,7 @@ fn guard_detects_raw_secrets_and_header_maps() {
             "Request",
             "ServiceResponse",
             "WsseVerifier",
+            "Response",
             "Challenge",
             "Qualified",
             "BadEnum",

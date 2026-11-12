@@ -185,6 +185,12 @@ mod tests {
     }
 
     #[test]
+    fn rejects_csrc_count_exceeding_packet_length() {
+        let packet = [0x81, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
+        assert_eq!(RtpHeader::parse(&packet), Err(RtpParseError::Extension));
+    }
+
+    #[test]
     fn ntp_conversion() {
         assert_eq!(ntp_timestamp(Duration::ZERO), NTP_UNIX_OFFSET << 32);
         let half = ntp_timestamp(Duration::from_millis(500));

@@ -10,6 +10,7 @@ All notable changes to this project are documented here. The format follows
 
 - Keep Sony sessions open when wait budgets expire, classify protocol fallback errors, and allow longer still-image downloads
 - Redact ONVIF response bodies and WS-Security replay caches from debug output
+- Redact RTSP response bodies in debug output
 - WS-Discovery sockets bound to an ephemeral port no longer set `SO_REUSEPORT`, which let Linux give two sockets the same port (cross-talk between parallel tests)
 - Do not advertise IPv6 link-local addresses in WS-Discovery `XAddrs`
 
@@ -22,6 +23,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Deterministic scripted RTSP media source for tests and examples
 - Reject fully covered stale entries in `coverage-pending.txt` during `make coverage`
 - Deterministic coverage of the media pipeline, removing its files from `coverage-pending.txt`
 

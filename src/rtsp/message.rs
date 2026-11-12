@@ -318,17 +318,12 @@ fn parse_message<T>(
             Ok(None)
         };
     };
-    if head_len > limits.max_head_bytes {
-        return Err(ParseError::HeadTooLarge {
-            limit: limits.max_head_bytes,
-        });
-    }
     let head = buf
         .get(..head_len)
         .and_then(|h| std::str::from_utf8(h).ok())
         .ok_or(ParseError::Malformed("head is not UTF-8"))?;
     let mut lines = head.split("\r\n");
-    let first = lines.next().ok_or(ParseError::Malformed("empty message"))?;
+    let first = lines.next().unwrap_or_default();
     let start = start(first)?;
     let headers = parse_headers(lines, limits)?;
 
@@ -468,9 +463,9 @@ fn content_length(headers: &Headers, limits: &Limits) -> Result<usize, ParseErro
         if value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit()) {
             return Err(ParseError::Malformed("bad Content-Length"));
         }
-        let parsed: usize = value
-            .parse()
-            .map_err(|_| ParseError::Malformed("bad Content-Length"))?;
+        let parsed = value.bytes().fold(0_usize, |number, digit| {
+            number * 10 + usize::from(digit - b'0')
+        });
         if length.is_some_and(|prev| prev != parsed) {
             return Err(ParseError::Malformed("conflicting Content-Length"));
         }
@@ -487,7 +482,7 @@ fn content_length(headers: &Headers, limits: &Limits) -> Result<usize, ParseErro
 }
 
 /// An RTSP response under construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Response {
     /// Numeric status code.
     pub status: u16,
@@ -495,6 +490,16 @@ pub struct Response {
     pub headers: Headers,
     /// Body bytes.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl Response {
@@ -591,6 +596,40 @@ pub fn encode_interleaved(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rejects_invalid_method_uri_and_header_line_breaks() {
+        for wire in [
+            &b"OP?TIONS * RTSP/1.0\r\n\r\n"[..],
+            b"OPTIONS  RTSP/1.0\r\n\r\n",
+            b"OPTIONS /\x01 RTSP/1.0\r\n\r\n",
+            b"OPTIONS * RTSP/1.0\r\nX: value\nextra\r\n\r\n",
+        ] {
+            assert!(super::parse_incoming(wire, &super::Limits::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn uncommon_reason_phrases() {
+        assert_eq!(super::reason_phrase(405), "Method Not Allowed");
+        assert_eq!(super::reason_phrase(500), "Internal Server Error");
+        assert_eq!(super::reason_phrase(999), "Unknown");
+    }
+
+    #[test]
+    fn request_test_helper_reports_invalid_input() {
+        assert!(std::panic::catch_unwind(|| request(b"invalid")).is_err());
+    }
+
+    #[test]
+    fn response_debug_redacts_body() {
+        let response =
+            super::Response::new(200).with_body("image/jpeg", b"synthetic-snapshot".to_vec());
+        let debug = format!("{response:?}");
+        assert!(debug.contains("body_len: 18"));
+        assert!(!debug.contains("synthetic-snapshot"));
+        assert!(!debug.contains("115, 121, 110"));
+    }
+
+    #[test]
     fn parsed_request_uri_credentials_are_redacted() {
         let bytes =
             b"OPTIONS rtsp://synthetic-user:synthetic-password@192.0.2.1/stream RTSP/1.0\r\n\r\n";
@@ -649,6 +688,24 @@ mod tests {
         }
     }
 
+    fn request_from_incoming(message: Incoming) -> Request {
+        match message {
+            Incoming::Request(request) => request,
+            other @ Incoming::Interleaved { .. } => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_extraction_rejects_frames() {
+        assert!(
+            std::panic::catch_unwind(|| request_from_incoming(Incoming::Interleaved {
+                channel: 0,
+                payload: Vec::new()
+            }))
+            .is_err()
+        );
+    }
+
     #[test]
     fn parses_options() {
         let r = request(
@@ -664,7 +721,7 @@ mod tests {
     fn parses_body_and_reports_consumed() {
         let wire = b"GET_PARAMETER * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 3\r\n\r\nabcOPTIONS";
         let (msg, n) = parse_incoming(wire, &LIMITS).unwrap().unwrap();
-        let Incoming::Request(r) = msg else { panic!() };
+        let r = request_from_incoming(msg);
         assert_eq!(r.method, Method::GetParameter);
         assert_eq!(r.body, b"abc");
         assert_eq!(&wire[n..], b"OPTIONS");
@@ -701,10 +758,10 @@ mod tests {
 
     #[test]
     fn rejects_oversize_frame_and_encode_overflow() {
-        assert!(matches!(
+        assert_eq!(
             parse_incoming(b"$\x00\x00\x11", &LIMITS),
             Err(ParseError::BodyTooLarge { len: 17, limit: 16 })
-        ));
+        );
         let mut out = Vec::new();
         assert_eq!(
             encode_interleaved(0, &vec![0; 70_000], &mut out),
@@ -729,8 +786,9 @@ mod tests {
             b"OPTIONS * RTSP/1.0\r\nX: \xff\r\n\r\n",
         ];
         for wire in cases {
-            assert!(
-                matches!(parse_incoming(wire, &LIMITS), Err(ParseError::Malformed(_))),
+            assert_eq!(
+                std::mem::discriminant(&parse_incoming(wire, &LIMITS).unwrap_err()),
+                std::mem::discriminant(&ParseError::Malformed("")),
                 "{wire:?}"
             );
         }
@@ -750,19 +808,19 @@ mod tests {
         let mut long = b"OPTIONS * RTSP/1.0\r\nX: ".to_vec();
         long.extend(std::iter::repeat_n(b'a', 300));
         // Without a terminator and with a terminator: both are rejected.
-        assert!(matches!(
+        assert_eq!(
             parse_incoming(&long, &LIMITS),
-            Err(ParseError::HeadTooLarge { .. })
-        ));
+            Err(ParseError::HeadTooLarge { limit: 256 })
+        );
         long.extend_from_slice(b"\r\n\r\n");
-        assert!(matches!(
+        assert_eq!(
             parse_incoming(&long, &LIMITS),
-            Err(ParseError::HeadTooLarge { .. })
-        ));
-        assert!(matches!(
+            Err(ParseError::HeadTooLarge { limit: 256 })
+        );
+        assert_eq!(
             parse_incoming(b"OPTIONS * RTSP/1.0\r\nContent-Length: 17\r\n\r\n", &LIMITS),
             Err(ParseError::BodyTooLarge { len: 17, limit: 16 })
-        ));
+        );
     }
 
     #[test]
@@ -795,9 +853,8 @@ mod tests {
         };
         let mut wire = Vec::new();
         original.write_into(5, &mut wire);
-        let Ok(Some((Incoming::Request(parsed), n))) = parse_incoming(&wire, &LIMITS) else {
-            panic!("did not parse");
-        };
+        let (parsed, n) = parse_incoming(&wire, &LIMITS).unwrap().unwrap();
+        let parsed = request_from_incoming(parsed);
         assert_eq!(n, wire.len());
         assert_eq!(parsed.method, original.method);
         assert_eq!(parsed.uri, original.uri);
@@ -820,15 +877,13 @@ mod tests {
         assert_eq!(again.headers.get("x"), Some("y"));
 
         let req_wire = b"GET_PARAMETER * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n";
-        let Ok(Some((Incoming::Request(mut req), _))) = parse_incoming(req_wire, &LIMITS) else {
-            panic!("did not parse");
-        };
+        let (req, _) = parse_incoming(req_wire, &LIMITS).unwrap().unwrap();
+        let mut req = request_from_incoming(req);
         req.body = b"xy".to_vec();
         let mut out = Vec::new();
         req.write_into(4, &mut out);
-        let Ok(Some((Incoming::Request(again), n))) = parse_incoming(&out, &LIMITS) else {
-            panic!("did not reparse");
-        };
+        let (again, n) = parse_incoming(&out, &LIMITS).unwrap().unwrap();
+        let again = request_from_incoming(again);
         assert_eq!(
             (n, again.cseq(), again.body),
             (out.len(), Some(4), b"xy".to_vec())
@@ -843,8 +898,9 @@ mod tests {
             b"RTSP/1.0 2x0 OK\r\n\r\n",
             b"RTSP/1.0 20 OK\r\n\r\n",
         ] {
-            assert!(
-                matches!(parse_response(wire, &LIMITS), Err(ParseError::Malformed(_))),
+            assert_eq!(
+                std::mem::discriminant(&parse_response(wire, &LIMITS).unwrap_err()),
+                std::mem::discriminant(&ParseError::Malformed("")),
                 "{wire:?}"
             );
         }
@@ -872,26 +928,25 @@ mod tests {
                 "cut {cut}"
             );
         }
-        assert!(matches!(parse_incoming(&exact, &limits), Ok(Some(_))));
+        assert!(parse_incoming(&exact, &limits).unwrap().is_some());
         // One byte more is over the limit however the terminator arrives.
         let over = format!("{prefix}{pad}a\r\n\r\n").into_bytes();
         for cut in 0..over.len() {
-            assert!(
-                matches!(
-                    parse_incoming(&over[..cut], &limits),
-                    Ok(None) | Err(ParseError::HeadTooLarge { .. })
-                ),
-                "cut {cut}"
-            );
+            let expected = if cut < exact.len() {
+                Ok(None)
+            } else {
+                Err(ParseError::HeadTooLarge { limit: 64 })
+            };
+            assert_eq!(parse_incoming(&over[..cut], &limits), expected, "cut {cut}");
         }
-        assert!(matches!(
+        assert_eq!(
             parse_incoming(&over, &limits),
-            Err(ParseError::HeadTooLarge { .. })
-        ));
-        assert!(matches!(
+            Err(ParseError::HeadTooLarge { limit: 64 })
+        );
+        assert_eq!(
             parse_incoming(&over[..over.len() - 1], &limits),
-            Err(ParseError::HeadTooLarge { .. })
-        ));
+            Err(ParseError::HeadTooLarge { limit: 64 })
+        );
     }
 
     #[test]
