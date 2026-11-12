@@ -15,6 +15,7 @@ Hard rules:
 - Every parser of bytes from the camera or the network is total: it returns an error on any input and never panics. Each one gets a `proptest` "never panics on arbitrary bytes" test
 - Every line, function and region under `src/` is covered by the test suite (100%, `cargo llvm-cov nextest`; `#[cfg(test)]` code counts too). `make coverage` is part of the gate and a required check. No exclusions: no `--ignore-filename-regex` for convenience, no `#[coverage(off)]`. Unreachable code is deleted or restructured so the state cannot be expressed, never waived. Hardware-bound logic sits behind the transport trait so the simulated camera covers it
 - `coverage-pending.txt` (`<src path> <tracking issue>` per line) is the transition list for files that predate the gate. It may only shrink: `scripts/coverage-pending.sh shrink origin/main` fails a run that adds a path, and `validate` fails a path that does not exist. Delete the file and the mechanism when it is empty
+- `make coverage` fails when any pending file reaches 100% lines, functions and regions; remove that entry
 - Everything runs without a camera. Hardware access sits behind a transport trait with an in-memory simulated camera; CI never needs USB
 - Must build for `aarch64-unknown-linux-gnu` and `armv7-unknown-linux-gnueabihf` (`make cross`). No macOS-only code outside `cfg`-gated modules with a portable fallback
 - Per-frame paths get a `criterion` benchmark in `benches/`

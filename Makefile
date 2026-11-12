@@ -44,9 +44,15 @@ COVERAGE_IGNORE = $$(scripts/coverage-pending.sh regex)
 coverage:  ## Enforce 100% line, function and region coverage of src/ (needs cargo-llvm-cov)
 	scripts/test-coverage-pending.sh
 	scripts/coverage-pending.sh validate
-	@if git rev-parse --verify --quiet origin/main >/dev/null; then scripts/coverage-pending.sh shrink origin/main; fi
+	@set -eu; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	cargo llvm-cov clean --workspace; \
+	cargo llvm-cov nextest --all-features --no-report; \
+	cargo llvm-cov report --json --summary-only --output-path "$$tmp/coverage.json"; \
+	scripts/coverage-pending.sh stale "$$tmp/coverage.json"; \
+	if git rev-parse --verify --quiet origin/main >/dev/null; then scripts/coverage-pending.sh shrink origin/main; fi; \
 	ignore="$(COVERAGE_IGNORE)"; \
-	cargo llvm-cov nextest --all-features --show-missing-lines \
+	cargo llvm-cov report --show-missing-lines \
 		--fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
 		$${ignore:+--ignore-filename-regex "$$ignore"}
 

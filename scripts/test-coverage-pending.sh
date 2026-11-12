@@ -80,6 +80,27 @@ done
 printf '# nothing pending\n' >coverage-pending.txt
 [ -z "$("$script" regex)" ] || fail "empty list produced a regex"
 
+# Check each metric independently and fail closed on missing or malformed reports.
+printf 'src/a.rs #1\n' >coverage-pending.txt
+printf '%s\n' '{"data":[{"files":[{"filename":"/repo/src/a.rs","summary":{"lines":{"count":10,"covered":10},"functions":{"count":2,"covered":2},"regions":{"count":5,"covered":5}}}]}]}' >report.json
+if "$script" stale report.json 2>error; then fail "fully covered file was accepted"; fi
+grep -q 'remove these entries' error || fail "missing stale diagnostic"
+grep -q 'src/a.rs' error || fail "missing stale path"
+for metric in lines functions regions; do
+    jq --arg metric "$metric" '.data[0].files[0].summary[$metric].covered -= 1' report.json >partial.json
+    "$script" stale partial.json || fail "$metric below 100% was stale"
+done
+printf 'src/b.rs #2\n' >coverage-pending.txt
+expect_fail "$script" stale report.json
+expect_fail "$script" stale missing.json
+printf 'not json\n' >bad.json
+expect_fail "$script" stale bad.json
+: >bad.json
+expect_fail "$script" stale bad.json
+printf '# empty\n' >coverage-pending.txt
+"$script" stale report.json
+expect_fail "$script" stale bad.json
+
 # An unknown base skips the shrink check instead of failing.
 "$script" shrink no-such-ref
 expect_fail "$script" bogus

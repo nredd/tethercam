@@ -6,6 +6,7 @@
 #   coverage-pending.sh regex           print an `--ignore-filename-regex` for the listed paths
 #   coverage-pending.sh validate        every entry is `src/...` path that exists, with a tracking ref
 #   coverage-pending.sh shrink <base>   fail if the list lists a path that <base> does not
+#   coverage-pending.sh stale <report>  fail on fully covered or missing pending paths
 #
 # File format, one entry per line: `<path> #<issue number>`, e.g. `src/config.rs #42`.
 # Blank lines and lines starting with `#` are ignored.
@@ -48,6 +49,39 @@ validate)
     fi
     exit "$status"
     ;;
+stale)
+    report="${2:?usage: coverage-pending.sh stale <report.json>}"
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    current_paths >"$tmp/paths"
+    # Require one report entry per pending path and complete, internally consistent metrics.
+    # Compare counts, not rounded percentages, so almost-complete coverage is not stale.
+    if ! jq -sr --rawfile paths "$tmp/paths" '
+        def metric:
+            type == "object" and (.count | type == "number") and
+            (.covered | type == "number") and .count >= 0 and
+            .covered >= 0 and .covered <= .count;
+        if length != 1 then error("expected one coverage report") else .[0] end |
+        if (.data | type != "array" or length != 1) or
+           (.data[0].files | type != "array") then error("invalid coverage report") else . end |
+        .data[0].files as $files |
+        [$paths | split("\n")[] | select(length > 0) | . as $path |
+            [$files[] | select(.filename | type == "string" and endswith("/" + $path))] as $matches |
+            if ($matches | length) != 1 then error("missing or ambiguous pending file: " + $path)
+            elif ([$matches[0].summary.lines, $matches[0].summary.functions, $matches[0].summary.regions] | all(metric)) | not
+                then error("invalid metrics for " + $path)
+            elif ([$matches[0].summary.lines, $matches[0].summary.functions, $matches[0].summary.regions] |
+                  all(.count > 0 and .covered == .count)) then $path else empty end] | .[]
+    ' "$report" >"$tmp/stale"; then
+        echo "coverage-pending: invalid or unreadable coverage report: $report" >&2
+        exit 1
+    fi
+    if [ -s "$tmp/stale" ]; then
+        echo "coverage-pending: remove these entries (100% covered):" >&2
+        cat "$tmp/stale" >&2
+        exit 1
+    fi
+    ;;
 shrink)
     base="${2:?usage: coverage-pending.sh shrink <base-ref>}"
     git rev-parse --verify --quiet "$base^{commit}" >/dev/null || {
@@ -70,7 +104,7 @@ shrink)
     fi
     ;;
 *)
-    echo "usage: $0 regex | validate | shrink <base-ref>" >&2
+    echo "usage: $0 regex | validate | shrink <base-ref> | stale <report.json>" >&2
     exit 2
     ;;
 esac

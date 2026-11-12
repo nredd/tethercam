@@ -57,7 +57,8 @@ make all        # the full gate: format check, clippy, tests, docs, benchmarks, 
 make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-cov)
 ```
 
-Tools: `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached.
+Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached.
+`make coverage` also rejects pending entries whose lines, functions and regions are fully covered; remove those entries from `coverage-pending.txt`.
 Repository rules are in [`AGENTS.md`](AGENTS.md); releases are described in
 [`docs/releasing.md`](docs/releasing.md).
 
