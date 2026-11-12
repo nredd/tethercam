@@ -112,7 +112,7 @@ impl HttpError {
 }
 
 /// A parsed request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     /// Method, as sent.
     pub method: String,
@@ -124,6 +124,14 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     /// Whether the connection may be reused after this request.
     pub keep_alive: bool,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -565,6 +573,20 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> Result<HttpRequest, HttpError> {
         read_request(&mut &bytes[..], &HttpLimits::default())
+    }
+
+    #[test]
+    fn parsed_requests_redact_debug() {
+        let request = parse(b"POST / HTTP/1.1\r\nAuthorization: synthetic-secret\r\nContent-Length: 16\r\n\r\nsynthetic-secret").unwrap();
+        assert!(!format!("{request:?}").contains("synthetic-secret"));
+        let service = ServiceRequest {
+            method: &request.method,
+            target: &request.target,
+            authorization: request.header("authorization"),
+            body: &request.body,
+            local: "192.0.2.1:80".parse().unwrap(),
+        };
+        assert!(!format!("{service:?}").contains("synthetic-secret"));
     }
 
     #[test]

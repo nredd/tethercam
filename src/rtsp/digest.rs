@@ -206,12 +206,22 @@ struct NonceState {
 }
 
 /// Issues challenges and verifies `Authorization` headers.
-#[derive(Debug)]
 pub struct Authenticator {
     credentials: Credentials,
     nonce_lifetime: Duration,
     max_nonces: usize,
     nonces: Mutex<HashMap<String, NonceState>>,
+}
+
+impl fmt::Debug for Authenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Authenticator")
+            .field("credentials", &self.credentials)
+            .field("nonce_lifetime", &self.nonce_lifetime)
+            .field("max_nonces", &self.max_nonces)
+            .field("nonces", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Authenticator {
@@ -289,7 +299,7 @@ impl Authenticator {
         let Some(header) = authorization else {
             return challenge(false, false);
         };
-        let Some(p) = DigestParams::parse(header) else {
+        let Ok(p) = DigestParams::parse(header) else {
             return challenge(false, true);
         };
         let algorithm = match p.algorithm.as_deref() {
@@ -378,7 +388,7 @@ fn parse_nc(nc: &str) -> Option<u32> {
     u32::from_str_radix(nc, 16).ok()
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct DigestParams {
     username: String,
     realm: String,
@@ -391,17 +401,38 @@ struct DigestParams {
     cnonce: String,
 }
 
+impl fmt::Debug for DigestParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DigestParams")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum DigestParseError {
+    #[error("Digest header too long")]
+    TooLong,
+    #[error("invalid Digest scheme")]
+    Scheme,
+    #[error("malformed Digest parameter")]
+    Parameter,
+    #[error("duplicate Digest parameter")]
+    Duplicate,
+}
+
 impl DigestParams {
-    /// Parse `Digest k=v, k="quoted", ...`. Total: any malformed input yields `None`.
-    fn parse(header: &str) -> Option<Self> {
+    /// Parse `Digest k=v, k="quoted", ...`.
+    fn parse(header: &str) -> Result<Self, DigestParseError> {
         if header.len() > MAX_HEADER_LEN {
-            return None;
+            return Err(DigestParseError::TooLong);
         }
         let (scheme, mut rest) = header
             .trim()
-            .split_once(|c: char| c.is_ascii_whitespace())?;
+            .split_once(|c: char| c.is_ascii_whitespace())
+            .ok_or(DigestParseError::Scheme)?;
         if !scheme.eq_ignore_ascii_case("digest") {
-            return None;
+            return Err(DigestParseError::Scheme);
         }
         let mut params = Self::default();
         let mut seen: Vec<String> = Vec::new();
@@ -410,26 +441,26 @@ impl DigestParams {
             if rest.is_empty() {
                 break;
             }
-            let (key, after) = rest.split_once('=')?;
+            let (key, after) = rest.split_once('=').ok_or(DigestParseError::Parameter)?;
             let key = key.trim().to_ascii_lowercase();
             let after = after.trim_start();
             let (value, remainder) = if let Some(quoted) = after.strip_prefix('"') {
                 let mut value = String::new();
                 let mut chars = quoted.char_indices();
-                let end = loop {
-                    match chars.next()? {
-                        (i, '"') => break i + 1,
-                        (_, '\\') => value.push(chars.next()?.1),
+                loop {
+                    match chars.next().ok_or(DigestParseError::Parameter)? {
+                        (_, '"') => break,
+                        (_, '\\') => value.push(chars.next().ok_or(DigestParseError::Parameter)?.1),
                         (_, c) => value.push(c),
                     }
-                };
-                (value, quoted.get(end..)?)
+                }
+                (value, chars.as_str())
             } else {
-                let end = after.find(',').unwrap_or(after.len());
-                (after.get(..end)?.trim().to_owned(), after.get(end..)?)
+                let (value, remainder) = after.split_once(',').unwrap_or((after, ""));
+                (value.trim().to_owned(), remainder)
             };
             if seen.contains(&key) {
-                return None;
+                return Err(DigestParseError::Duplicate);
             }
             match key.as_str() {
                 "username" => params.username = value,
@@ -446,7 +477,7 @@ impl DigestParams {
             seen.push(key);
             rest = remainder;
         }
-        Some(params)
+        Ok(params)
     }
 }
 
@@ -539,6 +570,46 @@ impl ClientDigest<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_digest_returns_typed_error() {
+        use super::{DigestParams, DigestParseError};
+        assert!(matches!(
+            DigestParams::parse("not digest"),
+            Err(DigestParseError::Scheme)
+        ));
+        assert!(matches!(
+            DigestParams::parse(&"x".repeat(super::MAX_HEADER_LEN + 1)),
+            Err(DigestParseError::TooLong)
+        ));
+        assert!(matches!(
+            DigestParams::parse("Digest bad"),
+            Err(DigestParseError::Parameter)
+        ));
+        assert!(matches!(
+            DigestParams::parse("Digest x=1,x=2"),
+            Err(DigestParseError::Duplicate)
+        ));
+        assert!(matches!(
+            DigestParams::parse("Digest x=\"unterminated"),
+            Err(DigestParseError::Parameter)
+        ));
+        assert!(matches!(
+            DigestParams::parse("Digest x=\"trailing\\"),
+            Err(DigestParseError::Parameter)
+        ));
+    }
+
+    #[test]
+    fn digest_parser_decodes_quoted_escapes() {
+        let params = super::DigestParams::parse(r#"Digest username="a\"b\\c""#).unwrap();
+        assert_eq!(params.username, "a\"b\\c");
+    }
+
+    #[test]
+    fn parsed_digest_debug_redacts_response() {
+        let params = super::DigestParams::parse("Digest response=synthetic-secret").unwrap();
+        assert!(!format!("{params:?}").contains("synthetic-secret"));
+    }
     use proptest::prelude::*;
 
     use super::*;
@@ -872,6 +943,15 @@ mod tests {
             a.authorize(CONN, "PLAY", URI, Some(&h), now),
             AuthOutcome::Authorized
         );
+    }
+
+    #[test]
+    fn authenticator_debug_redacts_challenge_nonce() {
+        let auth = auth();
+        let issued = nonce(&auth, Instant::now());
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains(&issued));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

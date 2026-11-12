@@ -46,6 +46,7 @@ rusty_h264-common = { version = "0.17", default-features = false, features = ["s
 log = { version = "0.4.35", default-features = false }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3.27.0"

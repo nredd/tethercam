@@ -131,8 +131,16 @@ impl Method {
 }
 
 /// An ordered, case-insensitive header map. Duplicate names are kept.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Headers(Vec<(String, String)>);
+
+impl std::fmt::Debug for Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Headers")
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
 
 impl Headers {
     /// The first value for `name`.
@@ -179,7 +187,7 @@ impl Headers {
 }
 
 /// A parsed RTSP request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     /// The request method.
     pub method: Method,
@@ -189,6 +197,17 @@ pub struct Request {
     pub headers: Headers,
     /// Body bytes, `Content-Length` long.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("uri", &"[REDACTED]")
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl Request {
@@ -571,6 +590,45 @@ pub fn encode_interleaved(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parsed_request_uri_credentials_are_redacted() {
+        let bytes =
+            b"OPTIONS rtsp://synthetic-user:synthetic-password@192.0.2.1/stream RTSP/1.0\r\n\r\n";
+        let (incoming, _) = super::parse_incoming(bytes, &super::Limits::default())
+            .unwrap()
+            .unwrap();
+        let request = request(bytes);
+        for debug in [format!("{incoming:?}"), format!("{request:?}")] {
+            assert!(!debug.contains("synthetic-user"));
+            assert!(!debug.contains("synthetic-password"));
+        }
+    }
+
+    #[test]
+    fn parsed_request_body_is_redacted() {
+        let body = b"synthetic-secret";
+        let (incoming, _) = super::parse_incoming(
+            b"OPTIONS / RTSP/1.0\r\nContent-Length: 16\r\n\r\nsynthetic-secret",
+            &super::Limits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let request = request(b"OPTIONS / RTSP/1.0\r\nContent-Length: 16\r\n\r\nsynthetic-secret");
+        for debug in [format!("{incoming:?}"), format!("{request:?}")] {
+            assert!(!debug.contains("synthetic-secret"));
+            assert!(!debug.contains(&format!("{:?}", body.as_slice())));
+            assert!(debug.contains("body_len: 16"));
+        }
+    }
+
+    #[test]
+    fn parsed_debug_redacts_authorization() {
+        let (incoming, _) = super::parse_incoming(b"OPTIONS rtsp://example.test/stream RTSP/1.0\r\nAuthorization: synthetic-secret\r\n\r\n", &super::Limits::default()).unwrap().unwrap();
+        assert!(!format!("{incoming:?}").contains("synthetic-secret"));
+        let parsed = request(b"OPTIONS rtsp://example.test/stream RTSP/1.0\r\nAuthorization: synthetic-secret\r\n\r\n");
+        assert!(!format!("{parsed:?}").contains("synthetic-secret"));
+        assert!(!format!("{:?}", parsed.headers).contains("synthetic-secret"));
+    }
     use proptest::prelude::*;
 
     use super::*;

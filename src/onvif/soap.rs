@@ -1,7 +1,7 @@
 //! SOAP 1.2 envelope parsing and response building.
 //!
 //! Parsing is total and bounded: input size, element depth and node count are capped, and
-//! any DTD (so any entity declaration, internal or external) is rejected before it is
+//! names are limited to 256 bytes and copied strings to four times the input size. Any DTD (so any entity declaration, internal or external) is rejected before it is
 //! processed. Only the SOAP 1.2 namespace is accepted; SOAP 1.1 gets a `VersionMismatch`.
 //!
 //! References:
@@ -59,10 +59,19 @@ pub enum SoapError {
     /// Elements nest deeper than [`SoapLimits::max_depth`].
     #[error("envelope nests deeper than {0} elements")]
     TooDeep(usize),
+    /// The bounded XML preflight rejected the input.
+    #[error("invalid or excessive XML before parsing: {0}")]
+    Preflight(&'static str),
     /// The document has a DTD or entity declaration, or exceeds the node limit, or is not
     /// well-formed.
     #[error("malformed or forbidden XML: {0}")]
     Xml(#[from] roxmltree::Error),
+    /// An XML namespace, element name, or attribute name exceeds 256 bytes.
+    #[error("XML name or namespace exceeds 256 bytes")]
+    NameTooLong,
+    /// The converted tree would exceed its input-derived string budget.
+    #[error("converted XML exceeds its allocation budget")]
+    AllocationBudget,
     /// The root is a SOAP 1.1 envelope.
     #[error("SOAP 1.1 envelope")]
     VersionMismatch,
@@ -78,7 +87,7 @@ pub enum SoapError {
 }
 
 /// An owned, namespace-resolved XML element.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Element {
     /// Namespace URI, if any.
     pub namespace: Option<String>,
@@ -90,6 +99,14 @@ pub struct Element {
     pub attributes: Vec<(String, String)>,
     /// Child elements in order.
     pub children: Vec<Element>,
+}
+
+impl std::fmt::Debug for Element {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Element")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Element {
@@ -152,6 +169,7 @@ impl Envelope {
             return Err(SoapError::TooLarge(limits.max_bytes));
         }
         let text = std::str::from_utf8(bytes).map_err(|_| SoapError::NotUtf8)?;
+        preflight(text, limits)?;
         let options = ParsingOptions {
             allow_dtd: false,
             nodes_limit: limits.max_nodes,
@@ -165,6 +183,8 @@ impl Envelope {
         if too_deep {
             return Err(SoapError::TooDeep(limits.max_depth));
         }
+
+        validate_conversion(&doc, bytes.len())?;
 
         let root = doc.root_element();
         let tag = root.tag_name();
@@ -207,6 +227,187 @@ impl Envelope {
     pub fn header_block(&self, namespace: &str, name: &str) -> Option<&Element> {
         self.header.iter().find(|e| e.is(namespace, name))
     }
+}
+
+/// Bounds checked before handing untrusted XML to the namespace-expanding parser.
+const MAX_ATTRIBUTES: usize = 64;
+const MAX_NAMESPACES: usize = 32;
+const MAX_ATTRIBUTE_VALUE: usize = 4096;
+
+/// Consume a bounded XML name, leaving full grammar validation to roxmltree.
+fn preflight_name(input: &mut &str) -> Result<(), SoapError> {
+    let remainder = input.trim_start_matches(|c: char| {
+        !c.is_ascii_whitespace() && !matches!(c, '/' | '>' | '=' | '?' | '<' | '\'' | '"')
+    });
+    let length = input.len() - remainder.len();
+    if length == 0 {
+        return Err(SoapError::Preflight("missing name"));
+    }
+    if length > 256 {
+        return Err(SoapError::NameTooLong);
+    }
+    *input = remainder;
+    Ok(())
+}
+
+/// Consume one attribute and charge namespace declarations against the document limit.
+fn preflight_attribute<'a>(
+    mut input: &'a str, namespaces: &mut usize,
+) -> Result<&'a str, SoapError> {
+    let original = input;
+    preflight_name(&mut input)?;
+    let name_len = original.len() - input.len();
+    let is_namespace =
+        original.starts_with("xmlns:") || (name_len == 5 && original.starts_with("xmlns"));
+    if is_namespace {
+        *namespaces += 1;
+        if *namespaces > MAX_NAMESPACES {
+            return Err(SoapError::Preflight("too many namespaces"));
+        }
+    }
+    input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    input = input
+        .strip_prefix('=')
+        .ok_or(SoapError::Preflight("missing attribute equals"))?;
+    input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (quote, value) = if let Some(value) = input.strip_prefix('"') {
+        ('"', value)
+    } else if let Some(value) = input.strip_prefix('\'') {
+        ('\'', value)
+    } else {
+        return Err(SoapError::Preflight("unquoted attribute"));
+    };
+    let (value, remainder) = value
+        .split_once(quote)
+        .ok_or(SoapError::Preflight("unfinished attribute"))?;
+    if is_namespace && value.len() > 256 {
+        return Err(SoapError::NameTooLong);
+    }
+    if value.len() > MAX_ATTRIBUTE_VALUE {
+        return Err(SoapError::Preflight("attribute value too long"));
+    }
+    Ok(remainder)
+}
+
+/// Check lexical shape and resource bounds in one allocation-free pass.
+fn preflight(mut input: &str, limits: &SoapLimits) -> Result<(), SoapError> {
+    input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    if let Some(rest) = input.strip_prefix("<?xml") {
+        if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+            return Err(SoapError::Preflight("invalid XML declaration"));
+        }
+        let (declaration, remainder) = rest
+            .split_once("?>")
+            .ok_or(SoapError::Preflight("unfinished XML declaration"))?;
+        if declaration.len() > MAX_ATTRIBUTE_VALUE {
+            return Err(SoapError::Preflight("XML declaration too long"));
+        }
+        input = remainder;
+    }
+    let (mut depth, mut elements, mut namespaces) = (0usize, 0usize, 0usize);
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix('<') {
+            input = rest;
+        } else {
+            input = input.trim_start_matches(|c| c != '<');
+            continue;
+        }
+        if let Some(comment) = input.strip_prefix("!--") {
+            let (_, remainder) = comment
+                .split_once("-->")
+                .ok_or(SoapError::Preflight("unfinished comment"))?;
+            input = remainder;
+            continue;
+        }
+        if input.starts_with(['!', '?']) {
+            return Err(SoapError::Preflight("forbidden markup"));
+        }
+        if let Some(rest) = input.strip_prefix('/') {
+            input = rest;
+            preflight_name(&mut input)?;
+            input = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            input = input
+                .strip_prefix('>')
+                .ok_or(SoapError::Preflight("invalid end tag"))?;
+            depth = depth
+                .checked_sub(1)
+                .ok_or(SoapError::Preflight("unmatched end tag"))?;
+            continue;
+        }
+        preflight_name(&mut input)?;
+        elements += 1;
+        if elements > limits.max_nodes as usize {
+            return Err(SoapError::Preflight("too many elements"));
+        }
+        depth += 1;
+        if depth > limits.max_depth {
+            return Err(SoapError::TooDeep(limits.max_depth));
+        }
+        let mut attributes = 0usize;
+        loop {
+            let trimmed = input.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let separated = trimmed.len() != input.len();
+            input = trimmed;
+            if let Some(rest) = input.strip_prefix("/>") {
+                input = rest;
+                depth -= 1;
+                break;
+            }
+            if let Some(rest) = input.strip_prefix('>') {
+                input = rest;
+                break;
+            }
+            if !separated {
+                return Err(SoapError::Preflight("attributes require whitespace"));
+            }
+            attributes += 1;
+            if attributes > MAX_ATTRIBUTES {
+                return Err(SoapError::Preflight("too many attributes"));
+            }
+            input = preflight_attribute(input, &mut namespaces)?;
+        }
+    }
+    if depth != 0 {
+        return Err(SoapError::Preflight("unclosed element"));
+    }
+    Ok(())
+}
+
+/// Check all names and copied string bytes before allocating the owned tree.
+fn validate_conversion(doc: &Document<'_>, input_len: usize) -> Result<(), SoapError> {
+    let mut bytes = 0usize;
+    for node in doc.descendants().filter(Node::is_element) {
+        let tag = node.tag_name();
+        let namespace = tag.namespace().unwrap_or("");
+        if namespace.len() > 256
+            || tag.name().len() > 256
+            || node.namespaces().any(|ns| ns.uri().len() > 256)
+        {
+            return Err(SoapError::NameTooLong);
+        }
+        bytes = bytes
+            .saturating_add(namespace.len())
+            .saturating_add(tag.name().len());
+        for attribute in node.attributes() {
+            if attribute.name().len() > 256 {
+                return Err(SoapError::NameTooLong);
+            }
+            bytes = bytes
+                .saturating_add(attribute.name().len())
+                .saturating_add(attribute.value().len());
+        }
+        for text in node
+            .children()
+            .filter(Node::is_text)
+            .filter_map(|n| n.text())
+        {
+            bytes = bytes.saturating_add(text.len());
+        }
+        if bytes > input_len.saturating_mul(4) {
+            return Err(SoapError::AllocationBudget);
+        }
+    }
+    Ok(())
 }
 
 fn is_soap(node: Node<'_, '_>, name: &str) -> bool {
@@ -407,6 +608,7 @@ impl Fault {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::fmt::Write as _;
 
     const LIMITS: SoapLimits = SoapLimits {
         max_bytes: 64 * 1024,
@@ -418,6 +620,34 @@ mod tests {
         format!(
             r#"<s:Envelope xmlns:s="{NS_SOAP12}" xmlns:tds="{NS_DEVICE}"><s:Body>{body}</s:Body></s:Envelope>"#
         )
+    }
+
+    fn allocated_bytes(env: &Envelope) -> usize {
+        fn size(e: &Element) -> usize {
+            e.namespace.as_ref().map_or(0, String::capacity)
+                + e.name.capacity()
+                + e.text.capacity()
+                + e.attributes.capacity() * std::mem::size_of::<(String, String)>()
+                + e.attributes
+                    .iter()
+                    .map(|(n, v)| n.capacity() + v.capacity())
+                    .sum::<usize>()
+                + e.children.capacity() * std::mem::size_of::<Element>()
+                + e.children.iter().map(size).sum::<usize>()
+        }
+        std::mem::size_of::<Envelope>()
+            + env.header.capacity() * std::mem::size_of::<Element>()
+            + size(&env.operation)
+            + env.header.iter().map(size).sum::<usize>()
+    }
+
+    #[test]
+    fn allocation_measurement_covers_headers_attributes_and_children() {
+        let xml = format!(
+            r#"<s:Envelope xmlns:s="{NS_SOAP12}"><s:Header><h a="v"><c/></h></s:Header><s:Body><op b="v"><child/></op></s:Body></s:Envelope>"#
+        );
+        let env = Envelope::parse(xml.as_bytes(), &LIMITS).unwrap();
+        assert!(allocated_bytes(&env) <= xml.len() * 128);
     }
 
     #[test]
@@ -472,14 +702,14 @@ mod tests {
         );
         assert!(matches!(
             Envelope::parse(laughs.as_bytes(), &LIMITS),
-            Err(SoapError::Xml(_))
+            Err(SoapError::Preflight(_))
         ));
         let xxe = format!(
             r#"<?xml version="1.0"?><!DOCTYPE l [<!ENTITY x SYSTEM "file:///etc/passwd">]><s:Envelope xmlns:s="{NS_SOAP12}"><s:Body><x>&x;</x></s:Body></s:Envelope>"#
         );
         assert!(matches!(
             Envelope::parse(xxe.as_bytes(), &LIMITS),
-            Err(SoapError::Xml(_))
+            Err(SoapError::Preflight(_))
         ));
     }
 
@@ -508,6 +738,179 @@ mod tests {
             Envelope::parse(xml.as_bytes(), &LIMITS),
             Err(SoapError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn preflight_rejects_nested_namespace_amplification() {
+        let mut open = String::new();
+        for i in 0..2_000 {
+            write!(open, r#"<a xmlns:n{i}="u">"#).unwrap();
+        }
+        let xml = wrap(&format!("{open}{}", "</a>".repeat(2_000)));
+        assert!(xml.len() < LIMITS.max_bytes);
+        assert!(matches!(
+            preflight(&xml, &LIMITS),
+            Err(SoapError::TooDeep(16))
+        ));
+        assert!(matches!(
+            Envelope::parse(xml.as_bytes(), &LIMITS),
+            Err(SoapError::TooDeep(16))
+        ));
+        let deep = SoapLimits {
+            max_depth: 3_000,
+            ..LIMITS
+        };
+        assert!(matches!(
+            preflight(&xml, &deep),
+            Err(SoapError::Preflight("too many namespaces"))
+        ));
+        assert!(matches!(
+            Envelope::parse(xml.as_bytes(), &deep),
+            Err(SoapError::Preflight("too many namespaces"))
+        ));
+    }
+
+    #[test]
+    fn preflight_bounds_and_malformed_markup() {
+        let mut attrs = String::new();
+        for i in 0..65 {
+            write!(attrs, r#" a{i}="x""#).unwrap();
+        }
+        let mut namespaces = String::new();
+        for i in 0..33 {
+            write!(namespaces, r#" xmlns:n{i}="u""#).unwrap();
+        }
+        let cases = [
+            (format!("<a{attrs}/>"), "too many attributes"),
+            (format!("<a{namespaces}/>"), "too many namespaces"),
+            (
+                format!(r#"<a x="{}"/>"#, "x".repeat(MAX_ATTRIBUTE_VALUE + 1)),
+                "attribute value too long",
+            ),
+            ("<?xml-stylesheet?>".to_owned(), "invalid XML declaration"),
+            (
+                "<?xml version='1.0'".to_owned(),
+                "unfinished XML declaration",
+            ),
+            (
+                format!("<?xml {}?>", "x".repeat(MAX_ATTRIBUTE_VALUE + 1)),
+                "XML declaration too long",
+            ),
+            ("<![CDATA[text]]>".to_owned(), "forbidden markup"),
+            ("<!--unfinished".to_owned(), "unfinished comment"),
+            ("<?other?>".to_owned(), "forbidden markup"),
+            (
+                "<a x='v'y='z'/>".to_owned(),
+                "attributes require whitespace",
+            ),
+            ("<a x/>".to_owned(), "missing attribute equals"),
+            ("<a x=v/>".to_owned(), "unquoted attribute"),
+            ("<a x='v".to_owned(), "unfinished attribute"),
+            ("<a></a x>".to_owned(), "invalid end tag"),
+            ("</a>".to_owned(), "unmatched end tag"),
+            ("<a>".to_owned(), "unclosed element"),
+            ("<>".to_owned(), "missing name"),
+        ];
+        for (xml, expected) in cases {
+            assert!(
+                matches!(preflight(&xml, &LIMITS), Err(SoapError::Preflight(message)) if message == expected),
+                "{xml}"
+            );
+        }
+        let limited = SoapLimits {
+            max_nodes: 1,
+            ..LIMITS
+        };
+        assert!(matches!(
+            preflight("<a><b/></a>", &limited),
+            Err(SoapError::Preflight("too many elements"))
+        ));
+        assert!(preflight("\u{feff}<?xml\tversion='1.0'?><a />", &LIMITS).is_ok());
+        let xml = wrap("<!-- ordinary comment --><a/>");
+        assert!(Envelope::parse(xml.as_bytes(), &LIMITS).is_ok());
+    }
+
+    #[test]
+    fn preflight_accepts_ws_security_envelope() {
+        let xml = format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="{NS_SOAP12}" xmlns:tds="{NS_DEVICE}" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><s:Header><wsse:Security><wsse:UsernameToken><wsse:Username>synthetic</wsse:Username><wsse:Password Type="digest">value</wsse:Password><wsu:Created>2025-01-01T00:00:00Z</wsu:Created></wsse:UsernameToken></wsse:Security></s:Header><s:Body><tds:GetHostname/></s:Body></s:Envelope>"#
+        );
+        assert!(preflight(&xml, &LIMITS).is_ok());
+        assert!(Envelope::parse(xml.as_bytes(), &LIMITS).is_ok());
+    }
+
+    #[test]
+    fn rejects_amplified_namespace() {
+        let namespace = "x".repeat(45_000);
+        let children = "<x:a/>".repeat(2_000);
+        let xml = wrap(&format!(
+            r#"<x:root xmlns:x="{namespace}">{children}</x:root>"#
+        ));
+        assert!(xml.len() < LIMITS.max_bytes);
+        assert!(matches!(
+            Envelope::parse(xml.as_bytes(), &LIMITS),
+            Err(SoapError::NameTooLong)
+        ));
+    }
+
+    #[test]
+    fn conversion_checks_names_independently_of_preflight() {
+        let name = "x".repeat(257);
+        for xml in [
+            format!("<{name}/>"),
+            format!(r#"<a {name}="v"/>"#),
+            format!(r#"<n:a xmlns:n="{name}"/>"#),
+            format!(r#"<a xmlns:n="{name}"/>"#),
+        ] {
+            let doc = Document::parse(&xml).unwrap();
+            assert!(matches!(
+                validate_conversion(&doc, xml.len()),
+                Err(SoapError::NameTooLong)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_names_and_conversion_budget() {
+        let name = "x".repeat(257);
+        for xml in [
+            wrap(&format!("<{name}/>")),
+            wrap(&format!(r#"<a {name}="v"/>"#)),
+        ] {
+            assert!(matches!(
+                Envelope::parse(xml.as_bytes(), &LIMITS),
+                Err(SoapError::NameTooLong)
+            ));
+        }
+        let uri = "x".repeat(257);
+        for xml in [
+            wrap(&format!(r#"<a xmlns:x="{uri}" x:attr="v"/>"#)),
+            wrap(&format!(r#"<a xmlns:x="{uri}"/>"#)),
+        ] {
+            assert!(matches!(
+                Envelope::parse(xml.as_bytes(), &LIMITS),
+                Err(SoapError::NameTooLong)
+            ));
+        }
+        let xml = wrap(&format!(
+            r#"<x:root xmlns:x="{}">{}</x:root>"#,
+            "x".repeat(256),
+            "<x:a/>".repeat(100)
+        ));
+        assert!(matches!(
+            Envelope::parse(xml.as_bytes(), &LIMITS),
+            Err(SoapError::AllocationBudget)
+        ));
+    }
+
+    #[test]
+    fn parsed_debug_redacts_security() {
+        let xml = format!(
+            r#"<s:Envelope xmlns:s="{NS_SOAP12}"><s:Header><Security><Password>synthetic-secret</Password></Security></s:Header><s:Body><a/></s:Body></s:Envelope>"#
+        );
+        let env = Envelope::parse(xml.as_bytes(), &LIMITS).unwrap();
+        assert!(!format!("{env:?}").contains("synthetic-secret"));
+        assert!(!format!("{:?}", env.header[0]).contains("synthetic-secret"));
     }
 
     #[test]
@@ -540,6 +943,36 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn preflight_arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..1024)) {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                let _ = preflight(text, &LIMITS);
+            }
+        }
+
+        #[test]
+        fn preflight_acceptance_respects_generated_limits(depth in 0usize..25, attrs in 0usize..75, namespaces in 0usize..40, value_len in 0usize..4200) {
+            let mut declarations = String::new();
+            for i in 0..namespaces { write!(declarations, r#" xmlns:n{i}="u""#).unwrap(); }
+            let mut fields = String::new();
+            for i in 0..attrs { write!(fields, r#" a{i}="{}""#, "x".repeat(value_len)).unwrap(); }
+            let candidate = format!("{}<a{declarations}{fields}/>{}", "<a>".repeat(depth), "</a>".repeat(depth));
+            if preflight(&candidate, &LIMITS).is_ok() {
+                prop_assert!(depth < LIMITS.max_depth);
+                prop_assert!(attrs + namespaces <= MAX_ATTRIBUTES);
+                prop_assert!(namespaces <= MAX_NAMESPACES);
+                prop_assert!(attrs == 0 || value_len <= MAX_ATTRIBUTE_VALUE);
+            }
+        }
+
+        #[test]
+        fn converted_strings_are_bounded(namespace in "[a-z]{1,256}", count in 0usize..300) {
+            let xml = wrap(&format!(r#"<x:root xmlns:x="urn:{namespace}">{}</x:root>"#, "<x:a/>".repeat(count)));
+            if let Ok(env) = Envelope::parse(xml.as_bytes(), &LIMITS) {
+                prop_assert!(allocated_bytes(&env) <= xml.len() * 128);
+            }
+        }
+
         #[test]
         fn parse_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = Envelope::parse(&bytes, &LIMITS);

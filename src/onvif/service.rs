@@ -70,7 +70,7 @@ pub enum SetupError {
 }
 
 /// A request as the router sees it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ServiceRequest<'a> {
     /// HTTP method.
     pub method: &'a str,
@@ -84,8 +84,16 @@ pub struct ServiceRequest<'a> {
     pub local: SocketAddr,
 }
 
+impl std::fmt::Debug for ServiceRequest<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceRequest")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A response to write back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServiceResponse {
     /// HTTP status.
     pub status: u16,
@@ -95,6 +103,17 @@ pub struct ServiceResponse {
     pub body: Vec<u8>,
     /// `WWW-Authenticate` value, for 401.
     pub www_authenticate: Option<String>,
+}
+
+impl std::fmt::Debug for ServiceResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceResponse")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("body", &self.body)
+            .field("www_authenticate", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ServiceResponse {
@@ -374,4 +393,32 @@ fn is_pre_auth(endpoint: Endpoint, op: &Element) -> bool {
             op.name.as_str(),
             "GetSystemDateAndTime" | "GetCapabilities" | "GetServices"
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onvif::{model::example_model, time::ManualClock};
+
+    #[test]
+    fn response_debug_redacts_issued_challenge() {
+        let service = OnvifService::with_digest_secret(
+            example_model(),
+            Credentials::new("synthetic-user", "synthetic-password").unwrap(),
+            Arc::new(ManualClock::new(1_750_000_000)),
+            [9; 32],
+        );
+        let response = service.challenge(false);
+        let challenge = response.www_authenticate.as_ref().unwrap();
+        let nonce = challenge
+            .split("nonce=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let debug = format!("{response:?}");
+        assert!(!debug.contains(nonce));
+        assert!(debug.contains("[REDACTED]"));
+    }
 }

@@ -30,7 +30,7 @@ const MAX_TRACKED_NONCES: usize = 1024;
 const MAX_HEADER_LEN: usize = 2048;
 
 /// Parsed `Authorization: Digest` parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct DigestParams {
     /// `username`.
     pub username: String,
@@ -50,6 +50,14 @@ pub struct DigestParams {
     pub cnonce: String,
     /// `algorithm`, if sent.
     pub algorithm: Option<String>,
+}
+
+impl std::fmt::Debug for DigestParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestParams")
+            .field("contents", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Parse an `Authorization` header value. Total.
@@ -329,6 +337,12 @@ impl DigestAuth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parsed_digest_debug_redacts_response() {
+        let value = "Digest username=alice, realm=test, nonce=abc, uri=/, response=synthetic-secret, qop=auth, nc=00000001, cnonce=abc";
+        let params = super::parse_authorization(value).unwrap();
+        assert!(!format!("{params:?}").contains("synthetic-secret"));
+    }
     use super::*;
     use crate::onvif::time::ManualClock;
     use proptest::prelude::*;

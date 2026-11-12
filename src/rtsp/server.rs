@@ -88,12 +88,19 @@ pub enum ServerError {
     /// Binding the listener failed.
     #[error("cannot bind RTSP listener: {0}")]
     Bind(#[from] io::Error),
+    /// Inspecting the listener address failed.
+    #[error("cannot inspect RTSP listener: {0}")]
+    LocalAddress(#[source] io::Error),
     /// The source's track cannot be described in SDP.
     #[error(transparent)]
     Track(#[from] SdpError),
     /// The configuration is unusable.
     #[error("invalid configuration: {0}")]
     Config(&'static str),
+}
+
+fn local_address(result: io::Result<SocketAddr>) -> Result<SocketAddr, ServerError> {
+    result.map_err(ServerError::LocalAddress)
 }
 
 /// State shared by every connection.
@@ -185,9 +192,9 @@ impl<S: MediaSource> RtspServer<S> {
     ///
     /// # Errors
     ///
-    /// Any I/O error from the socket.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    /// [`ServerError::LocalAddress`] if the socket cannot be inspected.
+    pub fn local_addr(&self) -> Result<SocketAddr, ServerError> {
+        local_address(self.listener.local_addr())
     }
 
     /// The fan-out, e.g. to read [`Fanout::dropped_packets`].
@@ -233,5 +240,21 @@ impl<S: MediaSource> RtspServer<S> {
         }
         let _ = stop_tx.send(true);
         while tasks.join_next().await.is_some() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn local_address_preserves_io_error() {
+        let error = local_address(Err(io::Error::other("synthetic failure"))).unwrap_err();
+        assert!(matches!(error, ServerError::LocalAddress(_)));
+        assert!(error.to_string().contains("synthetic failure"));
+        assert!(error.source().is_some());
+        let address = "192.0.2.1:554".parse().unwrap();
+        assert_eq!(local_address(Ok(address)).unwrap(), address);
     }
 }

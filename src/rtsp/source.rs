@@ -96,7 +96,7 @@ impl<S: MediaSource> Shared<S> {
 
     /// Deliver to every subscriber unless `generation` is stale. `false` means stop pumping.
     fn publish(&self, generation: u64, packet: &Packet) -> bool {
-        let valid = RtpHeader::parse(packet.as_bytes()).is_some();
+        let valid = RtpHeader::parse(packet.as_bytes()).is_ok();
         let inner = self.lock();
         if inner.generation != generation {
             return false;

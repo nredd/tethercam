@@ -25,32 +25,63 @@ pub struct RtpHeader {
     pub payload_len: usize,
 }
 
+/// Why an RTP packet could not be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RtpParseError {
+    /// The fixed header is incomplete.
+    #[error("truncated RTP header")]
+    Header,
+    /// The RTP version is not two.
+    #[error("invalid RTP version")]
+    Version,
+    /// The CSRC list or extension is incomplete.
+    #[error("truncated RTP CSRC list or extension")]
+    Extension,
+    /// Padding is zero or exceeds the payload.
+    #[error("invalid RTP padding")]
+    Padding,
+}
+
 impl RtpHeader {
     /// Parse and validate the RTP header, including CSRC list, extension and padding.
-    /// `None` when `packet` is too short, not version 2, or its lengths do not add up.
-    #[must_use]
-    pub fn parse(packet: &[u8]) -> Option<Self> {
-        let head: &[u8; 12] = packet.get(..12)?.try_into().ok()?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RtpParseError`] if the header or lengths are invalid.
+    pub fn parse(packet: &[u8]) -> Result<Self, RtpParseError> {
+        let head: &[u8; 12] = packet
+            .get(..12)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(RtpParseError::Header)?;
         let first = head[0];
         if first >> 6 != 2 {
-            return None;
+            return Err(RtpParseError::Version);
         }
         let mut offset = 12 + 4 * usize::from(first & 0x0f);
         if first & 0x10 != 0 {
-            let words = packet.get(offset + 2..offset + 4)?;
-            let words = usize::from(u16::from_be_bytes([*words.first()?, *words.get(1)?]));
+            let words: [u8; 2] = packet
+                .get(offset + 2..offset + 4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or(RtpParseError::Extension)?;
+            let words = usize::from(u16::from_be_bytes(words));
             offset += 4 + 4 * words;
         }
         let padding = if first & 0x20 != 0 {
-            usize::from(*packet.last()?)
+            usize::from(packet.last().copied().unwrap_or_default())
         } else {
             0
         };
         if first & 0x20 != 0 && padding == 0 {
-            return None;
+            return Err(RtpParseError::Padding);
         }
-        let payload_len = packet.len().checked_sub(offset)?.checked_sub(padding)?;
-        Some(Self {
+        let remaining = packet
+            .len()
+            .checked_sub(offset)
+            .ok_or(RtpParseError::Extension)?;
+        let payload_len = remaining
+            .checked_sub(padding)
+            .ok_or(RtpParseError::Padding)?;
+        Ok(Self {
             payload_type: head[1] & 0x7f,
             sequence: u16::from_be_bytes([head[2], head[3]]),
             timestamp: u32::from_be_bytes([head[4], head[5], head[6], head[7]]),
@@ -120,7 +151,7 @@ mod tests {
         p.extend_from_slice(b"payload");
         assert_eq!(
             RtpHeader::parse(&p),
-            Some(RtpHeader {
+            Ok(RtpHeader {
                 payload_type: 96,
                 sequence: 0x1234,
                 timestamp: 256,
@@ -128,9 +159,9 @@ mod tests {
                 payload_len: 7,
             })
         );
-        assert_eq!(RtpHeader::parse(&p[..11]), None);
+        assert_eq!(RtpHeader::parse(&p[..11]), Err(RtpParseError::Header));
         p[0] = 0x40;
-        assert_eq!(RtpHeader::parse(&p), None);
+        assert_eq!(RtpHeader::parse(&p), Err(RtpParseError::Version));
     }
 
     #[test]
@@ -142,15 +173,15 @@ mod tests {
         p.extend_from_slice(&[0; 8]);
         p.extend_from_slice(&[0xbe, 0xde, 0, 1, 0, 0, 0, 0]);
         p.extend_from_slice(&[1, 2, 3, 4, 5, 0, 0, 3]);
-        assert_eq!(RtpHeader::parse(&p).map(|h| h.payload_len), Some(5));
+        assert_eq!(RtpHeader::parse(&p).map(|h| h.payload_len), Ok(5));
         // Padding longer than the payload, zero padding count, truncated CSRC list or extension.
         let mut bad = p.clone();
         *bad.last_mut().unwrap() = 200;
-        assert_eq!(RtpHeader::parse(&bad), None);
+        assert_eq!(RtpHeader::parse(&bad), Err(RtpParseError::Padding));
         *bad.last_mut().unwrap() = 0;
-        assert_eq!(RtpHeader::parse(&bad), None);
-        assert_eq!(RtpHeader::parse(&p[..14]), None);
-        assert_eq!(RtpHeader::parse(&p[..22]), None);
+        assert_eq!(RtpHeader::parse(&bad), Err(RtpParseError::Padding));
+        assert_eq!(RtpHeader::parse(&p[..14]), Err(RtpParseError::Extension));
+        assert_eq!(RtpHeader::parse(&p[..22]), Err(RtpParseError::Extension));
     }
 
     #[test]

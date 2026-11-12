@@ -7,7 +7,7 @@
 //! - [RFC 2326 sections 10 (methods), 12.37 (`Session`), 12.39 (`Transport`)](https://www.rfc-editor.org/rfc/rfc2326)
 //! - [RFC 3550 section 6.4.1 (sender reports)](https://www.rfc-editor.org/rfc/rfc3550)
 
-use std::future::pending;
+use std::future::{Future, pending};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
@@ -25,6 +25,12 @@ use super::rtcp::{RtpHeader, SenderInfo, ntp_timestamp, write_sender_report};
 use super::server::Shared;
 use super::setup::{TransportSpec, format_transport, parse_transport};
 use super::source::{MediaSource, Packet, Subscription};
+
+#[derive(Debug, thiserror::Error)]
+#[error("RTSP connection I/O: {0}")]
+struct ConnectionError(#[from] io::Error);
+
+type ConnectionResult<T> = Result<T, ConnectionError>;
 
 const PUBLIC_METHODS: &str = "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER";
 /// Attempts at finding a free even/odd UDP port pair when the OS chooses.
@@ -123,7 +129,7 @@ impl<S: MediaSource> Connection<S> {
         self.last_activity + silence
     }
 
-    async fn drive(&mut self) -> io::Result<()> {
+    async fn drive(&mut self) -> ConnectionResult<()> {
         loop {
             loop {
                 match parse_incoming(&self.buf, &self.shared.config.limits) {
@@ -159,7 +165,7 @@ impl<S: MediaSource> Connection<S> {
     }
 
     /// Returns whether to keep the connection open.
-    async fn handle(&mut self, message: Incoming) -> io::Result<bool> {
+    async fn handle(&mut self, message: Incoming) -> ConnectionResult<bool> {
         match message {
             Incoming::Interleaved { .. } => {
                 // Client RTCP over the control connection: only proof of life is needed.
@@ -172,7 +178,7 @@ impl<S: MediaSource> Connection<S> {
         }
     }
 
-    async fn handle_request(&mut self, request: &Request) -> io::Result<bool> {
+    async fn handle_request(&mut self, request: &Request) -> ConnectionResult<bool> {
         let Some(cseq) = request.cseq() else {
             self.send(&Response::new(400), None).await?;
             return Ok(true);
@@ -371,7 +377,7 @@ impl<S: MediaSource> Connection<S> {
         Response::new(200)
     }
 
-    async fn send(&mut self, response: &Response, cseq: Option<u32>) -> io::Result<()> {
+    async fn send(&mut self, response: &Response, cseq: Option<u32>) -> ConnectionResult<()> {
         self.out.clear();
         response.write_into(cseq, &mut self.out);
         write_all(
@@ -382,11 +388,11 @@ impl<S: MediaSource> Connection<S> {
         .await
     }
 
-    async fn send_rtp(&mut self, packet: &Packet) -> io::Result<()> {
+    async fn send_rtp(&mut self, packet: &Packet) -> ConnectionResult<()> {
         let bytes = packet.as_bytes();
         let timeout = self.shared.config.write_timeout;
         let interval = self.shared.config.rtcp_interval;
-        let (Some(session), Some(header)) = (self.session.as_mut(), RtpHeader::parse(bytes)) else {
+        let (Some(session), Ok(header)) = (self.session.as_mut(), RtpHeader::parse(bytes)) else {
             return Ok(());
         };
         let Some(playing) = session.playing.as_mut() else {
@@ -432,7 +438,7 @@ impl<S: MediaSource> Connection<S> {
         Ok(())
     }
 
-    async fn send_report(&mut self) -> io::Result<()> {
+    async fn send_report(&mut self) -> ConnectionResult<()> {
         let timeout = self.shared.config.write_timeout;
         let interval = self.shared.config.rtcp_interval;
         let clock_rate = u128::from(self.shared.track.clock_rate);
@@ -476,18 +482,21 @@ impl<S: MediaSource> Connection<S> {
     }
 }
 
-async fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<usize> {
+async fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> ConnectionResult<usize> {
     buf.reserve(4096);
-    stream.read_buf(buf).await
+    Ok(stream.read_buf(buf).await?)
 }
 
-async fn write_all(stream: &mut TcpStream, data: &[u8], timeout: Duration) -> io::Result<()> {
-    match tokio::time::timeout(timeout, stream.write_all(data)).await {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "client write stalled",
-        )),
+async fn write_all(stream: &mut TcpStream, data: &[u8], timeout: Duration) -> ConnectionResult<()> {
+    write_with_timeout(stream.write_all(data), timeout).await
+}
+
+async fn write_with_timeout(
+    write: impl Future<Output = io::Result<()>>, timeout: Duration,
+) -> ConnectionResult<()> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "client write stalled").into()),
     }
 }
 
@@ -547,8 +556,8 @@ fn uri_path(uri: &str) -> Option<&str> {
 async fn bind_udp_pair(
     ip: IpAddr, range: Option<&RangeInclusive<u16>>, media_dest: SocketAddr,
     control_dest: SocketAddr,
-) -> io::Result<UdpPair> {
-    let finish = |rtp: UdpSocket, rtcp: UdpSocket| -> io::Result<UdpPair> {
+) -> ConnectionResult<UdpPair> {
+    let finish = |rtp: UdpSocket, rtcp: UdpSocket| -> ConnectionResult<UdpPair> {
         Ok(UdpPair {
             server_ports: (rtp.local_addr()?.port(), rtcp.local_addr()?.port()),
             rtp,
@@ -583,15 +592,39 @@ async fn bind_udp_pair(
             }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::AddrNotAvailable,
-        "no free UDP port pair",
-    ))
+    Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no free UDP port pair").into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn simulated_write(stall: bool, fail: bool) -> io::Result<()> {
+        if stall {
+            pending::<()>().await;
+        }
+        if fail {
+            return Err(io::Error::other("synthetic failure"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_deadline_returns_typed_timeout() {
+        let error = write_with_timeout(simulated_write(true, false), Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.kind(), io::ErrorKind::TimedOut);
+        let error = write_with_timeout(simulated_write(false, true), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0.kind(), io::ErrorKind::Other);
+        assert!(
+            write_with_timeout(simulated_write(false, false), Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
 
     #[test]
     fn extracts_uri_paths() {

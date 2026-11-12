@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format follows
 ### Removed
 
 - `Session::scoped`; callers explicitly open and close sessions
+### Changed
+
+- Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors
 
 ### Added
 
