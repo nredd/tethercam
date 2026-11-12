@@ -1,13 +1,5 @@
-src/onvif/auth/digest.rs #29
-src/onvif/auth/wsse.rs #29
-src/onvif/device.rs #29
 src/onvif/discovery/net.rs #30
 src/onvif/http.rs #29
-src/onvif/media.rs #29
-src/onvif/model.rs #29
-src/onvif/service.rs #29
-src/onvif/soap.rs #29
-src/onvif/time.rs #29
 src/rtsp/connection.rs #31
 src/rtsp/digest.rs #31
 src/rtsp/message.rs #31

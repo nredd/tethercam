@@ -110,7 +110,7 @@ impl std::fmt::Debug for ServiceResponse {
         f.debug_struct("ServiceResponse")
             .field("status", &self.status)
             .field("content_type", &self.content_type)
-            .field("body", &self.body)
+            .field("body_len", &self.body.len())
             .field("www_authenticate", &"[REDACTED]")
             .finish()
     }
@@ -223,8 +223,8 @@ impl OnvifService {
     pub fn new(
         model: DeviceModel, credentials: Credentials, clock: Arc<dyn Clock>,
     ) -> Result<Self, SetupError> {
-        let digest = DigestAuth::new(credentials.clone(), REALM, clock.clone())?;
-        Ok(Self::assemble(model, credentials, clock, digest))
+        let digest = DigestAuth::new(credentials.clone(), REALM, clock.clone());
+        Self::from_digest(model, credentials, clock, digest)
     }
 
     /// Like [`OnvifService::new`] with a fixed Digest secret, for deterministic tests.
@@ -234,6 +234,13 @@ impl OnvifService {
     ) -> Self {
         let digest = DigestAuth::with_secret(credentials.clone(), REALM, clock.clone(), secret);
         Self::assemble(model, credentials, clock, digest)
+    }
+
+    fn from_digest(
+        model: DeviceModel, credentials: Credentials, clock: Arc<dyn Clock>,
+        digest: Result<DigestAuth, AuthError>,
+    ) -> Result<Self, SetupError> {
+        Ok(Self::assemble(model, credentials, clock, digest?))
     }
 
     fn assemble(
@@ -399,6 +406,25 @@ fn is_pre_auth(endpoint: Endpoint, op: &Element) -> bool {
 mod tests {
     use super::*;
     use crate::onvif::{model::example_model, time::ManualClock};
+
+    #[test]
+    fn constructor_propagates_entropy_failure() {
+        let credentials = Credentials::new("synthetic-user", "synthetic-password").unwrap();
+        let result = OnvifService::from_digest(
+            example_model(),
+            credentials,
+            Arc::new(ManualClock::new(0)),
+            Err(AuthError::Entropy),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "authentication setup failed: random source unavailable"
+        );
+        let credentials = Credentials::new("synthetic-user", "synthetic-password").unwrap();
+        let clock = Arc::new(ManualClock::new(0));
+        let digest = DigestAuth::with_secret(credentials.clone(), REALM, clock.clone(), [9; 32]);
+        assert!(OnvifService::from_digest(example_model(), credentials, clock, Ok(digest)).is_ok());
+    }
 
     #[test]
     fn response_debug_redacts_issued_challenge() {

@@ -166,13 +166,23 @@ impl Default for WsseConfig {
 }
 
 /// Verifies `UsernameToken` digests against one credential pair.
-#[derive(Debug)]
 pub struct WsseVerifier {
     credentials: Credentials,
     clock: Arc<dyn Clock>,
     config: WsseConfig,
     /// Nonce bytes to the Unix second after which a replay can no longer pass the skew check.
     seen: Mutex<HashMap<Vec<u8>, i64>>,
+}
+
+impl std::fmt::Debug for WsseVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsseVerifier")
+            .field("credentials", &self.credentials)
+            .field("clock", &self.clock)
+            .field("config", &self.config)
+            .field("seen", &"<redacted>")
+            .finish()
+    }
 }
 
 impl WsseVerifier {
@@ -286,6 +296,15 @@ mod tests {
     }
 
     #[test]
+    fn used_verifier_debug_hides_nonce() {
+        let (v, _) = verifier(WsseConfig::default());
+        assert_eq!(v.verify(&token("synthetic-pass", NONCE, NOW)), Ok(()));
+        let debug = format!("{v:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&format!("{NONCE:?}")));
+    }
+
+    #[test]
     fn rejects_wrong_password_and_user() {
         let (v, _) = verifier(WsseConfig::default());
         assert_eq!(
@@ -385,13 +404,67 @@ mod tests {
         assert_eq!(v.verify(&t), Err(AuthError::UnsupportedPasswordType));
         let mut t = token("synthetic-pass", NONCE, NOW);
         t.nonce = None;
-        assert!(matches!(v.verify(&t), Err(AuthError::Malformed(_))));
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("no Nonce")));
         let mut t = token("synthetic-pass", NONCE, NOW);
         t.created = Some("yesterday".into());
-        assert!(matches!(v.verify(&t), Err(AuthError::Malformed(_))));
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("bad Created")));
         let mut t = token("synthetic-pass", NONCE, NOW);
         t.nonce = Some(STANDARD.encode(b"x"));
-        assert!(matches!(v.verify(&t), Err(AuthError::Malformed(_))));
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("nonce length")));
+    }
+
+    #[test]
+    fn malformed_token_fields_and_security_structure() {
+        let element = |name: &str, children| Element {
+            namespace: Some(NS_WSSE.into()),
+            name: name.into(),
+            text: String::new(),
+            attributes: vec![],
+            children,
+        };
+        for (node, error) in [
+            (element("other", vec![]), "not a Security header"),
+            (element("Security", vec![]), "no UsernameToken"),
+            (
+                element("Security", vec![element("UsernameToken", vec![])]),
+                "no Username",
+            ),
+            (
+                element(
+                    "Security",
+                    vec![element("UsernameToken", vec![element("Username", vec![])])],
+                ),
+                "no Password",
+            ),
+        ] {
+            assert_eq!(
+                UsernameToken::from_security(&node),
+                Err(AuthError::Malformed(error))
+            );
+        }
+        let text_security = element(
+            "Security",
+            vec![element(
+                "UsernameToken",
+                vec![element("Username", vec![]), element("Password", vec![])],
+            )],
+        );
+        assert_eq!(
+            UsernameToken::from_security(&text_security).unwrap().kind,
+            PasswordKind::Text
+        );
+        let (v, _) = verifier(WsseConfig::default());
+        let mut t = token("synthetic-pass", NONCE, NOW);
+        t.created = None;
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("no Created")));
+        t.created = Some(format_datetime(NOW));
+        t.nonce = Some("!".into());
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("nonce not base64")));
+        t.nonce = Some(STANDARD.encode(NONCE));
+        t.password = "!".into();
+        assert_eq!(v.verify(&t), Err(AuthError::Malformed("digest not base64")));
+        t.kind = PasswordKind::Text;
+        assert!(t.to_header_xml().contains("#PasswordText"));
     }
 
     #[test]

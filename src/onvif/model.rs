@@ -274,7 +274,41 @@ pub fn example_model() -> DeviceModel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h264_profile_names() {
+        use super::H264Profile;
+        assert_eq!(H264Profile::Baseline.as_str(), "Baseline");
+        assert_eq!(H264Profile::Main.as_str(), "Main");
+        assert_eq!(H264Profile::High.as_str(), "High");
+    }
+
     use super::*;
+
+    #[test]
+    fn validation_covers_independent_fields() {
+        let m = example_model();
+        for field in 0..3 {
+            let mut profiles = m.profiles().to_vec();
+            match field {
+                0 => profiles[0].height = 0,
+                1 => profiles[0].frame_rate = 0,
+                _ => profiles[0].bitrate_kbps = 0,
+            }
+            assert_eq!(
+                DeviceModel::new(m.device().clone(), profiles, 1),
+                Err(ModelError::ZeroValue("main".into()))
+            );
+        }
+        for path in ["/white space", "/control\u{7f}"] {
+            let mut profiles = m.profiles().to_vec();
+            profiles[0].rtsp_path = path.into();
+            assert_eq!(
+                DeviceModel::new(m.device().clone(), profiles, 1),
+                Err(ModelError::BadPath("main".into()))
+            );
+        }
+        assert!(token_ok("a_-."));
+    }
 
     #[test]
     fn example_is_valid() {
@@ -300,18 +334,18 @@ mod tests {
             build(&|_, p| p[1].token = p[0].token.clone()),
             Err(ModelError::DuplicateToken("main".into()))
         );
-        assert!(matches!(
+        assert_eq!(
             build(&|_, p| p[0].token = "a b".into()),
-            Err(ModelError::BadToken(_))
-        ));
-        assert!(matches!(
+            Err(ModelError::BadToken("a b".into()))
+        );
+        assert_eq!(
             build(&|_, p| p[0].width = 0),
-            Err(ModelError::ZeroValue(_))
-        ));
-        assert!(matches!(
+            Err(ModelError::ZeroValue("main".into()))
+        );
+        assert_eq!(
             build(&|_, p| p[0].rtsp_path = "live".into()),
-            Err(ModelError::BadPath(_))
-        ));
+            Err(ModelError::BadPath("main".into()))
+        );
         assert_eq!(
             build(&|d, _| d.manufacturer = " ".into()),
             Err(ModelError::EmptyField("manufacturer"))

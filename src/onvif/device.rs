@@ -197,3 +197,76 @@ fn hostname(ctx: &Context<'_>) -> String {
         text_element("tt:Name", &ctx.model.device().hostname)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onvif::model::example_model;
+
+    #[test]
+    fn capability_categories_and_scope_escaping() {
+        let mut model = example_model();
+        let mut device = model.device().clone();
+        device.model = "Example Cam".into();
+        model = super::super::model::DeviceModel::new(
+            device,
+            model.profiles().to_vec(),
+            model.rtsp_port(),
+        )
+        .unwrap();
+        let ctx = Context {
+            model: &model,
+            local: "192.0.2.10:8080".parse().unwrap(),
+            now: 0,
+            snapshot: true,
+            authenticated: true,
+        };
+        let mut op = Element {
+            namespace: Some(NS_DEVICE.into()),
+            name: "GetCapabilities".into(),
+            text: String::new(),
+            attributes: vec![],
+            children: vec![],
+        };
+        for category in [
+            "",
+            "Device",
+            "Media",
+            "Analytics",
+            "Events",
+            "Imaging",
+            "PTZ",
+            "unknown",
+        ] {
+            op.children = vec![Element {
+                namespace: None,
+                name: "Category".into(),
+                text: category.into(),
+                attributes: vec![],
+                children: vec![],
+            }];
+            let result = handle(&op, &ctx);
+            match category {
+                "" => assert!(result.is_ok()),
+                "Device" => {
+                    let xml = result.unwrap();
+                    assert!(xml.contains("<tt:Device>"));
+                    assert!(!xml.contains("<tt:Media>"));
+                }
+                "Media" => {
+                    let xml = result.unwrap();
+                    assert!(!xml.contains("<tt:Device>"));
+                    assert!(xml.contains("<tt:Media>"));
+                }
+                _ => assert!(result.is_err()),
+            }
+        }
+        op.name = "GetServices".into();
+        op.children[0].name = "IncludeCapability".into();
+        op.children[0].text = "1".into();
+        assert!(handle(&op, &ctx).unwrap().contains("UsernameToken"));
+        assert!(scopes(&ctx).contains("Example%20Cam"));
+        op.namespace = None;
+        assert!(handle(&op, &ctx).is_err());
+    }
+}

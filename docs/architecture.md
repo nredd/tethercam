@@ -109,7 +109,8 @@ They map to:
   before namespace resolution. DTDs, entity declarations, CDATA and processing
   instructions other than the XML declaration are rejected. SOAP conversion also limits copied
   strings to four times the input size before allocating the owned tree. Request debug output redacts
-  credentials and bodies. WS-Security `UsernameToken` uses password digest (plaintext refused),
+  credentials and bodies; response debug output reports only body length, and WS-Security replay
+  cache contents are redacted. WS-Security `UsernameToken` uses password digest (plaintext refused),
   nonce replay cache and a bounded clock-skew window. HTTP Digest is the alternative. Only
   `GetSystemDateAndTime`, `GetCapabilities` and `GetServices` are pre-auth
 - Discovery reveals only what ONVIF requires: at most one unicast reply per accepted probe (each at most 1400 bytes), on-link sources only, `MessageID` de-duplicated, a per-source token bucket and one global bucket (burst 20, 10 per second) charged before parsing, so reflected traffic is bounded by `refill * reply cap` (14000 bytes per second by default) regardless of the number of sources. IPv6 link-local subnets are served only when the same interface has a non-link-local IPv6 address to advertise; otherwise they are omitted and a warning is emitted through the `log` facade (applications must configure a logger to display it)

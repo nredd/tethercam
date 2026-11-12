@@ -565,6 +565,68 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_routing_without_source_and_rejected_methods() {
+        let clock = Arc::new(ManualClock::new(NOW));
+        let service = OnvifService::new(
+            example_model(),
+            Credentials::new(USER, PASS).unwrap(),
+            clock,
+        )
+        .unwrap()
+        .with_limits(SoapLimits::default());
+        assert_eq!(service.limits().max_bytes, SoapLimits::default().max_bytes);
+        let request = ServiceRequest {
+            method: "GET",
+            target: "/onvif/snapshot/mjpeg",
+            authorization: None,
+            body: b"",
+            local: LOCAL.parse().unwrap(),
+        };
+        assert_eq!(service.handle(&request).status, 404);
+        let rig = rig();
+        let request = ServiceRequest {
+            method: "POST",
+            ..request
+        };
+        assert_eq!(rig.service.handle(&request).status, 405);
+        let request = ServiceRequest {
+            method: "GET",
+            authorization: Some("bad"),
+            ..request
+        };
+        assert_eq!(rig.service.handle(&request).status, 401);
+        let challenge = snapshot_get(&rig, "mjpeg", None).www_authenticate.unwrap();
+        let target = format!("{SNAPSHOT_PREFIX}mjpeg");
+        let auth =
+            DigestAuth::client_response(USER, PASS, "GET", &target, &challenge, 1, "c").unwrap();
+        rig.clock.advance(3601);
+        let stale = snapshot_get(&rig, "mjpeg", Some(&auth));
+        assert_eq!(stale.status, 401);
+        assert!(stale.www_authenticate.unwrap().contains("stale=true"));
+    }
+
+    #[test]
+    fn used_service_and_snapshot_debug_hide_sensitive_bytes() {
+        let rig = rig();
+        let nonce = b"nonce-debug-0001";
+        let req = authed_request("device_get_device_information", &security(PASS, nonce, NOW));
+        assert_eq!(post(&rig, "/onvif/device_service", &req).status, 200);
+        let debug = format!("{:?}", rig.service);
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&format!("{:?}", nonce.as_slice())));
+        let challenge = snapshot_get(&rig, "mjpeg", None).www_authenticate.unwrap();
+        let target = format!("{SNAPSHOT_PREFIX}mjpeg");
+        let auth =
+            DigestAuth::client_response(USER, PASS, "GET", &target, &challenge, 1, "c").unwrap();
+        let response = snapshot_get(&rig, "mjpeg", Some(&auth));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, [0xFF, 0xD8, 0xFF, 0xD9]);
+        let debug = format!("{response:?}");
+        assert!(debug.contains("body_len: 4"));
+        assert!(!debug.contains(&format!("{:?}", response.body)));
+    }
+
+    #[test]
     fn snapshot_endpoint_requires_digest() {
         let rig = rig();
         let unauth = snapshot_get(&rig, "mjpeg", None);

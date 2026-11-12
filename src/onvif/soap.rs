@@ -177,13 +177,6 @@ impl Envelope {
         };
         let doc = Document::parse_with_options(text, options)?;
 
-        let too_deep = doc
-            .descendants()
-            .any(|n| n.is_element() && n.ancestors().count() > limits.max_depth.saturating_add(1));
-        if too_deep {
-            return Err(SoapError::TooDeep(limits.max_depth));
-        }
-
         validate_conversion(&doc, bytes.len())?;
 
         let root = doc.root_element();
@@ -670,13 +663,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unqualified_envelope_and_namespace_like_attribute() {
+        assert!(Envelope::parse(b"<Envelope><Body><a/></Body></Envelope>", &LIMITS).is_err());
+        assert!(preflight("<a xmlnsx='v'/>", &LIMITS).is_ok());
+        assert!(preflight("<a xmlns='urn:example'/>", &LIMITS).is_ok());
+        assert!(Envelope::parse(wrap("<a></b>").as_bytes(), &LIMITS).is_err());
+    }
+
+    #[test]
     fn rejects_soap11() {
         let xml =
             format!(r#"<s:Envelope xmlns:s="{NS_SOAP11}"><s:Body><a/></s:Body></s:Envelope>"#);
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::VersionMismatch)
-        ));
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::VersionMismatch.to_string()
+        );
     }
 
     #[test]
@@ -700,17 +703,21 @@ mod tests {
         let laughs = format!(
             r#"<?xml version="1.0"?><!DOCTYPE l [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><s:Envelope xmlns:s="{NS_SOAP12}"><s:Body><x>&b;</x></s:Body></s:Envelope>"#
         );
-        assert!(matches!(
-            Envelope::parse(laughs.as_bytes(), &LIMITS),
-            Err(SoapError::Preflight(_))
-        ));
+        assert_eq!(
+            Envelope::parse(laughs.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::Preflight("forbidden markup").to_string()
+        );
         let xxe = format!(
             r#"<?xml version="1.0"?><!DOCTYPE l [<!ENTITY x SYSTEM "file:///etc/passwd">]><s:Envelope xmlns:s="{NS_SOAP12}"><s:Body><x>&x;</x></s:Body></s:Envelope>"#
         );
-        assert!(matches!(
-            Envelope::parse(xxe.as_bytes(), &LIMITS),
-            Err(SoapError::Preflight(_))
-        ));
+        assert_eq!(
+            Envelope::parse(xxe.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::Preflight("forbidden markup").to_string()
+        );
     }
 
     #[test]
@@ -718,10 +725,12 @@ mod tests {
         let depth = 200;
         let inner = format!("{}{}", "<a>".repeat(depth), "</a>".repeat(depth));
         let xml = wrap(&inner);
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::TooDeep(16))
-        ));
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::TooDeep(16).to_string()
+        );
         let thousands = wrap(&format!("{}{}", "<a>".repeat(5000), "</a>".repeat(5000)));
         let big = SoapLimits {
             max_bytes: usize::MAX,
@@ -734,10 +743,12 @@ mod tests {
     fn rejects_oversized_input_and_attributes() {
         let attr = "x".repeat(70_000);
         let xml = wrap(&format!(r#"<a v="{attr}"/>"#));
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::TooLarge(_))
-        ));
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::TooLarge(LIMITS.max_bytes).to_string()
+        );
     }
 
     #[test]
@@ -748,14 +759,16 @@ mod tests {
         }
         let xml = wrap(&format!("{open}{}", "</a>".repeat(2_000)));
         assert!(xml.len() < LIMITS.max_bytes);
-        assert!(matches!(
-            preflight(&xml, &LIMITS),
-            Err(SoapError::TooDeep(16))
-        ));
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::TooDeep(16))
-        ));
+        assert_eq!(
+            preflight(&xml, &LIMITS).unwrap_err().to_string(),
+            SoapError::TooDeep(16).to_string()
+        );
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::TooDeep(16).to_string()
+        );
         let deep = SoapLimits {
             max_depth: 3_000,
             ..LIMITS
@@ -810,6 +823,7 @@ mod tests {
             ("</a>".to_owned(), "unmatched end tag"),
             ("<a>".to_owned(), "unclosed element"),
             ("<>".to_owned(), "missing name"),
+            ("<a></>".to_owned(), "missing name"),
         ];
         for (xml, expected) in cases {
             assert!(
@@ -847,10 +861,12 @@ mod tests {
             r#"<x:root xmlns:x="{namespace}">{children}</x:root>"#
         ));
         assert!(xml.len() < LIMITS.max_bytes);
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::NameTooLong)
-        ));
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::NameTooLong.to_string()
+        );
     }
 
     #[test]
@@ -863,10 +879,12 @@ mod tests {
             format!(r#"<a xmlns:n="{name}"/>"#),
         ] {
             let doc = Document::parse(&xml).unwrap();
-            assert!(matches!(
-                validate_conversion(&doc, xml.len()),
-                Err(SoapError::NameTooLong)
-            ));
+            assert_eq!(
+                validate_conversion(&doc, xml.len())
+                    .unwrap_err()
+                    .to_string(),
+                SoapError::NameTooLong.to_string()
+            );
         }
     }
 
@@ -877,30 +895,36 @@ mod tests {
             wrap(&format!("<{name}/>")),
             wrap(&format!(r#"<a {name}="v"/>"#)),
         ] {
-            assert!(matches!(
-                Envelope::parse(xml.as_bytes(), &LIMITS),
-                Err(SoapError::NameTooLong)
-            ));
+            assert_eq!(
+                Envelope::parse(xml.as_bytes(), &LIMITS)
+                    .unwrap_err()
+                    .to_string(),
+                SoapError::NameTooLong.to_string()
+            );
         }
         let uri = "x".repeat(257);
         for xml in [
             wrap(&format!(r#"<a xmlns:x="{uri}" x:attr="v"/>"#)),
             wrap(&format!(r#"<a xmlns:x="{uri}"/>"#)),
         ] {
-            assert!(matches!(
-                Envelope::parse(xml.as_bytes(), &LIMITS),
-                Err(SoapError::NameTooLong)
-            ));
+            assert_eq!(
+                Envelope::parse(xml.as_bytes(), &LIMITS)
+                    .unwrap_err()
+                    .to_string(),
+                SoapError::NameTooLong.to_string()
+            );
         }
         let xml = wrap(&format!(
             r#"<x:root xmlns:x="{}">{}</x:root>"#,
             "x".repeat(256),
             "<x:a/>".repeat(100)
         ));
-        assert!(matches!(
-            Envelope::parse(xml.as_bytes(), &LIMITS),
-            Err(SoapError::AllocationBudget)
-        ));
+        assert_eq!(
+            Envelope::parse(xml.as_bytes(), &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::AllocationBudget.to_string()
+        );
     }
 
     #[test]
@@ -921,16 +945,18 @@ mod tests {
 
     #[test]
     fn rejects_non_utf8() {
-        assert!(matches!(
-            Envelope::parse(&[0xff, 0xfe, 0x00], &LIMITS),
-            Err(SoapError::NotUtf8)
-        ));
+        assert_eq!(
+            Envelope::parse(&[0xff, 0xfe, 0x00], &LIMITS)
+                .unwrap_err()
+                .to_string(),
+            SoapError::NotUtf8.to_string()
+        );
     }
 
     #[test]
     fn escape_covers_markup() {
         assert_eq!(escape("a&b<c>\"'"), "a&amp;b&lt;c&gt;&quot;&apos;");
-        assert!(matches!(escape("plain"), Cow::Borrowed(_)));
+        assert_eq!(escape("plain"), Cow::Borrowed::<str>("plain"));
     }
 
     #[test]

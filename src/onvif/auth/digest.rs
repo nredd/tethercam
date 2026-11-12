@@ -76,7 +76,7 @@ pub fn parse_authorization(value: &str) -> Result<DigestParams, AuthError> {
         return Err(BAD);
     }
     let mut params = DigestParams::default();
-    let mut seen = [false; 8];
+    let mut seen = 0_u8;
     let mut chars = rest.trim().chars().peekable();
     loop {
         while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
@@ -104,30 +104,28 @@ pub fn parse_authorization(value: &str) -> Result<DigestParams, AuthError> {
             val.truncate(val.trim_end().len());
         }
         let (slot, idx) = match key.trim().to_ascii_lowercase().as_str() {
-            "username" => (Some(&mut params.username), 0),
-            "realm" => (Some(&mut params.realm), 1),
-            "nonce" => (Some(&mut params.nonce), 2),
-            "uri" => (Some(&mut params.uri), 3),
-            "response" => (Some(&mut params.response), 4),
-            "qop" => (Some(&mut params.qop), 5),
-            "nc" => (Some(&mut params.nc), 6),
-            "cnonce" => (Some(&mut params.cnonce), 7),
+            "username" => (&mut params.username, 0),
+            "realm" => (&mut params.realm, 1),
+            "nonce" => (&mut params.nonce, 2),
+            "uri" => (&mut params.uri, 3),
+            "response" => (&mut params.response, 4),
+            "qop" => (&mut params.qop, 5),
+            "nc" => (&mut params.nc, 6),
+            "cnonce" => (&mut params.cnonce, 7),
             "algorithm" => {
                 params.algorithm = Some(val);
                 continue;
             }
             _ => continue,
         };
-        let seen_slot = seen.get_mut(idx).ok_or(BAD)?;
-        if *seen_slot {
+        let mask = 1_u8 << idx;
+        if seen & mask != 0 {
             return Err(BAD);
         }
-        *seen_slot = true;
-        if let Some(slot) = slot {
-            *slot = val;
-        }
+        seen |= mask;
+        *slot = val;
     }
-    if seen.iter().all(|s| *s) {
+    if seen == u8::MAX {
         Ok(params)
     } else {
         Err(BAD)
@@ -176,8 +174,15 @@ impl DigestAuth {
     pub fn new(
         credentials: Credentials, realm: impl Into<String>, clock: Arc<dyn Clock>,
     ) -> Result<Self, AuthError> {
+        Self::with_entropy(credentials, realm, clock, getrandom::fill)
+    }
+
+    fn with_entropy(
+        credentials: Credentials, realm: impl Into<String>, clock: Arc<dyn Clock>,
+        fill: fn(&mut [u8]) -> Result<(), getrandom::Error>,
+    ) -> Result<Self, AuthError> {
         let mut secret = [0_u8; 32];
-        getrandom::fill(&mut secret).map_err(|_| AuthError::Entropy)?;
+        fill(&mut secret).map_err(|_| AuthError::Entropy)?;
         Ok(Self::with_secret(credentials, realm, clock, secret))
     }
 
@@ -362,6 +367,65 @@ mod tests {
 
     fn respond(pass: &str, nc: u32, challenge: &str) -> String {
         DigestAuth::client_response("operator", pass, "GET", URI, challenge, nc, "cn0nce").unwrap()
+    }
+
+    #[test]
+    fn deterministic_error_and_cache_paths() {
+        let creds = || Credentials::new("operator", "synthetic-pass").unwrap();
+        let clock = Arc::new(ManualClock::new(1_750_000_000));
+        assert_eq!(
+            DigestAuth::with_entropy(creds(), "tethercam", clock.clone(), |_| Err(
+                getrandom::Error::UNSUPPORTED
+            ))
+            .unwrap_err()
+            .to_string(),
+            AuthError::Entropy.to_string()
+        );
+        assert!(DigestAuth::with_entropy(creds(), "tethercam", clock, |_| Ok(())).is_ok());
+        let (a, clock) = auth();
+        let header = respond("synthetic-pass", 1, &a.challenge(false));
+        assert_eq!(
+            a.verify(
+                "GET",
+                URI,
+                &header.replace("algorithm=MD5", "algorithm=SHA-256")
+            ),
+            Err(AuthError::UnsupportedPasswordType)
+        );
+        assert_eq!(
+            a.verify("GET", URI, &header.replace("nc=00000001", "nc=1")),
+            Err(AuthError::Malformed("nc"))
+        );
+        assert!(!a.nonce_fresh("bad"));
+        for input in [
+            format!("Digest {}", "a".repeat(MAX_HEADER_LEN)),
+            "Digest key".into(),
+            "Digest key=\"unterminated".into(),
+            "Digest key=\"\\".into(),
+        ] {
+            assert!(parse_authorization(&input).is_err());
+        }
+        assert!(parse_authorization(&(header.clone() + ", ignored=value")).is_ok());
+        assert!(DigestAuth::client_response("u", "p", "GET", "/", "missing", 1, "c").is_none());
+        assert!(DigestAuth::client_response("u", "p", "GET", "/", "realm=\"x\"", 1, "c").is_none());
+        let first = a.mint_nonce();
+        {
+            let mut cache = a.nonce_counts.lock().unwrap();
+            for _ in 0..MAX_TRACKED_NONCES {
+                cache.insert(a.mint_nonce(), 1);
+            }
+        }
+        let challenge = format!("Digest realm=\"tethercam\", nonce=\"{first}\"");
+        assert_eq!(
+            a.verify("GET", URI, &respond("synthetic-pass", 1, &challenge)),
+            Err(AuthError::ReplayCacheFull)
+        );
+        clock.advance(NONCE_LIFETIME_SECONDS + 1);
+        let fresh = a.challenge(false);
+        assert_eq!(
+            a.verify("GET", URI, &respond("synthetic-pass", 1, &fresh)),
+            Ok(())
+        );
     }
 
     #[test]

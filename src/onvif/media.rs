@@ -219,3 +219,161 @@ fn snapshot_uri(op: &Element, ctx: &Context<'_>) -> Result<String, Fault> {
         media_uri(&ctx.snapshot_url(p))
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onvif::model::example_model;
+
+    fn op(name: &str, args: &[(&str, &str)]) -> Element {
+        Element {
+            namespace: Some(NS_MEDIA.into()),
+            name: name.into(),
+            text: String::new(),
+            attributes: vec![],
+            children: args
+                .iter()
+                .map(|(name, text)| Element {
+                    namespace: None,
+                    name: (*name).into(),
+                    text: (*text).into(),
+                    attributes: vec![],
+                    children: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn configuration_and_empty_collection_operations() {
+        let model = example_model();
+        let ctx = Context {
+            model: &model,
+            local: "192.0.2.10:8080".parse().unwrap(),
+            now: 0,
+            snapshot: true,
+            authenticated: true,
+        };
+        for (name, args, expected) in [
+            ("GetProfiles", vec![], "<trt:GetProfilesResponse>"),
+            (
+                "GetProfile",
+                vec![("ProfileToken", "main")],
+                "<trt:GetProfileResponse>",
+            ),
+            ("GetVideoSources", vec![], "<trt:GetVideoSourcesResponse>"),
+            (
+                "GetStreamUri",
+                vec![("ProfileToken", "main")],
+                "<trt:GetStreamUriResponse>",
+            ),
+            (
+                "GetSnapshotUri",
+                vec![("ProfileToken", "main")],
+                "<trt:GetSnapshotUriResponse>",
+            ),
+            (
+                "GetServiceCapabilities",
+                vec![],
+                "MaximumNumberOfProfiles=\"2\"",
+            ),
+            (
+                "GetVideoSourceConfigurations",
+                vec![],
+                "video_source_config_0",
+            ),
+            (
+                "GetVideoSourceConfiguration",
+                vec![("ConfigurationToken", "video_source_config_0")],
+                "video_source_config_0",
+            ),
+            (
+                "GetVideoEncoderConfigurations",
+                vec![],
+                "video_encoder_main",
+            ),
+            (
+                "GetVideoEncoderConfiguration",
+                vec![("ConfigurationToken", "video_encoder_main")],
+                "video_encoder_main",
+            ),
+            ("GetAudioSources", vec![], "<trt:GetAudioSourcesResponse/>"),
+            (
+                "GetAudioEncoderConfigurations",
+                vec![],
+                "<trt:GetAudioEncoderConfigurationsResponse/>",
+            ),
+            (
+                "GetMetadataConfigurations",
+                vec![],
+                "<trt:GetMetadataConfigurationsResponse/>",
+            ),
+        ] {
+            let result = handle(&op(name, &args), &ctx).unwrap();
+            assert!(result.contains(expected), "{name}: {result}");
+        }
+        error_operations(&ctx);
+    }
+
+    fn error_operations(ctx: &Context<'_>) {
+        for name in [
+            "GetVideoSourceConfiguration",
+            "GetVideoEncoderConfiguration",
+        ] {
+            assert!(handle(&op(name, &[("ConfigurationToken", "bad")]), ctx).is_err());
+            assert!(handle(&op(name, &[]), ctx).is_err());
+        }
+        for name in ["GetStreamUri", "GetSnapshotUri"] {
+            assert!(handle(&op(name, &[("ProfileToken", "bad")]), ctx).is_err());
+        }
+        assert!(handle(&op("unknown", &[]), ctx).is_err());
+        assert!(handle(&op("GetProfile", &[("ProfileToken", "bad")]), ctx).is_err());
+        let mut wrong_namespace = op("GetProfiles", &[]);
+        wrong_namespace.namespace = None;
+        assert!(handle(&wrong_namespace, ctx).is_err());
+        let mut stream = op("GetStreamUri", &[("ProfileToken", "main")]);
+        stream.children.push(Element {
+            namespace: None,
+            name: "StreamSetup".into(),
+            text: String::new(),
+            attributes: vec![],
+            children: vec![Element {
+                namespace: None,
+                name: "Transport".into(),
+                text: String::new(),
+                attributes: vec![],
+                children: vec![Element {
+                    namespace: None,
+                    name: "Protocol".into(),
+                    text: "bad".into(),
+                    attributes: vec![],
+                    children: vec![],
+                }],
+            }],
+        });
+        assert!(handle(&stream, ctx).is_err());
+        for protocol in ["RTSP", "TCP", "UDP"] {
+            stream.children[1].children[0].children[0].text = protocol.into();
+            assert!(handle(&stream, ctx).is_ok());
+        }
+        stream.children[1].children.push(Element {
+            namespace: None,
+            name: "Stream".into(),
+            text: "RTP-Multicast".into(),
+            attributes: vec![],
+            children: vec![],
+        });
+        assert!(handle(&stream, ctx).is_err());
+        let without_snapshot = Context {
+            snapshot: false,
+            ..*ctx
+        };
+        assert!(
+            handle(
+                &op("GetSnapshotUri", &[("ProfileToken", "main")]),
+                &without_snapshot
+            )
+            .is_err()
+        );
+    }
+}

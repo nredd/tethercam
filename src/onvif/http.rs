@@ -416,10 +416,19 @@ impl Write for DeadlineIo {
 fn serve_connection(
     stream: TcpStream, service: &OnvifService, limits: &HttpLimits, stop: &AtomicBool,
 ) {
-    let Ok(local) = stream.local_addr() else {
+    let local = stream.local_addr();
+    let read_half = stream.try_clone();
+    serve_connection_prepared(stream, service, limits, stop, &local, read_half);
+}
+
+fn serve_connection_prepared(
+    stream: TcpStream, service: &OnvifService, limits: &HttpLimits, stop: &AtomicBool,
+    local: &io::Result<SocketAddr>, read_half: io::Result<TcpStream>,
+) {
+    let Ok(local) = local else {
         return;
     };
-    let Ok(read_half) = stream.try_clone() else {
+    let Ok(read_half) = read_half else {
         return;
     };
     let deadline = Rc::new(Cell::new(Instant::now()));
@@ -462,7 +471,7 @@ fn serve_connection(
             target: &req.target,
             authorization: req.header("authorization"),
             body: &req.body,
-            local,
+            local: *local,
         });
         let keep = req.keep_alive
             && served < limits.max_requests_per_connection
@@ -571,8 +580,206 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    struct TestReader<'a> {
+        bytes: &'a [u8],
+        fail_when_empty: bool,
+    }
+
+    impl Read for TestReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.is_empty() && self.fail_when_empty {
+                return Err(io::Error::other("synthetic read failure"));
+            }
+            self.bytes.read(out)
+        }
+    }
+
+    impl BufRead for TestReader<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            if self.bytes.is_empty() && self.fail_when_empty {
+                return Err(io::Error::other("synthetic read failure"));
+            }
+            Ok(self.bytes)
+        }
+        fn consume(&mut self, amount: usize) {
+            self.bytes.consume(amount);
+        }
+    }
+
     fn parse(bytes: &[u8]) -> Result<HttpRequest, HttpError> {
-        read_request(&mut &bytes[..], &HttpLimits::default())
+        read_request(
+            &mut TestReader {
+                bytes,
+                fail_when_empty: false,
+            },
+            &HttpLimits::default(),
+        )
+    }
+
+    #[test]
+    fn parser_propagates_io_errors_during_headers_and_body() {
+        for bytes in [
+            b"GET / HTTP/1.1\r\n".as_slice(),
+            b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nx".as_slice(),
+        ] {
+            let mut reader = TestReader {
+                bytes,
+                fail_when_empty: true,
+            };
+            assert_eq!(
+                read_request(&mut reader, &HttpLimits::default())
+                    .unwrap_err()
+                    .status(),
+                400
+            );
+        }
+    }
+
+    fn service() -> OnvifService {
+        use crate::onvif::{auth::Credentials, model::example_model, time::ManualClock};
+        OnvifService::with_digest_secret(
+            example_model(),
+            Credentials::new("operator", "synthetic-pass").unwrap(),
+            Arc::new(ManualClock::new(0)),
+            [9; 32],
+        )
+    }
+
+    #[test]
+    fn socket_setup_failures_and_stopped_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let error = || io::Error::other("synthetic failure");
+        let limits = HttpLimits::default();
+        let stopped = AtomicBool::new(true);
+        serve_connection_prepared(
+            socket.try_clone().unwrap(),
+            &service(),
+            &limits,
+            &stopped,
+            &Err(error()),
+            Ok(socket.try_clone().unwrap()),
+        );
+        serve_connection_prepared(
+            socket.try_clone().unwrap(),
+            &service(),
+            &limits,
+            &stopped,
+            &socket.local_addr(),
+            Err(error()),
+        );
+        serve_connection(socket, &service(), &limits, &stopped);
+    }
+
+    #[test]
+    fn deadline_reader_and_writer_failures_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let deadline = Rc::new(Cell::new(after(Duration::from_millis(50))));
+        let mut reader = BufReader::new(DeadlineIo {
+            stream: socket.try_clone().unwrap(),
+            deadline: deadline.clone(),
+        });
+        peer.write_all(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nx")
+            .unwrap();
+        assert!(read_request_phased(&mut reader, &HttpLimits::default(), &mut |_| {}).is_err());
+        deadline.set(Instant::now());
+        let mut writer = DeadlineIo {
+            stream: socket,
+            deadline,
+        };
+        assert!(write_response(&mut writer, &error_response(500), false).is_err());
+    }
+
+    #[test]
+    fn loopback_server_handles_success_and_framing_errors() {
+        let limits = HttpLimits {
+            max_header_bytes: 100,
+            idle_timeout: Duration::from_millis(100),
+            head_timeout: Duration::from_millis(100),
+            body_timeout: Duration::from_millis(100),
+            ..HttpLimits::default()
+        };
+        let mut server =
+            HttpServer::start("127.0.0.1:0".parse().unwrap(), Arc::new(service()), limits).unwrap();
+        for (request, status) in [
+            (
+                b"GET /unknown HTTP/1.1\r\nConnection: close\r\n\r\n".as_slice(),
+                "404",
+            ),
+            (b"POST / HTTP/1.1\r\n\r\n".as_slice(), "411"),
+            (b"GET / HTTP/1.1\r\nInvalid\r\n\r\n".as_slice(), "400"),
+            (
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+                "501",
+            ),
+        ] {
+            let mut peer = TcpStream::connect(server.local_addr()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.write_all(request).unwrap();
+            let mut response = String::new();
+            peer.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+        }
+        server.shutdown();
+    }
+
+    #[test]
+    fn shutdown_wakes_wildcard_listeners() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(
+            HttpServer::start(
+                occupied.local_addr().unwrap(),
+                Arc::new(service()),
+                HttpLimits::default()
+            )
+            .is_err()
+        );
+        for addr in [
+            "0.0.0.0:0".parse().unwrap(),
+            "[::]:0".parse().unwrap(),
+            occupied.local_addr().unwrap(),
+        ] {
+            if let Ok(mut server) =
+                HttpServer::start(addr, Arc::new(service()), HttpLimits::default())
+            {
+                server.shutdown();
+            }
+        }
+    }
+
+    #[test]
+    fn status_codes_and_reasons_cover_all_responses() {
+        assert_eq!(HttpError::HeaderTooLarge.status(), 431);
+        for (status, text) in [
+            (405, "Method Not Allowed"),
+            (411, "Length Required"),
+            (431, "Request Header Fields Too Large"),
+            (500, "Internal Server Error"),
+            (501, "Not Implemented"),
+        ] {
+            assert_eq!(reason(status), text);
+        }
+    }
+
+    #[test]
+    fn malformed_headers_and_connection_tokens() {
+        for bytes in [
+            b"GET / HTTP/1.1\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nX: \xff\r\n\r\n".as_slice(),
+        ] {
+            assert!(parse(bytes).is_err());
+        }
+        assert!(
+            parse(b"GET / HTTP/1.1\r\nConnection: upgrade\r\n\r\n")
+                .unwrap()
+                .keep_alive
+        );
     }
 
     #[test]
@@ -639,7 +846,7 @@ mod tests {
         ];
         for (bytes, status) in cases {
             let err = parse(bytes).unwrap_err();
-            assert_eq!(err.status(), *status, "{}", String::from_utf8_lossy(bytes));
+            assert_eq!(err.status(), *status);
         }
     }
 
@@ -647,18 +854,15 @@ mod tests {
     fn bounds_header_block() {
         let mut big = b"GET / HTTP/1.1\r\n".to_vec();
         big.extend(format!("X: {}\r\n\r\n", "a".repeat(9000)).bytes());
-        assert!(matches!(parse(&big), Err(HttpError::HeaderTooLarge)));
+        assert_eq!(parse(&big).unwrap_err().status(), 431);
         let mut many = b"GET / HTTP/1.1\r\n".to_vec();
         for i in 0..40 {
             many.extend(format!("X{i}: v\r\n").bytes());
         }
         many.extend(b"\r\n");
-        assert!(matches!(parse(&many), Err(HttpError::HeaderTooLarge)));
+        assert_eq!(parse(&many).unwrap_err().status(), 431);
         // A single endless line without a newline is bounded too.
-        assert!(matches!(
-            parse(&vec![b'a'; 100_000]),
-            Err(HttpError::HeaderTooLarge)
-        ));
+        assert_eq!(parse(&vec![b'a'; 100_000]).unwrap_err().status(), 431);
     }
 
     #[test]
@@ -685,7 +889,72 @@ mod tests {
 
     #[test]
     fn clean_eof_is_closed() {
-        assert!(matches!(parse(b""), Err(HttpError::Closed)));
+        assert_eq!(
+            parse(b"").unwrap_err().to_string(),
+            HttpError::Closed.to_string()
+        );
+    }
+
+    struct ControlledWriter {
+        bytes: Vec<u8>,
+        fail: usize,
+        calls: usize,
+    }
+
+    impl Write for ControlledWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == self.fail {
+                return Err(io::Error::other("synthetic write failure"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.calls += 1;
+            if self.calls == self.fail {
+                return Err(io::Error::other("synthetic flush failure"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn response_io_errors_and_all_status_reasons() {
+        for fail in 0..=3 {
+            let mut writer = ControlledWriter {
+                bytes: vec![],
+                fail,
+                calls: 0,
+            };
+            let response = ServiceResponse {
+                status: 200,
+                content_type: "text/plain",
+                body: vec![1],
+                www_authenticate: None,
+            };
+            assert_eq!(
+                write_response(&mut writer, &response, false).is_ok(),
+                fail == 0
+            );
+        }
+        for status in [200, 400, 401, 404, 405, 411, 413, 431, 500, 501, 503] {
+            for keep in [false, true] {
+                let mut writer = ControlledWriter {
+                    bytes: vec![],
+                    fail: 0,
+                    calls: 0,
+                };
+                let mut response = error_response(status);
+                response.www_authenticate = Some("synthetic".into());
+                write_response(&mut writer, &response, keep).unwrap();
+                assert!(
+                    String::from_utf8(writer.bytes)
+                        .unwrap()
+                        .contains(reason(status))
+                );
+            }
+        }
     }
 
     #[test]

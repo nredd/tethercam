@@ -154,7 +154,7 @@ fn digits(s: &str, n: usize) -> Result<i64, TimeError> {
 pub fn parse_datetime(s: &str) -> Result<i64, TimeError> {
     let (date, rest) = s.split_once('T').ok_or(TimeError)?;
     let mut dp = date.split('-');
-    let year = digits(dp.next().ok_or(TimeError)?, 4)?;
+    let year = digits(dp.next().unwrap_or_default(), 4)?;
     let month = digits(dp.next().ok_or(TimeError)?, 2)?;
     let day = digits(dp.next().ok_or(TimeError)?, 2)?;
     if dp.next().is_some() || !(1..=12).contains(&month) || year < 1 {
@@ -168,9 +168,9 @@ pub fn parse_datetime(s: &str) -> Result<i64, TimeError> {
         (clock, 0)
     } else {
         let idx = rest.rfind(['+', '-']).ok_or(TimeError)?;
-        let (clock, zone) = rest.split_at_checked(idx).ok_or(TimeError)?;
+        let (clock, zone) = rest.split_at(idx);
         let sign = if zone.starts_with('-') { -1 } else { 1 };
-        let zone = zone.get(1..).ok_or(TimeError)?;
+        let (_, zone) = zone.split_at(1);
         let (zh, zm) = zone.split_once(':').ok_or(TimeError)?;
         let (zh, zm) = (digits(zh, 2)?, digits(zm, 2)?);
         if zh > 23 || zm > 59 {
@@ -180,7 +180,7 @@ pub fn parse_datetime(s: &str) -> Result<i64, TimeError> {
     };
 
     let mut cp = clock.split(':');
-    let hour = digits(cp.next().ok_or(TimeError)?, 2)?;
+    let hour = digits(cp.next().unwrap_or_default(), 2)?;
     let minute = digits(cp.next().ok_or(TimeError)?, 2)?;
     let sec_part = cp.next().ok_or(TimeError)?;
     if cp.next().is_some() {
@@ -231,6 +231,37 @@ mod tests {
         assert_eq!(parse_datetime("2025-06-01T12:00:00+02:00"), Ok(utc));
         assert_eq!(parse_datetime("2025-06-01T05:30:00-04:30"), Ok(utc));
         assert_eq!(parse_datetime("2025-06-01T10:00:00.123456Z"), Ok(utc));
+    }
+
+    #[test]
+    fn clock_and_date_boundaries() {
+        let clock = ManualClock::new(1);
+        clock.set(3);
+        assert_eq!(clock.now_unix(), 3);
+        assert_eq!(digits("999999999999999999999", 21), Err(TimeError));
+        for value in [
+            "2025-01-aaT10:00:00Z",
+            "2025-01-01Taa:00:00Z",
+            "2025-01-01T10:aa:00Z",
+            "2025-01-01T10:00:aaZ",
+            "2025-01-01T10:00:aa.1Z",
+            "2025-01-01T10:00:00+aa:00",
+            "2025-01-01T10:00:00+01:aa",
+            "2025T10:00:00Z",
+            "2025-01T10:00:00Z",
+            "2025-01-01-extraT10:00:00Z",
+            "2025-00-01T10:00:00Z",
+            "2025-01-00T10:00:00Z",
+            "2025-01-01T10Z",
+            "2025-01-01T10:00Z",
+            "2025-01-01T10:00:00:00Z",
+            "2025-01-01T10:00:00.1234567890Z",
+            "2025-01-01T10:00:00.aZ",
+            "2025-01-01T10:00:00+01",
+            "2025-01-01T10:00:00+01:60",
+        ] {
+            assert_eq!(parse_datetime(value), Err(TimeError), "{value}");
+        }
     }
 
     #[test]
