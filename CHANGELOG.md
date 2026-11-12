@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Exercise pacer slot-accounting invariants deterministically even with one property-test case
 - Keep Sony sessions open when wait budgets expire, classify protocol fallback errors, and allow longer still-image downloads
 - Redact ONVIF response bodies and WS-Security replay caches from debug output
 - Redact RTSP response bodies in debug output
