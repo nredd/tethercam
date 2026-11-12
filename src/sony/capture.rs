@@ -132,20 +132,19 @@ impl<T: Transport> SonyCamera<'_, T> {
     async fn check_image_within(
         &mut self, budget: Option<(Instant, Duration)>,
     ) -> Result<bool, SonyError> {
-        let events = self.pump_events_inner(budget).await?;
+        let (events, refreshed) = self.pump_events_inner(budget).await?;
         if events
             .iter()
             .any(|event| matches!(event, SonyEvent::ObjectAdded { .. }))
         {
             return Ok(true);
         }
-        if let Some((started, limit)) = budget {
-            let remaining = self.remaining(started, limit);
-            if remaining.is_zero() {
+        if !refreshed {
+            if let Some((started, limit)) = budget
+                && self.remaining(started, limit).is_zero()
+            {
                 return Err(SonyError::CaptureTimeout { timeout: limit });
             }
-            self.refresh_properties().await?;
-        } else {
             self.refresh_properties().await?;
         }
         Ok(self.image_in_memory())

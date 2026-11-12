@@ -618,9 +618,10 @@ async fn event_refresh_is_skipped_after_budget_expires() {
     SonyCamera::run(&mut session, config, async |camera| {
         let before = camera.session.transport().commands().len();
         let started = camera.session.now();
-        let events = camera
+        let (events, refreshed) = camera
             .pump_events_inner(Some((started, Duration::from_millis(10))))
             .await?;
+        assert!(!refreshed);
         assert_eq!(events, [SonyEvent::PropertyChanged(prop::PRIORITY_MODE)]);
         assert_eq!(camera.session.transport().commands().len(), before);
         assert_eq!(camera.session.transport().reset_count(), 0);
@@ -868,6 +869,36 @@ async fn slow_wait_transactions_preserve_the_session() {
         assert_eq!(codes(&session).last(), Some(&0x1003));
         assert_closed(&session);
     }
+}
+
+#[tokio::test]
+async fn capture_consumes_property_refresh_finished_after_deadline() {
+    ELAPSED.set(Duration::ZERO);
+    let sim = SonySimConfig {
+        warmup_reads: 0,
+        shutter: Shutter::AfterRelease,
+        emit_object_added: false,
+        ..body(200)
+    };
+    let still = sim.still.clone();
+    let mut session = session(sim).with_clock(ticking_now);
+    let config = SonyConfig {
+        capture_timeout: Duration::from_millis(5),
+        event_poll_timeout: Duration::from_millis(50),
+        ..fast()
+    };
+    SonyCamera::run(&mut session, config, async |camera| {
+        let image = camera.capture_still().await?;
+        assert_eq!(image.data, still);
+        assert_eq!(camera.session.transport().reset_count(), 0);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(session.transport().reset_count(), 0);
+    let writes: Vec<&Vec<u8>> = session.transport().received_data().iter().skip(1).collect();
+    assert_eq!(writes, [&vec![2, 0], &vec![2, 0], &vec![1, 0], &vec![1, 0]]);
+    assert_closed(&session);
 }
 
 #[tokio::test]
