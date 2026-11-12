@@ -17,7 +17,10 @@ single USB-C cable.
 - Serve full-resolution stills as the ONVIF snapshot
 - Run in the foreground on macOS and Linux, with graceful interrupt/terminate cleanup
 
-Service installation and real NVR adoption remain separate work.
+Install a per-user macOS launchd agent or a Linux system/user systemd service with
+`tethercam service install` (`--user` for Linux's user manager). Installation starts the service.
+See [`docs/service.md`](docs/service.md) for privileges, standard paths, USB permissions, status,
+uninstall and graceful stop policy. Real NVR adoption remains unvalidated.
 
 ## Supported hardware
 
@@ -67,7 +70,8 @@ is used. `probe` lists candidate USB modes and reports the selected body's remot
 and battery/USB power. `camera_serial` in the configuration selects an exact device; otherwise
 the first usable camera is chosen. USB serials and OS bus paths are not printed. `doctor` checks file
 permissions and values, listener addresses/ports, a plausible UTC clock and camera readiness; it
-does not prove that NTP is synchronized. The process never installs a daemon or backgrounds itself.
+does not prove that NTP is synchronized. These foreground commands never install a daemon or
+background themselves; only the explicit `service` command performs native service operations.
 
 Both streams share the configured RTSP port. Enabled MJPEG is checked for RFC 2435 compatibility
 before any listener starts; disable `streams.mjpeg` if a body's JPEG layout is unsupported.

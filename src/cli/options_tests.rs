@@ -81,6 +81,54 @@ fn non_utf8_commands_fail_and_paths_survive() {
     );
 }
 
+#[test]
+fn service_syntax_is_bounded_and_separate_from_runtime_options() {
+    use crate::service::Action;
+    for (name, action) in [
+        ("install", Action::Install),
+        ("uninstall", Action::Uninstall),
+        ("status", Action::Status),
+    ] {
+        for user in [false, true] {
+            let mut args = vec!["service", name];
+            if user {
+                args.push("--user");
+            }
+            assert_eq!(
+                parse(&args).unwrap().command,
+                Command::Service { action, user }
+            );
+        }
+    }
+    for flag in ["-h", "--help"] {
+        assert_eq!(parse(&["service", flag]).unwrap().command, Command::Help);
+    }
+    for args in [
+        vec!["service"],
+        vec!["service", "bad"],
+        vec!["service", "--help", "extra"],
+        vec!["service", "install", "--user", "--user"],
+        vec!["service", "install", "--config", "/synthetic/config"],
+        vec!["service", "status", "--simulate", "/synthetic.jpg"],
+    ] {
+        assert!(parse(&args).is_err());
+    }
+    assert!(
+        Options::parse(
+            ["service", "status"]
+                .into_iter()
+                .map(OsString::from)
+                .chain(std::iter::repeat_with(|| OsString::from("--user")))
+        )
+        .is_err()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(Options::parse(["service".into(), OsString::from_vec(vec![0xff])]).is_err());
+    }
+}
+
 proptest! {
     #[test]
     fn arbitrary_arguments_never_panic(args in proptest::collection::vec(".*", 0..32)) {

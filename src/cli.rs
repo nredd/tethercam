@@ -26,9 +26,11 @@ use crate::supervisor::CameraFactory;
 
 /// The version banner printed without arguments or with `--version`.
 pub const BANNER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
-/// Short command/option help. There is no default password, daemon installation or backgrounding.
+/// Short command/option help. Daemon operations require an explicit `service` subcommand.
 pub const HELP: &str = "tethercam setup|probe|run|doctor [--config PATH] [--simulate JPEG] [--no-discovery]\n\
-setup creates owner-only credentials and identity; probe inspects a camera; run serves in the foreground; doctor checks readiness.\n";
+setup creates owner-only credentials and identity; probe inspects a camera; run serves in the foreground; doctor checks readiness.\n\
+tethercam service install|uninstall|status [--user]\n\
+Linux defaults to a privileged system unit; --user selects its user manager. macOS uses a per-user launchd agent. Service paths are fixed; uninstall retains credentials.\n";
 
 /// User-facing diagnostic categories. Values supplied by cameras and configuration parsers are
 /// retained as sources but never interpolated into CLI errors or logs.
@@ -37,6 +39,9 @@ pub enum Error {
     /// Invalid arguments.
     #[error(transparent)]
     Arguments(#[from] ParseError),
+    /// A protected native service lifecycle operation failed.
+    #[error(transparent)]
+    Service(#[from] crate::service::Error),
     /// Configuration parsing, permissions or validation failed.
     #[error("configuration rejected; check syntax, values and owner-only permissions")]
     Config(#[from] config::Error),
@@ -103,6 +108,19 @@ fn execute_with_path(
     options: Result<Options, ParseError>, out: &mut dyn Write,
     default_path: Result<std::path::PathBuf, config::Error>,
 ) -> Result<(), Error> {
+    execute_with_service(
+        options,
+        out,
+        default_path,
+        &mut crate::service::Manager::new,
+    )
+}
+
+fn execute_with_service(
+    options: Result<Options, ParseError>, out: &mut dyn Write,
+    default_path: Result<std::path::PathBuf, config::Error>,
+    service: &mut dyn FnMut(bool) -> Result<crate::service::Manager, crate::service::Error>,
+) -> Result<(), Error> {
     let options = options?;
     match options.command {
         Command::Version => {
@@ -111,6 +129,10 @@ fn execute_with_path(
         }
         Command::Help => {
             out.write_all(HELP.as_bytes())?;
+            return Ok(());
+        }
+        Command::Service { action, user } => {
+            writeln!(out, "Service: {}", service(user)?.manage(action)?)?;
             return Ok(());
         }
         _ => {}
@@ -210,6 +232,6 @@ async fn command_until<F: CameraFactory>(
             crate::supervisor::serve(factory, cfg, discovery, shutdown, out).await?;
             Ok(())
         }
-        Command::Setup | Command::Version | Command::Help => Ok(()),
+        Command::Setup | Command::Version | Command::Help | Command::Service { .. } => Ok(()),
     }
 }

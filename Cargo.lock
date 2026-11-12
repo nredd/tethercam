@@ -989,6 +989,7 @@ dependencies = [
  "nusb",
  "proptest",
  "roxmltree",
+ "rustix",
  "rusty_h264-common",
  "rusty_h264-encoder",
  "serde",
