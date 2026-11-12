@@ -77,6 +77,12 @@ They map to:
   clock-skew window. Discovery reveals only what ONVIF requires
 - Credentials: random, generated at first run, stored in a config file created with owner-only
   permissions. Compared in constant time. Never logged
+- The `config` layer loads an explicit path or resolves the platform default. On first run it
+  generates credentials and an endpoint UUID, then atomically publishes a new owner-only file;
+  competing first runs load the winning file instead of replacing its identity. Publication syncs
+  the file and containing directory, and syncs parents of newly created directories. Listener
+  validation rejects overlapping addresses and ports within the same IP family. On Unix, loading
+  rejects files accessible to group or others. Unsupported permission models fail closed
 - No remote configuration surface. The config file and the CLI are the only way to change
   behavior
 - Parsers of untrusted bytes (USB and network) are total and fuzz-tested with `proptest`
