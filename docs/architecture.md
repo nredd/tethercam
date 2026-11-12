@@ -73,8 +73,9 @@ They map to:
 ## Security model
 
 - RTSP: Digest authentication on every request, including from loopback
-- ONVIF: WS-Security `UsernameToken` with password digest, nonce replay cache and a bounded
-  clock-skew window. Discovery reveals only what ONVIF requires
+- ONVIF: WS-Security `UsernameToken` with password digest (plaintext refused), nonce replay
+  cache and a bounded clock-skew window. HTTP Digest is the alternative. Only
+  `GetSystemDateAndTime`, `GetCapabilities` and `GetServices` are pre-auth. Discovery reveals only what ONVIF requires
 - Credentials: random, generated at first run, stored in a config file created with owner-only
   permissions. Compared in constant time. Never logged
 - The `config` layer loads an explicit path or resolves the platform default. On first run it
