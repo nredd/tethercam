@@ -395,16 +395,25 @@ impl DeadlineIo {
     }
 }
 
+impl DeadlineIo {
+    /// Arm a transport timeout from the absolute deadline, propagating setup failures.
+    fn arm(
+        &self, set_timeout: &mut dyn FnMut(Option<Duration>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        set_timeout(Some(self.remaining()?))
+    }
+}
+
 impl Read for DeadlineIo {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.arm(&mut |timeout| self.stream.set_read_timeout(timeout))?;
         self.stream.read(buf)
     }
 }
 
 impl Write for DeadlineIo {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.arm(&mut |timeout| self.stream.set_write_timeout(timeout))?;
         self.stream.write(buf)
     }
 
@@ -483,6 +492,45 @@ fn serve_connection_prepared(
     }
 }
 
+/// Owned work passed to the OS thread builder.
+type ThreadTask = Box<dyn FnOnce() + Send>;
+
+/// Spawn a named server task; keeping the builder here preserves OS spawn errors.
+fn spawn_thread(name: &str, task: ThreadTask) -> io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name.to_owned()).spawn(task)
+}
+
+/// Accept connections with bounded admission; failed accepts are retried and failed
+/// connection spawns drop their task, releasing both the socket and admission guard.
+fn accept_connections(
+    incoming: &mut dyn Iterator<Item = io::Result<TcpStream>>, service: &Arc<OnvifService>,
+    limits: HttpLimits, stop: &Arc<AtomicBool>, active: &Arc<AtomicUsize>,
+    spawn: &mut dyn FnMut(ThreadTask) -> io::Result<JoinHandle<()>>,
+) {
+    for stream in incoming {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(stream) = stream else { continue };
+        if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
+            active.fetch_sub(1, Ordering::SeqCst);
+            let mut io = DeadlineIo {
+                stream,
+                deadline: Rc::new(Cell::new(after(limits.write_timeout))),
+            };
+            let _ = write_response(&mut io, &error_response(503), false);
+            continue;
+        }
+        let guard = ConnectionGuard(active.clone());
+        let (service, stop) = (service.clone(), stop.clone());
+        let spawned = spawn(Box::new(move || {
+            let _guard = guard;
+            serve_connection(stream, &service, &limits, &stop);
+        }));
+        drop(spawned);
+    }
+}
+
 /// A running server. Dropping it stops accepting and lets in-flight connections finish.
 #[derive(Debug)]
 pub struct HttpServer {
@@ -502,41 +550,33 @@ impl HttpServer {
         addr: SocketAddr, service: Arc<OnvifService>, limits: HttpLimits,
     ) -> Result<Self, ServerError> {
         let listener = TcpListener::bind(addr).map_err(ServerError::Bind)?;
-        let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
+        let local_addr = listener.local_addr();
         let stop = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(AtomicUsize::new(0));
         let accept_stop = stop.clone();
-        let accept = thread::Builder::new()
-            .name("onvif-accept".to_owned())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    if accept_stop.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let Ok(stream) = stream else { continue };
-                    if active.fetch_add(1, Ordering::SeqCst) >= limits.max_connections {
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        // Same absolute write bound as any other response.
-                        let mut io = DeadlineIo {
-                            stream,
-                            deadline: Rc::new(Cell::new(after(limits.write_timeout))),
-                        };
-                        let _ = write_response(&mut io, &error_response(503), false);
-                        continue;
-                    }
-                    let guard = ConnectionGuard(active.clone());
-                    let (service, stop) = (service.clone(), accept_stop.clone());
-                    let spawned =
-                        thread::Builder::new()
-                            .name("onvif-conn".to_owned())
-                            .spawn(move || {
-                                let _guard = guard;
-                                serve_connection(stream, &service, &limits, &stop);
-                            });
-                    drop(spawned);
-                }
-            })
-            .map_err(ServerError::Spawn)?;
+        Self::start_prepared(
+            local_addr,
+            stop,
+            Box::new(move || {
+                accept_connections(
+                    &mut listener.incoming(),
+                    &service,
+                    limits,
+                    &accept_stop,
+                    &Arc::new(AtomicUsize::new(0)),
+                    &mut |task| spawn_thread("onvif-conn", task),
+                );
+            }),
+            &mut |task| spawn_thread("onvif-accept", task),
+        )
+    }
+
+    /// Finish listener setup through the same error paths for real and injected OS results.
+    fn start_prepared(
+        local_addr: io::Result<SocketAddr>, stop: Arc<AtomicBool>, task: ThreadTask,
+        spawn: &mut dyn FnMut(ThreadTask) -> io::Result<JoinHandle<()>>,
+    ) -> Result<Self, ServerError> {
+        let local_addr = local_addr.map_err(ServerError::Bind)?;
+        let accept = spawn(task).map_err(ServerError::Spawn)?;
         Ok(Self {
             local_addr,
             stop,
@@ -673,6 +713,122 @@ mod tests {
     }
 
     #[test]
+    fn deadline_timeout_setup_propagates_errors_without_extending_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_socket, _) = listener.accept().unwrap();
+        let deadline = after(Duration::from_secs(1));
+        let io = DeadlineIo {
+            stream: peer,
+            deadline: Rc::new(Cell::new(deadline)),
+        };
+        let mut calls = 0;
+        let error = io
+            .arm(&mut |timeout| {
+                calls += 1;
+                let remaining = timeout.unwrap();
+                assert!(!remaining.is_zero());
+                assert!(remaining <= Duration::from_secs(1));
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "synthetic timeout setup failure",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
+        assert_eq!(io.deadline.get(), deadline);
+    }
+
+    #[test]
+    fn listener_inspection_and_accept_thread_spawn_failures_propagate() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut spawn_calls = 0;
+        let mut spawn = |task: ThreadTask| {
+            spawn_calls += 1;
+            drop(task);
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "synthetic thread limit",
+            ))
+        };
+        let error = HttpServer::start_prepared(
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "synthetic listener inspection failure",
+            )),
+            stop.clone(),
+            Box::new(thread::yield_now),
+            &mut spawn,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Bind(ref e) if e.kind() == io::ErrorKind::NotConnected)
+        );
+        let error = HttpServer::start_prepared(
+            Ok("127.0.0.1:0".parse().unwrap()),
+            stop,
+            Box::new(thread::yield_now),
+            &mut spawn,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ServerError::Spawn(ref e) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(spawn_calls, 1);
+    }
+
+    #[test]
+    fn accept_retries_errors_and_failed_connection_spawn_releases_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let calls = Cell::new(0);
+        let mut spawn = |task: ThreadTask| {
+            calls.set(calls.get() + 1);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            drop(task);
+            Err(io::Error::other("synthetic connection spawn failure"))
+        };
+        accept_connections(
+            &mut [
+                Err(io::Error::other("synthetic accept failure")),
+                Ok(socket),
+            ]
+            .into_iter(),
+            &Arc::new(service()),
+            HttpLimits::default(),
+            &Arc::new(AtomicBool::new(false)),
+            &active,
+            &mut spawn,
+        );
+        let mut rejected = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        accept_connections(
+            &mut [Ok(socket)].into_iter(),
+            &Arc::new(service()),
+            HttpLimits {
+                max_connections: 0,
+                ..HttpLimits::default()
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &active,
+            &mut spawn,
+        );
+        let mut response = String::new();
+        rejected.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 "));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
     fn deadline_reader_and_writer_failures_are_bounded() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -691,6 +847,44 @@ mod tests {
             deadline,
         };
         assert!(write_response(&mut writer, &error_response(500), false).is_err());
+    }
+
+    #[test]
+    fn connection_pipeline_body_deadline_and_write_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        for (request, zero_write, responses) in [
+            (
+                b"GET /unknown HTTP/1.1\r\nContent-Length: 1\r\n\r\nxGET /unknown HTTP/1.1\r\n\r\n"
+                    .as_slice(),
+                false,
+                2,
+            ),
+            (b"GET /unknown HTTP/1.1\r\n\r\n".as_slice(), true, 0),
+            (b"GET /unknown HTTP/1.1\r\n".as_slice(), false, 0),
+            (b"".as_slice(), false, 0),
+        ] {
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            peer.write_all(request).unwrap();
+            if request.is_empty() {
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            let limits = HttpLimits {
+                max_requests_per_connection: 2,
+                head_timeout: Duration::from_millis(50),
+                write_timeout: if zero_write {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                },
+                ..HttpLimits::default()
+            };
+            serve_connection(socket, &service(), &limits, &AtomicBool::new(false));
+            let mut response = String::new();
+            peer.read_to_string(&mut response).unwrap();
+            assert_eq!(response.matches("HTTP/1.1 404 ").count(), responses);
+        }
     }
 
     #[test]
@@ -740,16 +934,97 @@ mod tests {
             )
             .is_err()
         );
-        for addr in [
+        let mut ipv4 = HttpServer::start(
             "0.0.0.0:0".parse().unwrap(),
+            Arc::new(service()),
+            HttpLimits::default(),
+        )
+        .unwrap();
+        ipv4.shutdown();
+
+        shutdown_ipv6(HttpServer::start(
             "[::]:0".parse().unwrap(),
-            occupied.local_addr().unwrap(),
+            Arc::new(service()),
+            HttpLimits::default(),
+        ));
+    }
+
+    /// Only explicit address-family unavailability may skip the IPv6 environment check.
+    fn ipv6_unavailable(error: &io::Error) -> bool {
+        // Rust does not give EAFNOSUPPORT a distinct stable ErrorKind. Only interpret
+        // a raw code on the platform that defines it, never another OS's errno table.
+        error.kind() == io::ErrorKind::Unsupported
+            || error
+                .raw_os_error()
+                .is_some_and(|code| Some(code) == FAMILY_UNAVAILABLE_CODE)
+    }
+
+    const FAMILY_UNAVAILABLE_CODE: Option<i32> = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            Some(97)
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            Some(47)
+        }
+        #[cfg(windows)]
+        {
+            Some(10047)
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            windows
+        )))]
+        {
+            None
+        }
+    };
+
+    fn shutdown_ipv6(result: Result<HttpServer, ServerError>) {
+        match result {
+            Ok(mut ipv6) => ipv6.shutdown(),
+            Err(error) => assert!(
+                matches!(error, ServerError::Bind(ref e) if ipv6_unavailable(e)),
+                "unexpected IPv6 startup failure: {error}"
+            ),
+        }
+    }
+
+    #[test]
+    fn ipv6_skip_is_limited_to_unsupported_address_families() {
+        shutdown_ipv6(Err(ServerError::Bind(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "synthetic unsupported family",
+        ))));
+        assert!(
+            FAMILY_UNAVAILABLE_CODE
+                .is_none_or(|code| { ipv6_unavailable(&io::Error::from_raw_os_error(code)) })
+        );
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::AddrNotAvailable,
+            io::ErrorKind::Other,
         ] {
-            if let Ok(mut server) =
-                HttpServer::start(addr, Arc::new(service()), HttpLimits::default())
-            {
-                server.shutdown();
-            }
+            assert!(!ipv6_unavailable(&io::Error::new(
+                kind,
+                "synthetic non-family error"
+            )));
         }
     }
 
@@ -771,10 +1046,13 @@ mod tests {
     fn malformed_headers_and_connection_tokens() {
         for bytes in [
             b"GET / HTTP/1.1\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nTruncated".as_slice(),
             b"GET / HTTP/1.1\r\nX: \xff\r\n\r\n".as_slice(),
         ] {
             assert!(parse(bytes).is_err());
         }
+        assert!(parse(b"GET / HTTP/1.1\n\n").unwrap().keep_alive);
+        assert!(parse(b"\xff / HTTP/1.1\r\n\r\n").is_err());
         assert!(
             parse(b"GET / HTTP/1.1\r\nConnection: upgrade\r\n\r\n")
                 .unwrap()
