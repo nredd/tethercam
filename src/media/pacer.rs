@@ -401,6 +401,45 @@ mod tests {
         assert_eq!(slot_at(Duration::from_nanos(66_666_666), 15), 1);
     }
 
+    /// Check slot ordering and accounting for one concrete, reproducible input sequence.
+    fn check_slot_accounting(fps: u32, steps: &[(u64, bool)]) -> Result<(), TestCaseError> {
+        let clock = ManualClock::new();
+        let mut p = Pacer::new(fps, clock.clone()).unwrap();
+        let mut frame = 0_u32;
+        let mut last_slot: Option<u64> = None;
+        for &(advance_ms, push) in steps {
+            clock.advance(Duration::from_millis(advance_ms));
+            if push {
+                frame += 1;
+                p.push(frame);
+            }
+            if let Some(out) = p.poll() {
+                prop_assert!(last_slot.is_none_or(|l| out.slot > l));
+                prop_assert!(out.due <= clock.now());
+                last_slot = Some(out.slot);
+            }
+        }
+        let s = p.stats();
+        prop_assert!(s.duplicated <= s.emitted);
+        // Every slot up to the last emitted one was either emitted or skipped.
+        if let Some(l) = last_slot {
+            prop_assert_eq!(s.emitted + s.skipped, l + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn slot_accounting_covers_output_cardinalities() {
+        // No output, one output, then fresh/duplicate outputs with an early and a late poll.
+        for steps in [
+            &[(100, false)][..],
+            &[(0, true)][..],
+            &[(0, true), (0, true), (100, false), (350, true)][..],
+        ] {
+            check_slot_accounting(10, steps).unwrap();
+        }
+    }
+
     proptest! {
         #[test]
         fn waking_at_next_due_always_finds_a_slot(fps in 1_u32..=MAX_FPS) {
@@ -419,28 +458,7 @@ mod tests {
             fps in 1_u32..=60,
             steps in proptest::collection::vec((0_u64..400, any::<bool>()), 1..80),
         ) {
-            let clock = ManualClock::new();
-            let mut p = Pacer::new(fps, clock.clone()).unwrap();
-            let mut frame = 0_u32;
-            let mut last_slot: Option<u64> = None;
-            for (advance_ms, push) in steps {
-                clock.advance(Duration::from_millis(advance_ms));
-                if push {
-                    frame += 1;
-                    p.push(frame);
-                }
-                if let Some(out) = p.poll() {
-                    prop_assert!(last_slot.is_none_or(|l| out.slot > l));
-                    prop_assert!(out.due <= clock.now());
-                    last_slot = Some(out.slot);
-                }
-            }
-            let s = p.stats();
-            prop_assert!(s.duplicated <= s.emitted);
-            // Every slot up to the last emitted one was either emitted or skipped.
-            if let Some(l) = last_slot {
-                prop_assert_eq!(s.emitted + s.skipped, l + 1);
-            }
+            check_slot_accounting(fps, &steps)?;
         }
     }
 }
