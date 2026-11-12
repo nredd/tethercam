@@ -35,8 +35,8 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 
 | Module | Responsibility |
 |---|---|
-| `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, the session and transaction state machine. No I/O |
-| `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb). `sim`: an in-memory simulated camera used by every test |
+| `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, the session and transaction engine (`ptp::session`, generic over `Transport`: it does no I/O itself, `CloseSession` on every exit path, clear-halt then reset recovery) |
+| `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery; generic, not object-safe, so no boxed future per transfer). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb). `sim`: an in-memory simulated camera used by every test |
 | `sony` | Sony SDIO extension: connect handshake, extended device info, property table, set-property and control operations, live-view fetch, still capture and download, capability detection, model quirks |
 | `media` | Live-view frame source, constant-frame-rate pacing, JPEG decode, `Encoder` trait with a pure-Rust software H.264 backend. Hardware encoders are optional features |
 | `rtp` | RTP packetizers: H.264 (RFC 6184) and JPEG (RFC 2435). Frames in, packets out into a caller-owned reusable `PacketPool` (no per-packet allocation once warm). No I/O: `rtsp` sends what the pool holds |

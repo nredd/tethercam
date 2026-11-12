@@ -14,6 +14,7 @@ mod codes;
 mod container;
 mod dataset;
 mod datatype;
+pub mod session;
 
 pub use codec::{CodecError, MAX_STRING_UNITS, Reader, Writer};
 pub use codes::{DevicePropCode, EventCode, OperationCode, ResponseCode};
