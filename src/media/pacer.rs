@@ -69,16 +69,22 @@ pub struct Paced<'a, F> {
     pub fresh: bool,
 }
 
+/// The first frame establishes the epoch and every push retains one latest frame.
+#[derive(Debug)]
+struct Latest<F> {
+    start: Duration,
+    frame: F,
+}
+
 /// Turns irregular input frames into a fixed-rate sequence. See the [module docs](self).
 #[derive(Debug)]
 pub struct Pacer<F, C> {
     clock: C,
     fps: u32,
-    /// Clock reading at the first push; slot 0 is due then.
-    start: Option<Duration>,
+    /// First push establishes the epoch and the first frame together.
+    latest: Option<Latest<F>>,
     /// The next slot to emit.
     next_slot: u64,
-    latest: Option<F>,
     /// `latest` has not been emitted yet.
     fresh: bool,
     stats: PacerStats,
@@ -96,9 +102,8 @@ impl<F, C: Clock> Pacer<F, C> {
         Ok(Self {
             clock,
             fps,
-            start: None,
-            next_slot: 0,
             latest: None,
+            next_slot: 0,
             fresh: false,
             stats: PacerStats::default(),
         })
@@ -110,20 +115,29 @@ impl<F, C: Clock> Pacer<F, C> {
     /// frame was never emitted it counts as an overrun drop in [`PacerStats::dropped`]; a
     /// replaced frame that was already emitted is returned too but is not a drop.
     pub fn push(&mut self, frame: F) -> Option<F> {
-        if self.start.is_none() {
-            self.start = Some(self.clock.now());
-        }
+        let previous = if let Some(latest) = &mut self.latest {
+            Some(std::mem::replace(&mut latest.frame, frame))
+        } else {
+            self.latest = Some(Latest {
+                start: self.clock.now(),
+                frame,
+            });
+            None
+        };
         if std::mem::replace(&mut self.fresh, true) {
             self.stats.dropped += 1;
         }
-        self.latest.replace(frame)
+        previous
     }
 
     /// When the next slot is due, or `None` before the first frame.
     #[must_use]
     pub fn next_due(&self) -> Option<Duration> {
-        self.start
-            .map(|start| start.saturating_add(slot_offset(self.next_slot, self.fps)))
+        self.latest.as_ref().map(|latest| {
+            latest
+                .start
+                .saturating_add(slot_offset(self.next_slot, self.fps))
+        })
     }
 
     /// How long until the next slot is due: zero if it already is, `None` before the first frame.
@@ -138,7 +152,8 @@ impl<F, C: Clock> Pacer<F, C> {
     /// Returns `None` before the first frame and while the next slot is still in the future.
     /// Call again after the returned [`Paced`] is dropped; at most one slot is emitted per call.
     pub fn poll(&mut self) -> Option<Paced<'_, F>> {
-        let start = self.start?;
+        let latest = self.latest.as_ref()?;
+        let start = latest.start;
         let elapsed = self.clock.now().saturating_sub(start);
         let current = slot_at(elapsed, self.fps);
         if current < self.next_slot {
@@ -153,9 +168,8 @@ impl<F, C: Clock> Pacer<F, C> {
         if !fresh {
             self.stats.duplicated += 1;
         }
-        let frame = self.latest.as_ref()?;
         Some(Paced {
-            frame,
+            frame: &latest.frame,
             slot,
             due: start.saturating_add(slot_offset(slot, self.fps)),
             fresh,
@@ -218,6 +232,13 @@ mod tests {
     }
 
     #[test]
+    fn configured_rate_and_saturated_slot() {
+        let (p, _) = pacer(10);
+        assert_eq!(p.fps(), 10);
+        assert_eq!(slot_at(Duration::MAX, 10), u64::MAX);
+    }
+
+    #[test]
     fn rejects_bad_rates() {
         for fps in [0, MAX_FPS + 1] {
             assert_eq!(
@@ -273,9 +294,7 @@ mod tests {
         for _ in 0..200 {
             let next_arrival = pending.peek().map(|a| a.0);
             let next_slot = p.next_due();
-            let Some(at) = next_arrival.into_iter().chain(next_slot).min() else {
-                break;
-            };
+            let at = next_arrival.into_iter().chain(next_slot).min().unwrap();
             clock.advance_to(at);
             while let Some(&&(t, frame)) = pending.peek() {
                 if t > clock.now() {

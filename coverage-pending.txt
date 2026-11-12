@@ -1,11 +1,3 @@
-src/media/annexb.rs #32
-src/media/clock.rs #32
-src/media/encoder.rs #32
-src/media/frame.rs #32
-src/media/h264.rs #32
-src/media/jpeg.rs #32
-src/media/jpeg/structure.rs #32
-src/media/pacer.rs #32
 src/onvif/auth/digest.rs #29
 src/onvif/auth/wsse.rs #29
 src/onvif/device.rs #29

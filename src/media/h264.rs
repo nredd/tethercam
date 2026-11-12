@@ -43,7 +43,7 @@ impl std::fmt::Debug for SoftwareH264Encoder {
 impl Encoder for SoftwareH264Encoder {
     fn configure(config: EncoderConfig) -> Result<Self, EncodeError> {
         let level = config.level_idc()?;
-        let (width, height) = (to_usize(config.width)?, to_usize(config.height)?);
+        let (width, height) = (to_usize(config.width), to_usize(config.height));
 
         let mut cfg = RustyConfig::baseline(width, height);
         if config.profile == Profile::Main {
@@ -56,16 +56,16 @@ impl Encoder for SoftwareH264Encoder {
         // Precision loss is irrelevant: `fps` is at most 120.
         cfg.framerate = f32::from(u16::try_from(config.fps).unwrap_or(u16::MAX));
 
-        let sps = parameter_set(&Sps::from_config(&cfg).to_nal().to_annex_b(), NAL_SPS)?;
-        let pps = parameter_set(&Pps::from_config(&cfg).to_nal().to_annex_b(), NAL_PPS)?;
-        let inner = RustyEncoder::new(cfg).map_err(|e| EncodeError::Backend(e.to_string()))?;
-        let scratch = vec![0; width * height * 3 / 2 + OUTPUT_SLACK];
-        Ok(Self {
-            config,
-            inner,
-            sps,
-            pps,
-            scratch,
+        parameter_set(&Sps::from_config(&cfg).to_nal().to_annex_b(), NAL_SPS).and_then(|sps| {
+            parameter_set(&Pps::from_config(&cfg).to_nal().to_annex_b(), NAL_PPS).and_then(|pps| {
+                map_backend(RustyEncoder::new(cfg)).map(|inner| Self {
+                    config,
+                    inner,
+                    sps,
+                    pps,
+                    scratch: vec![0; width * height * 3 / 2 + OUTPUT_SLACK],
+                })
+            })
         })
     }
 
@@ -97,35 +97,45 @@ impl Encoder for SoftwareH264Encoder {
                 actual_height: frame.height(),
             });
         }
-        let planes = YuvPlanes::new(
-            to_usize(frame.width())?,
-            to_usize(frame.height())?,
-            frame.y(),
-            frame.u(),
-            frame.v(),
-            to_usize(frame.stride_y())?,
-            to_usize(frame.stride_c())?,
+        required(
+            YuvPlanes::new(
+                to_usize(frame.width()),
+                to_usize(frame.height()),
+                frame.y(),
+                frame.u(),
+                frame.v(),
+                to_usize(frame.stride_y()),
+                to_usize(frame.stride_c()),
+            ),
+            "frame planes rejected by backend",
         )
-        .ok_or_else(|| EncodeError::Backend("frame planes rejected by backend".into()))?;
-
-        let len = self
-            .inner
-            .encode_into(&planes, &mut self.scratch)
-            .map_err(|e| EncodeError::Backend(e.to_string()))?;
-        let access_unit = self
-            .scratch
-            .get(..len)
-            .filter(|au| !au.is_empty())
-            .ok_or_else(|| EncodeError::Backend("backend produced no access unit".into()))?;
-        out.extend_from_slice(access_unit);
-        Ok(EncodedFrame {
-            keyframe: contains_idr(out),
+        .and_then(|planes| map_backend(self.inner.encode_into(&planes, &mut self.scratch)))
+        .and_then(|len| {
+            required(
+                self.scratch.get(..len).filter(|au| !au.is_empty()),
+                "backend produced no access unit",
+            )
+        })
+        .map(|access_unit| {
+            out.extend_from_slice(access_unit);
+            EncodedFrame {
+                keyframe: contains_idr(out),
+            }
         })
     }
 }
 
-fn to_usize(value: u32) -> Result<usize, EncodeError> {
-    usize::try_from(value).map_err(|_| EncodeError::Backend(format!("'{value}' exceeds usize")))
+// Every supported Rust target has a usize at least 32 bits wide.
+fn to_usize(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn map_backend<T>(result: Result<T, rusty_h264_encoder::EncodeError>) -> Result<T, EncodeError> {
+    result.map_err(|error| EncodeError::Backend(error.to_string()))
+}
+
+fn required<T>(value: Option<T>, message: &str) -> Result<T, EncodeError> {
+    value.ok_or_else(|| EncodeError::Backend(message.into()))
 }
 
 /// The single NAL unit of type `expected` in an Annex B serialization of one parameter set.
@@ -134,4 +144,51 @@ fn parameter_set(annex_b: &[u8], expected: u8) -> Result<Vec<u8>, EncodeError> {
         .find(|nal| nal_unit_type(nal) == Some(expected))
         .map(<[u8]>::to_vec)
         .ok_or_else(|| EncodeError::Backend(format!("backend emitted no NAL of type '{expected}'")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_and_debug_are_exposed() {
+        let config = EncoderConfig {
+            width: 16,
+            height: 16,
+            fps: 15,
+            bitrate_bps: 100_000,
+            keyframe_interval: 2,
+            profile: Profile::Baseline,
+        };
+        let encoder = SoftwareH264Encoder::configure(config).unwrap();
+        assert_eq!(encoder.config(), &config);
+        assert!(format!("{encoder:?}").contains("SoftwareH264Encoder"));
+    }
+
+    #[test]
+    fn missing_parameter_set_is_an_error() {
+        assert_eq!(
+            parameter_set(&[0, 0, 1, 0x68], NAL_SPS),
+            Err(EncodeError::Backend(
+                "backend emitted no NAL of type '7'".into()
+            ))
+        );
+        assert_eq!(
+            required::<&[u8]>(None, "missing"),
+            Err(EncodeError::Backend("missing".into()))
+        );
+        assert_eq!(
+            required::<YuvPlanes<'_>>(None, "missing").err(),
+            Some(EncodeError::Backend("missing".into()))
+        );
+        let err = rusty_h264_encoder::EncodeError::FrameMismatch;
+        assert_eq!(
+            map_backend::<usize>(Err(err.clone())),
+            Err(EncodeError::Backend(err.to_string()))
+        );
+        assert_eq!(
+            map_backend::<RustyEncoder>(Err(err.clone())).err(),
+            Some(EncodeError::Backend(err.to_string()))
+        );
+    }
 }

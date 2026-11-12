@@ -101,6 +101,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn start_code_search_past_end_returns_none() {
+        assert_eq!(find_start_code(&[], 1), None);
+    }
+
+    #[test]
     fn splits_three_and_four_byte_start_codes() {
         let stream = [
             0, 0, 0, 1, 0x67, 1, 2, // SPS

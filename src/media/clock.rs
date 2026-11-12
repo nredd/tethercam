@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn system_clock_is_monotonic() {
-        let clock = SystemClock::new();
+        let clock = SystemClock::default();
         let a = clock.now();
         let b = clock.now();
         assert!(b >= a);

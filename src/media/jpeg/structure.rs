@@ -128,6 +128,10 @@ mod tests {
         assert_eq!(validate(&[]), Err(StructureError::NoSoi));
         assert_eq!(validate(&[0xFF, 0xD8]), Err(StructureError::Truncated(2)));
         assert_eq!(
+            validate(&[0xFF, 0xD8, 0xFF]),
+            Err(StructureError::Truncated(3))
+        );
+        assert_eq!(
             validate(&[0xFF, 0xD8, 0x12]),
             Err(StructureError::BadMarker {
                 at: 2,
@@ -150,6 +154,10 @@ mod tests {
             Err(StructureError::Truncated(7))
         );
         assert_eq!(validate(&[0xFF, 0xD8, 0xFF, 0xD9]), Ok(()));
+        assert_eq!(
+            validate(&[0xFF, 0xD8, 0xFF, 0xFF, 0x01, 0xFF, 0xD9]),
+            Ok(())
+        );
     }
 
     #[test]

@@ -120,38 +120,39 @@ impl JpegDecoder {
             decoder.set_options(options.jpeg_set_out_colorspace(ColorSpace::Luma));
         }
 
-        let (width, height) = decoder
-            .dimensions()
-            .map(|(w, h)| {
-                (
-                    u32::try_from(w).unwrap_or(u32::MAX),
-                    u32::try_from(h).unwrap_or(u32::MAX),
-                )
+        required(decoder.dimensions(), "no frame header").and_then(|(w, h)| {
+            let width = u32::try_from(w).unwrap_or(u32::MAX);
+            let height = u32::try_from(h).unwrap_or(u32::MAX);
+            if u64::from(width) * u64::from(height) > self.max_pixels {
+                return Err(JpegError::TooLarge {
+                    width,
+                    height,
+                    max_pixels: self.max_pixels,
+                });
+            }
+            required(decoder.output_buffer_size(), "no output size").and_then(|needed| {
+                self.scratch.resize(needed, 0);
+                decoder
+                    .decode_into(&mut self.scratch)
+                    .map_err(|e| malformed(&e))
+                    .and_then(|()| {
+                        out.resize(width, height)
+                            .map_err(JpegError::from)
+                            .map(|()| {
+                                if gray {
+                                    pack_gray(&self.scratch, out);
+                                } else {
+                                    pack_i420(&self.scratch, out);
+                                }
+                            })
+                    })
             })
-            .ok_or_else(|| JpegError::Malformed("no frame header".into()))?;
-        if u64::from(width) * u64::from(height) > self.max_pixels {
-            return Err(JpegError::TooLarge {
-                width,
-                height,
-                max_pixels: self.max_pixels,
-            });
-        }
-        let needed = decoder
-            .output_buffer_size()
-            .ok_or_else(|| JpegError::Malformed("no output size".into()))?;
-        self.scratch.resize(needed, 0);
-        decoder
-            .decode_into(&mut self.scratch)
-            .map_err(|e| malformed(&e))?;
-
-        out.resize(width, height)?;
-        if gray {
-            pack_gray(&self.scratch, out);
-        } else {
-            pack_i420(&self.scratch, out);
-        }
-        Ok(())
+        })
     }
+}
+
+fn required<T>(value: Option<T>, message: &str) -> Result<T, JpegError> {
+    value.ok_or_else(|| JpegError::Malformed(message.into()))
 }
 
 fn malformed(e: &zune_jpeg::errors::DecodeErrors) -> JpegError {
@@ -419,17 +420,38 @@ mod tests {
     }
 
     #[test]
+    fn decoder_default_and_structurally_valid_invalid_jpegs() {
+        let mut frame = I420Frame::new(2, 2).unwrap();
+        let mut decoder = JpegDecoder::default();
+        assert!(
+            decoder
+                .decode_into(&[0xff, 0xd8, 0xff, 0xd9], &mut frame)
+                .is_err()
+        );
+        assert_eq!(
+            required::<usize>(None, "missing"),
+            Err(JpegError::Malformed("missing".into()))
+        );
+        assert_eq!(
+            required::<(usize, usize)>(None, "missing"),
+            Err(JpegError::Malformed("missing".into()))
+        );
+        pack_i420(&[], &mut frame);
+        assert_eq!(declared_size(&QUADRANTS_420), Some((32, 32)));
+        assert_eq!(declared_size(&[]), None);
+        assert_eq!(declared_size(&[0xff, 0xc0]), None);
+    }
+
+    #[test]
     fn rejects_truncated_and_non_jpeg_input() {
         let mut frame = I420Frame::new(2, 2).unwrap();
         let mut decoder = JpegDecoder::new();
-        assert!(matches!(
-            decoder.decode_into(&[], &mut frame),
-            Err(JpegError::Malformed(_))
-        ));
-        assert!(matches!(
-            decoder.decode_into(b"not a jpeg at all", &mut frame),
-            Err(JpegError::Malformed(_))
-        ));
+        assert!(decoder.decode_into(&[], &mut frame).is_err());
+        assert!(
+            decoder
+                .decode_into(b"not a jpeg at all", &mut frame)
+                .is_err()
+        );
         let cut = QUADRANTS_420.len() / 2;
         assert!(
             decoder
@@ -478,11 +500,7 @@ mod tests {
             end - 8,
         ] {
             let result = JpegDecoder::new().decode_into(&QUADRANTS_420[..cut], &mut frame);
-            assert!(
-                matches!(result, Err(JpegError::Malformed(_))),
-                "cut at {cut} of {} decoded: {result:?}",
-                QUADRANTS_420.len()
-            );
+            assert!(result.is_err(), "cut at {cut} decoded: {result:?}");
         }
     }
 
@@ -515,11 +533,25 @@ mod tests {
                     JpegDecoder::new()
                         .decode_into(&jpeg[..cut], &mut frame)
                         .is_err(),
-                    "{sampling:?} cut at {cut} of {}",
-                    jpeg.len()
+                    "{sampling:?} cut at {cut}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn malformed_entropy_is_rejected_by_decoder() {
+        let start = scan_start();
+        let mut data = QUADRANTS_420.to_vec();
+        let end = data.len() - 2;
+        data[start..end].fill(0xff);
+        // Stuff FF bytes so the marker validator accepts the scan.
+        for byte in data[start..end].iter_mut().skip(1).step_by(2) {
+            *byte = 0;
+        }
+        assert_eq!(structure::validate(&data), Ok(()));
+        let mut frame = I420Frame::new(2, 2).unwrap();
+        assert!(JpegDecoder::new().decode_into(&data, &mut frame).is_err());
     }
 
     #[test]

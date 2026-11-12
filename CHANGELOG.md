@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - Reject fully covered stale entries in `coverage-pending.txt` during `make coverage`
+- Deterministic coverage of the media pipeline, removing its files from `coverage-pending.txt`
 
 - Deterministic configuration failure tests and full coverage for `src/config.rs`
 - Coverage gate: `make coverage` (part of `make all`) and a `Coverage` workflow require 100% line, function and region coverage of `src/` via `cargo-llvm-cov`; `coverage-pending.txt` lists the files exempt during the transition and may only shrink

@@ -259,9 +259,13 @@ fn plane_row(plane: &[u8], stride: u32, width: u32, row: u32, rows: u32) -> Opti
     if row >= rows {
         return None;
     }
-    let start = usize::try_from(u64::from(row) * u64::from(stride)).ok()?;
-    let end = start.checked_add(usize::try_from(width).ok()?)?;
-    plane.get(start..end)
+    // Both operands are u32 and `row < rows`, so this sum fits in u64.
+    let start = u64::from(row) * u64::from(stride);
+    let end = start + u64::from(width);
+    usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| plane.get(start..end))
 }
 
 #[cfg(test)]
@@ -338,6 +342,18 @@ mod tests {
         assert_eq!(frame.y_row(4), None);
         assert_eq!(frame.u_row(1).map(<[u8]>::len), Some(3));
         assert_eq!(frame.v_row(2), None);
+    }
+
+    #[test]
+    fn oversized_chroma_stride_is_rejected() {
+        let mut frame = I420Frame::new(2, 2).unwrap();
+        assert_eq!(
+            frame.resize_with_strides(2, 4, 2, u32::MAX),
+            Err(FrameError::PlaneTooLarge {
+                stride: u32::MAX,
+                rows: 2
+            })
+        );
     }
 
     #[test]

@@ -265,6 +265,20 @@ mod tests {
     }
 
     #[test]
+    fn level_constructor_preserves_fields() {
+        let level = Level::new(10, 20, 30, 40);
+        assert_eq!(
+            (
+                level.idc,
+                level.max_mb_rate,
+                level.max_frame_mbs,
+                level.max_bitrate_bps
+            ),
+            (10, 20, 30, 40)
+        );
+    }
+
+    #[test]
     fn live_view_target_needs_level_3_1() {
         // 64 x 43 = 2752 MBs exceeds level 3.0's 1620; 41280 MB/s fits level 3.1.
         assert_eq!(EncoderConfig::live_view().level_idc(), Ok(31));
@@ -289,10 +303,12 @@ mod tests {
                 height: 680
             })
         );
-        assert!(matches!(
-            config(8, 680, 15, 1).level_idc(),
-            Err(EncodeError::InvalidDimensions { .. })
-        ));
+        for (width, height) in [(8, 680), (680, 8), (680, 1023)] {
+            assert_eq!(
+                config(width, height, 15, 1).level_idc(),
+                Err(EncodeError::InvalidDimensions { width, height })
+            );
+        }
         assert_eq!(
             config(640, 480, 0, 1).level_idc(),
             Err(EncodeError::InvalidFrameRate(0))
@@ -312,20 +328,27 @@ mod tests {
 
     #[test]
     fn impossible_streams_exceed_every_level() {
-        assert!(matches!(
-            config(16_384, 16_384, 30, 1_000_000).level_idc(),
-            Err(EncodeError::LevelExceeded { .. })
-        ));
-        assert!(matches!(
-            config(640, 480, 15, u32::MAX).level_idc(),
-            Err(EncodeError::LevelExceeded { .. })
-        ));
+        for (width, height, fps, bitrate_bps) in
+            [(16_384, 16_384, 30, 1_000_000), (640, 480, 15, u32::MAX)]
+        {
+            assert_eq!(
+                config(width, height, fps, bitrate_bps).level_idc(),
+                Err(EncodeError::LevelExceeded {
+                    width,
+                    height,
+                    fps,
+                    bitrate_bps
+                })
+            );
+        }
     }
 
     #[test]
     fn very_wide_pictures_hit_the_side_limit() {
         // 4096 x 16: 256 MBs wide, but level 3.1 allows sqrt(3600 * 8) = 169 MBs per side.
-        let level = config(4096, 16, 1, 100_000).level_idc();
-        assert!(matches!(level, Ok(idc) if idc > 31));
+        for (width, height) in [(4096, 16), (16, 4096)] {
+            let level = config(width, height, 1, 100_000).level_idc();
+            assert!(matches!(level, Ok(idc) if idc > 31));
+        }
     }
 }
