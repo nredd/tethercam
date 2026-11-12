@@ -1,0 +1,4 @@
+# Let the logged-in user and the `plugdev` group open Sony cameras without root.
+# The 70 prefix matters: `uaccess` must be tagged before systemd's 73-seat-late.rules runs.
+# Install: sudo cp docs/70-tethercam.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="054c", MODE="0660", GROUP="plugdev", TAG+="uaccess"

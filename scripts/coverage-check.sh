@@ -7,7 +7,12 @@ report="${1:?usage: coverage-check.sh <llvm-cov.json> [source-directory]}"
 source="${2:-src}"
 logical=$(cd "$source" && pwd -L)
 physical=$(cd "$source" && pwd -P)
-jq -ers --arg logical "$logical/" --arg physical "$physical/" '
+local_usb=false
+if test "${CI+x}" != x && test ! -d /sys/devices/platform/vhci_hcd.0; then
+    local_usb=true
+    printf 'LOCAL ONLY: src/transport/usb/nusb_backend.rs is not threshold-gated without VHCI; CI always requires 100%%.\n' >&2
+fi
+jq -ers --arg logical "$logical/" --arg physical "$physical/" --argjson local_usb "$local_usb" '
     # LLVM preserves include paths such as tests/../benches/support.rs.
     def normalized_path:
         split("/") | reduce .[] as $part ([];
@@ -41,9 +46,11 @@ jq -ers --arg logical "$logical/" --arg physical "$physical/" '
     map(. as $file |
         if [.summary.lines, .summary.functions, .summary.regions] | all(metric) | not
         then error("invalid coverage metrics: " + $file.source)
+        elif ($local_usb and .source == "transport/usb/nusb_backend.rs") then .
         elif [.summary.lines, .summary.functions, .summary.regions] | all(.covered == .count) | not
         then error("incomplete source coverage: " + $file.source)
         else . end) |
+    map(select(($local_usb and .source == "transport/usb/nusb_backend.rs") | not)) |
     if [(map(.summary.lines.count) | add), (map(.summary.functions.count) | add),
         (map(.summary.regions.count) | add)] | all(. > 0) | not
     then error("source inventory contains no executable coverage") else . end |

@@ -12,6 +12,7 @@
 //! - USB Still Image Capture Device Definition 1.0, sections 5-7
 
 pub mod sim;
+pub mod usb;
 
 use std::time::Duration;
 

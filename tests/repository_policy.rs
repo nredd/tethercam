@@ -170,6 +170,51 @@ fn policy() -> Result<Value, Box<dyn Error>> {
 }
 
 #[test]
+fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<(), Box<dyn Error>> {
+    let workflows = workflows()?;
+    let coverage = &workflows
+        .iter()
+        .find(|(name, _)| name == "coverage.yml")
+        .ok_or("missing coverage")?
+        .1["jobs"]["coverage"];
+    assert_eq!(coverage["env"]["TETHERCAM_USBIP"], json!(1));
+    let steps = coverage["steps"]
+        .as_array()
+        .ok_or("missing coverage steps")?;
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["run"] == "scripts/usbip-ci.sh prepare" && step.get("if").is_none())
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["run"] == "scripts/usbip-ci.sh detach" && step["if"] == "always()")
+    );
+    let tests = &workflows
+        .iter()
+        .find(|(name, _)| name == "test.yml")
+        .ok_or("missing tests")?
+        .1["jobs"]["test"];
+    let steps = tests["steps"].as_array().ok_or("missing test steps")?;
+    assert!(steps.iter().any(|step| {
+        step["if"] == "runner.os == 'Linux'"
+            && step["run"].as_str().is_some_and(|run| {
+                run.contains("scripts/usbip-ci.sh prepare")
+                    && run.contains("TETHERCAM_USBIP=1")
+                    && run.contains("$GITHUB_ENV")
+            })
+    }));
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["run"] == "scripts/usbip-ci.sh detach"
+                && step["if"] == "always() && runner.os == 'Linux'")
+    );
+    Ok(())
+}
+
+#[test]
 fn checked_in_policy_matches_every_owned_pr_job() -> Result<(), Box<dyn Error>> {
     validate(&policy()?, &workflows()?)?;
     Ok(())
@@ -275,14 +320,18 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
 #[test]
 fn repository_only_test_is_excluded_from_publication() -> Result<(), Box<dyn Error>> {
     let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))?;
-    assert!(
-        manifest["package"]["exclude"]
-            .as_array()
-            .is_some_and(|paths| paths
-                .iter()
-                .any(|path| path.as_str() == Some("tests/repository_policy.rs"))),
-        "repository-only tests must not ship without their excluded inputs"
-    );
+    for required in [
+        "tests/repository_policy.rs",
+        "tests/usb_emulated.rs",
+        "tests/usbip/",
+    ] {
+        assert!(
+            manifest["package"]["exclude"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|path| path.as_str() == Some(required))),
+            "repository-only test '{required}' must not ship without its excluded inputs"
+        );
+    }
     Ok(())
 }
 

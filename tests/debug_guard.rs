@@ -1,4 +1,8 @@
 //! Guard against deriving `Debug` directly on raw credential fields and header maps.
+//!
+//! References:
+//! - <https://docs.rs/syn/2/syn/visit/trait.Visit.html>
+//! - <https://github.com/nredd/tethercam/blob/main/docs/architecture.md#security-model>
 
 use std::fs;
 use std::path::Path;

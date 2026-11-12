@@ -38,7 +38,13 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-nextest
+      - if: runner.os == 'Linux'
+        run: |
+          scripts/usbip-ci.sh prepare
+          echo 'TETHERCAM_USBIP=1' >> "$GITHUB_ENV"
       - run: make test
+      - if: always() && runner.os == 'Linux'
+        run: scripts/usbip-ci.sh detach
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15

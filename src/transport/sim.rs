@@ -354,6 +354,32 @@ impl SimCamera {
         self.session_open
     }
 
+    /// Cancel the active bulk transaction without ending its PTP session.
+    ///
+    /// Discards partial host data and queued data/response transfers for the current
+    /// transaction. A mismatched id does nothing. An incomplete command consumes its id
+    /// when cancelled, just as an accepted command does; interrupt events are independent.
+    #[must_use]
+    pub fn cancel_transaction(&mut self, transaction_id: u32) -> bool {
+        let pending = self.pending.as_ref().map(|data| data.transaction_id);
+        let queued = self
+            .commands
+            .last()
+            .map(|command| command.transaction_id)
+            .filter(|_| !self.bulk_in.is_empty());
+        let partial = (!self.host_buffer.is_empty()).then_some(self.expected_transaction);
+        if pending.or(queued).or(partial) != Some(transaction_id) {
+            return false;
+        }
+        self.pending = None;
+        self.host_buffer.clear();
+        self.bulk_in.clear();
+        if self.session_open && self.expected_transaction == transaction_id {
+            self.expected_transaction = next_transaction(transaction_id);
+        }
+        true
+    }
+
     /// Whether the camera is wedged and needs a reset.
     #[must_use]
     pub fn is_wedged(&self) -> bool {
@@ -560,10 +586,7 @@ impl SimCamera {
         };
         if rejection.is_none() && self.session_open && op != code::OPEN_SESSION {
             // An accepted command consumes its id whatever the response code is.
-            self.expected_transaction = match transaction_id.checked_add(1) {
-                Some(next) if next != u32::MAX => next,
-                _ => 1,
-            };
+            self.expected_transaction = next_transaction(transaction_id);
         }
         let reply = match rejection {
             Some(response) => Reply::with_code(response),
@@ -667,6 +690,14 @@ impl SimCamera {
         }
         self.bulk_in.push_back(response);
         Ok(())
+    }
+}
+
+/// Advance an accepted or cancelled transaction, skipping the reserved id.
+fn next_transaction(transaction_id: u32) -> u32 {
+    match transaction_id.checked_add(1) {
+        Some(next) if next != u32::MAX => next,
+        _ => 1,
     }
 }
 
@@ -819,6 +850,45 @@ mod tests {
         let n = camera.bulk_in(&mut buf, T).await?;
         buf.truncate(n);
         Ok(buf)
+    }
+
+    #[tokio::test]
+    async fn cancelling_discards_only_the_active_transaction_and_keeps_the_session() {
+        let mut camera = SimCamera::new().with_operation(0x9991, Reply::accepting_data());
+        assert!(!camera.cancel_transaction(0));
+        camera.push_raw_bulk_in(vec![1]);
+        assert!(!camera.cancel_transaction(0));
+        read(&mut camera, 64).await.unwrap();
+        send(&mut camera, code::OPEN_SESSION, 0, &[1]).await;
+        assert!(!camera.cancel_transaction(99));
+        assert!(camera.cancel_transaction(0));
+        assert!(camera.session_open());
+        send(&mut camera, 0x9991, 1, &[]).await;
+        assert!(!camera.cancel_transaction(99));
+        let data = ContainerHeader::for_payload(
+            ContainerKind::Data,
+            0x9991,
+            1,
+            PayloadLen::new(10, 10).unwrap(),
+        )
+        .encode();
+        camera.bulk_out(&data, T).await.unwrap();
+        assert!(camera.cancel_transaction(1));
+        assert_eq!(read(&mut camera, 64).await, Err(TransportError::Timeout));
+        send(&mut camera, code::GET_DEVICE_INFO, 2, &[]).await;
+        assert!(!camera.cancel_transaction(1));
+        assert!(camera.cancel_transaction(2));
+        let partial = Container::command(0x9991, 3, &[]).unwrap();
+        camera.bulk_out(&partial[..8], T).await.unwrap();
+        assert!(!camera.cancel_transaction(4));
+        assert!(camera.cancel_transaction(3));
+        send(&mut camera, code::GET_DEVICE_INFO, 4, &[]).await;
+        read(&mut camera, 64).await.unwrap();
+        read(&mut camera, 64).await.unwrap();
+        assert!(!camera.cancel_transaction(4));
+        send(&mut camera, code::CLOSE_SESSION, 5, &[]).await;
+        assert!(camera.cancel_transaction(5));
+        assert!(!camera.session_open());
     }
 
     #[tokio::test]

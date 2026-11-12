@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Reject unrepresentable USB reset deadlines before port I/O instead of panicking
+
 - Exercise pacer slot-accounting invariants deterministically even with one property-test case
 - Consume a completed Sony capture property refresh even when it finishes after the wait deadline
 - Keep RTSP benchmark subscribers alive across bursts so repeated Criterion iterations cannot lose a packet to a stale pump and hang
@@ -29,6 +31,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Loopback-only, pure-Rust USB/IP Sony simulator for real `nusb` Linux backend tests on hosted x64 and arm64 runners, with targeted synthetic-device permissions, stateful cancellation and an export-lifetime memory admission budget
+
 - Deterministic coverage of RTSP connection failures, completing RTSP's coverage transition
 - Deterministic scripted RTSP media source for tests and examples
 - Reproducible default-branch ruleset payload and workflow inventory tests, with native all-targets/all-features CI checks and staged administrator activation docs
@@ -40,6 +44,7 @@ All notable changes to this project are documented here. The format follows
 - Deterministic configuration failure tests and full coverage for `src/config.rs`
 - Configurable outgoing and simulated PTP container payload limits, checked before encoding
 - Sony SDIO extension driver (`tethercam::sony`): connect handshake with protocol-generation negotiation (2.00 and 3.00), property table with change tracking, property writes and shutter controls, live-view frames with the Sony header stripped, still capture and download, battery and power source, protocol fallback from 3.00 to 2.00 (including after a stalled request), deadline-based waits with a short event-poll timeout, capability detection and a per-model quirks registry. `transport::sim::sony` teaches the simulated camera the extension for both generations, `transport::sim::Responder` lets any extension keep state. Adds the `sony_live_view` benchmark and an `#[ignore]`d hardware soak test
+- USB transport on `nusb` (`tethercam::transport::usb`): Sony still-image interface selection from descriptor bytes, connection-mode detection (PC Remote / MTP / Mass Storage) with a "set USB Connection to PC Remote" error, bulk and interrupt transfers with timeouts and cancellation, clear-halt, class Device Reset and Get Device Status, hot-plug watching, udev rule and setup notes in `docs/usb.md`, and an `#[ignore]`d hardware test
 - Coverage gate: `make coverage` (part of `make all`) and a `Coverage` workflow require 100% line, function and region coverage of `src/` via `cargo-llvm-cov`; `coverage-pending.txt` lists the files exempt during the transition and may only shrink
 - `tethercam::cli::run`, the testable core of the binary, with an integration test that runs the built binary
 - PTP data types, `DeviceInfo` / `ObjectInfo` / `DevicePropDesc` datasets and operation, response, event and property code tables (`tethercam::ptp`)
