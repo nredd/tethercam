@@ -1,4 +1,7 @@
 //! Driver tests against the simulated Sony body, for both protocol generations.
+//!
+//! References:
+//! - Sony SDIO behavior documented in `docs/architecture.md`.
 
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,35 @@ use crate::transport::sim::sony::{
 };
 use crate::transport::sim::{Fault, SimCamera};
 use crate::transport::{Endpoint, TransportError};
+
+/// One body for both successful handshakes and failures that never invoke the body.
+async fn connected(_: &mut SonyCamera<'_, SimCamera>) -> Result<(), SonyError> {
+    Ok(())
+}
+
+/// Share the frame operation across successful handshakes and early disconnects.
+async fn frame(camera: &mut SonyCamera<'_, SimCamera>) -> Result<Vec<u8>, SonyError> {
+    camera.fetch_live_view_frame().await
+}
+
+/// Recognize codec failures without an unreachable match arm at every assertion site.
+fn is_codec_error(error: &SonyError) -> bool {
+    matches!(error, SonyError::Codec(_))
+}
+
+/// Extract the retry count while retaining a testable unexpected-variant result.
+fn unavailable_attempts(error: &SonyError) -> Option<u32> {
+    match error {
+        SonyError::ExtInfoUnavailable { attempts } => Some(*attempts),
+        _ => None,
+    }
+}
+
+#[test]
+fn error_assertion_helpers_reject_unexpected_variants() {
+    assert!(!is_codec_error(&SonyError::LiveViewNotReady));
+    assert_eq!(unavailable_attempts(&SonyError::LiveViewNotReady), None);
+}
 
 fn session(sim: SonySimConfig) -> Session<SimCamera> {
     Session::new(sony_camera(sim), SessionConfig::default())
@@ -143,7 +175,7 @@ async fn ext_info_is_retried_while_busy_or_empty() {
         ..body(200)
     };
     let mut session = session(sim);
-    SonyCamera::run(&mut session, fast(), async |_| Ok(()))
+    SonyCamera::run(&mut session, fast(), connected)
         .await
         .unwrap();
     assert_eq!(codes(&session).iter().filter(|c| **c == 0x9202).count(), 5);
@@ -162,7 +194,7 @@ async fn ext_info_gives_up_and_the_session_still_closes() {
         ext_info_attempts: 3,
         ..fast()
     };
-    let result = SonyCamera::run(&mut session, config, async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, config, connected).await;
     assert_eq!(result, Err(SonyError::ExtInfoUnavailable { attempts: 3 }));
     assert_eq!(codes(&session).iter().filter(|c| **c == 0x9202).count(), 3);
     assert_closed(&session);
@@ -179,7 +211,7 @@ async fn ext_info_transport_failure_is_not_retried() {
         protocol: Protocol::V200,
         ..fast()
     };
-    let result = SonyCamera::run(&mut session, config, async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, config, connected).await;
     assert_eq!(
         result,
         Err(SonyError::Session(SessionError::Transport(
@@ -197,7 +229,7 @@ async fn a_body_outside_pc_remote_mode_is_refused() {
         ..body(200)
     };
     let mut session = session(sim);
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
     assert_eq!(result, Err(SonyError::SdioUnsupported));
     assert_eq!(codes(&session), [0x1002, 0x1001, 0x1003]);
     assert_closed(&session);
@@ -206,7 +238,7 @@ async fn a_body_outside_pc_remote_mode_is_refused() {
 #[tokio::test]
 async fn an_undocumented_old_protocol_is_refused() {
     let mut session = session(body(150));
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
     assert_eq!(result, Err(SonyError::UnsupportedProtocol(150)));
     assert_closed(&session);
 }
@@ -229,22 +261,23 @@ async fn set_property_round_trips_through_the_change_event() {
         SonyCamera::run(&mut session, fast(), async |camera| {
             let aspect = DevicePropCode(0xD211);
             assert_eq!(camera.properties().integer(aspect), Some(0));
-            camera.refresh_properties().await?;
+            camera.refresh_properties().await.unwrap();
             assert_eq!(camera.properties().integer(aspect), Some(0));
             // The handshake wrote priority mode, and the camera confirmed it with an event.
             assert_eq!(
-                camera.pump_events().await?,
+                camera.pump_events().await.unwrap(),
                 [SonyEvent::PropertyChanged(prop::PRIORITY_MODE)]
             );
-            camera.set_property(aspect, &Value::UInt8(1)).await?;
-            let events = camera.pump_events().await?;
+            camera.set_property(aspect, &Value::UInt8(1)).await.unwrap();
+            let events = camera.pump_events().await.unwrap();
             assert_eq!(events, [SonyEvent::PropertyChanged(aspect)]);
             assert_eq!(camera.properties().integer(aspect), Some(1));
             camera
                 .set_property(DevicePropCode(0xD1CF), &Value::String("tethercam".into()))
-                .await?;
-            assert_eq!(camera.pump_events().await?.len(), 1);
-            assert_eq!(camera.pump_events().await?, Vec::<SonyEvent>::new());
+                .await
+                .unwrap();
+            assert_eq!(camera.pump_events().await.unwrap().len(), 1);
+            assert_eq!(camera.pump_events().await.unwrap(), Vec::<SonyEvent>::new());
             Ok(())
         })
         .await
@@ -279,9 +312,11 @@ async fn set_property_validates_before_sending() {
             })
         );
         let too_long = Value::String("x".repeat(300));
-        assert!(matches!(
-            camera.set_property(DevicePropCode(0xD1CF), &too_long).await,
-            Err(SonyError::Codec(_))
+        assert!(is_codec_error(
+            &camera
+                .set_property(DevicePropCode(0xD1CF), &too_long)
+                .await
+                .unwrap_err()
         ));
         Ok(())
     })
@@ -301,11 +336,11 @@ async fn control_rejects_unlisted_codes_and_unencodable_values() {
             camera.control(unknown, &Value::UInt16(2)).await,
             Err(SonyError::UnsupportedControl(unknown))
         );
-        assert!(matches!(
-            camera
+        assert!(is_codec_error(
+            &camera
                 .control(prop::SHUTTER_HALF_PRESS, &Value::String("x".repeat(300)))
-                .await,
-            Err(SonyError::Codec(_))
+                .await
+                .unwrap_err()
         ));
         Ok(())
     })
@@ -324,16 +359,13 @@ async fn live_view_waits_for_ready_then_hands_out_frames() {
         let mut session = session(sim);
         SonyCamera::run(&mut session, fast(), async |camera| {
             // Right after connecting: not ready, and property values read as zero.
-            assert_eq!(
-                camera.fetch_live_view_frame().await,
-                Err(SonyError::LiveViewNotReady)
-            );
+            assert_eq!(frame(camera).await, Err(SonyError::LiveViewNotReady));
             assert_eq!(camera.properties().integer(prop::LIVE_VIEW_STATUS), Some(0));
             assert_eq!(camera.battery().unwrap().percent, Some(0));
-            camera.wait_live_view_ready().await?;
+            camera.wait_live_view_ready().await.unwrap();
             assert_eq!(camera.properties().integer(prop::LIVE_VIEW_STATUS), Some(1));
             for _ in 0..3 {
-                assert_eq!(camera.next_live_view_frame().await?, jpeg);
+                assert_eq!(camera.next_live_view_frame().await.unwrap(), jpeg);
             }
             let battery = camera.battery().unwrap();
             assert_eq!(battery.percent, Some(80));
@@ -456,12 +488,12 @@ async fn capture_presses_waits_releases_and_downloads() {
         let still = sim.still.clone();
         let mut session = session(sim);
         SonyCamera::run(&mut session, fast(), async |camera| {
-            let image = camera.capture_still().await?;
+            let image = camera.capture_still().await.unwrap();
             assert_eq!(image.data, still);
             assert_eq!(image.info.filename, "DSC00001.JPG");
             assert_eq!(image.info.object_format, 0x3801);
             // The download cleared the camera's memory.
-            camera.refresh_properties().await?;
+            camera.refresh_properties().await.unwrap();
             assert_eq!(camera.properties().integer(prop::OBJECT_IN_MEMORY), Some(0));
             Ok(())
         })
@@ -504,7 +536,7 @@ async fn still_downloads_can_outlast_normal_transaction_timeout() {
         };
         SonyCamera::run(&mut session, config, async |camera| {
             let before = ELAPSED.get();
-            let image = camera.capture_still().await?;
+            let image = camera.capture_still().await.unwrap();
             assert_eq!(image.data, still);
             assert!(ELAPSED.get().saturating_sub(before) > Duration::from_millis(20));
             assert!(camera.session.is_open());
@@ -535,7 +567,7 @@ async fn capture_discards_a_stale_image_first() {
     let mut session = session(sim);
     SonyCamera::run(&mut session, fast(), async |camera| {
         // Values read as zero until the camera warms up, which would hide the stale image.
-        camera.wait_live_view_ready().await?;
+        camera.wait_live_view_ready().await.unwrap();
         assert!(camera.capture_still().await.is_ok());
         Ok(())
     })
@@ -620,12 +652,13 @@ async fn event_refresh_is_skipped_after_budget_expires() {
         let started = camera.session.now();
         let (events, refreshed) = camera
             .pump_events_inner(Some((started, Duration::from_millis(10))))
-            .await?;
+            .await
+            .unwrap();
         assert!(!refreshed);
         assert_eq!(events, [SonyEvent::PropertyChanged(prop::PRIORITY_MODE)]);
         assert_eq!(camera.session.transport().commands().len(), before);
         assert_eq!(camera.session.transport().reset_count(), 0);
-        camera.refresh_properties().await?;
+        camera.refresh_properties().await.unwrap();
         Ok(())
     })
     .await
@@ -642,11 +675,11 @@ async fn pumping_events_costs_at_most_the_short_poll_timeout() {
         ..fast()
     };
     SonyCamera::run(&mut session, config, async |camera| {
-        camera.wait_live_view_ready().await?;
+        camera.wait_live_view_ready().await.unwrap();
         for _ in 0..3 {
             let before = ELAPSED.get();
-            camera.next_live_view_frame().await?;
-            camera.pump_events().await?;
+            camera.next_live_view_frame().await.unwrap();
+            camera.pump_events().await.unwrap();
             assert!(ELAPSED.get().saturating_sub(before) <= Duration::from_millis(50));
         }
         Ok(())
@@ -787,7 +820,7 @@ async fn zero_wait_budgets_do_not_start_operations() {
             capture_commands.last().unwrap().code,
             op::SDIO_CONTROL_DEVICE
         );
-        camera.refresh_properties().await?;
+        camera.refresh_properties().await.unwrap();
         assert!(camera.session.is_open());
         assert_eq!(camera.session.transport().reset_count(), 0);
         Ok(())
@@ -805,7 +838,7 @@ async fn zero_wait_budgets_do_not_start_operations() {
         ..fast()
     };
     assert_eq!(
-        SonyCamera::run(&mut session, config, async |_| Ok(())).await,
+        SonyCamera::run(&mut session, config, connected).await,
         Err(SonyError::ExtInfoUnavailable { attempts: 0 })
     );
     assert_eq!(ext_info_requests(&session), Vec::<Vec<u32>>::new());
@@ -828,11 +861,11 @@ async fn started_transaction_can_finish_after_wait_budget() {
     };
     SonyCamera::run(&mut session, config, async |camera| {
         let before = ELAPSED.get();
-        camera.wait_live_view_ready().await?;
+        camera.wait_live_view_ready().await.unwrap();
         assert!(ELAPSED.get().saturating_sub(before) > Duration::from_millis(2));
         assert_eq!(camera.session.transport().reset_count(), 0);
         assert!(camera.session.is_open());
-        camera.refresh_properties().await?;
+        camera.refresh_properties().await.unwrap();
         Ok(())
     })
     .await
@@ -860,7 +893,7 @@ async fn slow_wait_transactions_preserve_the_session() {
             assert_eq!(result, Err(SonyError::LiveViewNotReady));
             assert_eq!(camera.session.transport().reset_count(), 0);
             assert!(camera.session.is_open());
-            camera.refresh_properties().await?;
+            camera.refresh_properties().await.unwrap();
             Ok(())
         })
         .await
@@ -888,7 +921,7 @@ async fn capture_consumes_property_refresh_finished_after_deadline() {
         ..fast()
     };
     SonyCamera::run(&mut session, config, async |camera| {
-        let image = camera.capture_still().await?;
+        let image = camera.capture_still().await.unwrap();
         assert_eq!(image.data, still);
         assert_eq!(camera.session.transport().reset_count(), 0);
         Ok(())
@@ -924,7 +957,7 @@ async fn capture_budget_covers_event_and_property_reads() {
             );
             assert_eq!(camera.session.transport().reset_count(), 0);
             assert!(camera.session.is_open());
-            camera.refresh_properties().await?;
+            camera.refresh_properties().await.unwrap();
             Ok(())
         })
         .await
@@ -947,10 +980,7 @@ async fn a_disconnect_mid_frame_surfaces_and_closes() {
     // property table and the priority write; the live-view data phase is read 13.
     camera.inject(Endpoint::BulkIn, 13, Fault::Disconnect);
     let mut session = Session::new(camera, SessionConfig::default());
-    let result = SonyCamera::run(&mut session, fast(), async |camera| {
-        camera.fetch_live_view_frame().await
-    })
-    .await;
+    let result = SonyCamera::run(&mut session, fast(), frame).await;
     assert_eq!(
         result,
         Err(SonyError::Session(SessionError::Transport(
@@ -964,8 +994,8 @@ async fn a_disconnect_mid_frame_surfaces_and_closes() {
 async fn a_garbage_device_info_is_an_error() {
     let camera = sony_camera(body(200)).with_device_info(vec![1, 2, 3]);
     let mut session = Session::new(camera, SessionConfig::default());
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
-    assert!(matches!(result, Err(SonyError::Codec(_))));
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
+    assert!(is_codec_error(&result.unwrap_err()));
     assert_closed(&session);
 }
 
@@ -993,8 +1023,8 @@ async fn a_truncated_property_table_is_an_error() {
         ..body(200)
     };
     let mut session = session(sim);
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
-    assert!(matches!(result, Err(SonyError::Codec(_))));
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
+    assert!(is_codec_error(&result.unwrap_err()));
     assert_closed(&session);
 }
 
@@ -1006,10 +1036,7 @@ async fn a_garbage_object_info_fails_the_capture_but_releases_the_shutter() {
     };
     let mut session = session(sim);
     SonyCamera::run(&mut session, fast(), async |camera| {
-        assert!(matches!(
-            camera.capture_still().await,
-            Err(SonyError::Codec(_))
-        ));
+        assert!(is_codec_error(&camera.capture_still().await.unwrap_err()));
         Ok(())
     })
     .await
@@ -1030,8 +1057,8 @@ async fn capture_waits_for_an_image_that_only_appears_after_release() {
         let still = sim.still.clone();
         let mut session = session(sim);
         SonyCamera::run(&mut session, fast(), async |camera| {
-            camera.wait_live_view_ready().await?;
-            let image = camera.capture_still().await?;
+            camera.wait_live_view_ready().await.unwrap();
+            let image = camera.capture_still().await.unwrap();
             assert_eq!(image.data, still);
             Ok(())
         })
@@ -1115,7 +1142,7 @@ async fn refusing_both_generations_names_both_attempts() {
         ..body(300)
     };
     let mut session = session(sim);
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
     let refusal = || {
         Box::new(SonyError::Session(SessionError::Response {
             code: 0x201D,
@@ -1160,7 +1187,7 @@ async fn starting_at_2_00_makes_a_single_attempt() {
         ..body(300)
     };
     let mut session = self::session(sim);
-    let result = SonyCamera::run(&mut session, config, async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, config, connected).await;
     assert_eq!(
         result,
         Err(SonyError::Session(SessionError::Response {
@@ -1221,8 +1248,8 @@ async fn malformed_fallback_is_not_a_refusal() {
         ..body(300)
     };
     let mut session = fake_clock_session(sim);
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
-    assert!(matches!(result, Err(SonyError::Codec(_))));
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
+    assert!(is_codec_error(&result.unwrap_err()));
     assert_eq!(ext_info_requests(&session), [[300, 1], [200, 1]]);
     assert_eq!(session.transport().reset_count(), 0);
     assert_closed(&session);
@@ -1237,7 +1264,7 @@ async fn disconnect_on_fallback_is_not_a_refusal() {
     let mut camera = sony_camera(sim);
     camera.inject(Endpoint::BulkIn, 8, Fault::Disconnect);
     let mut session = Session::new(camera, SessionConfig::default()).with_clock(fake_now);
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
     assert_eq!(
         result,
         Err(SonyError::Session(SessionError::Transport(
@@ -1252,7 +1279,7 @@ async fn a_disconnect_during_negotiation_is_not_a_refusal() {
     let mut camera = sony_camera(body(300));
     camera.inject(Endpoint::BulkIn, 7, Fault::Disconnect);
     let mut session = Session::new(camera, SessionConfig::default());
-    let result = SonyCamera::run(&mut session, fast(), async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, fast(), connected).await;
     assert_eq!(
         result,
         Err(SonyError::Session(SessionError::Transport(
@@ -1298,7 +1325,7 @@ async fn endless_empty_answers_for_both_generations_name_both_attempts() {
         ..fast()
     };
     let unavailable = || Box::new(SonyError::ExtInfoUnavailable { attempts: 2 });
-    let result = SonyCamera::run(&mut session, config, async |_| Ok(())).await;
+    let result = SonyCamera::run(&mut session, config, connected).await;
     assert_eq!(
         result,
         Err(SonyError::ProtocolRefused {
@@ -1325,10 +1352,8 @@ async fn ext_info_retries_stop_at_their_deadline() {
         poll_interval: Duration::from_millis(5),
         ..fast()
     };
-    let result = SonyCamera::run(&mut session, config, async |_| Ok(())).await;
-    let Err(SonyError::ExtInfoUnavailable { attempts }) = result else {
-        panic!("expected ExtInfoUnavailable, got {result:?}");
-    };
+    let result = SonyCamera::run(&mut session, config, connected).await;
+    let attempts = unavailable_attempts(&result.unwrap_err()).unwrap();
     assert!((1..1000).contains(&attempts), "{attempts} attempts");
     assert_closed(&session);
 }

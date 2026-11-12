@@ -57,8 +57,8 @@ make all        # the full gate: format check, clippy, tests, docs, benchmarks, 
 make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-cov)
 ```
 
-Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached.
-`make coverage` also rejects pending entries whose lines, functions and regions are fully covered; remove those entries from `coverage-pending.txt`.
+Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached. `make coverage` disables llvm-cov's implicit filename exclusions and validates exact line, function and region counts for every instrumented file under the actual `src/` root, including separately named test modules and nested test directories. Files with no executable code need no coverage; integration tests, examples, benchmarks and dependencies outside that root are not gated. Malformed reports, missing metrics and empty source inventories fail closed. `make coverage-report` writes unfiltered JSON, lcov and HTML artifacts under `coverage/`.
+
 `make bench-check` smoke-runs each case once; `make bench` records full Criterion measurements.
 The RTSP fan-out benchmark keeps subscribers alive across bursts, measuring steady-state packet
 delivery rather than subscription churn. Its shared workload also runs for 100 consecutive bursts

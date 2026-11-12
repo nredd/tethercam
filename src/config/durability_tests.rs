@@ -1,3 +1,9 @@
+//! Storage fault injection and publication durability regressions.
+//!
+//! References:
+//! - <https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist_noclobber>
+
+use super::tests::assert_variant;
 use super::{
     Config, Error, FileStorage, Storage, check_supported_permissions, config_parent,
     create_directories, default_path, sync_directory,
@@ -39,14 +45,21 @@ impl Storage for FailingStorage {
 }
 
 #[test]
-fn storage_failures_are_propagated() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn storage_failures_are_propagated() {
+    let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
-    let config = Config::generate()?;
-    assert!(matches!(
-        config.create_with_storage(&path, &mut sync_directory, false, &mut FileStorage),
-        Err(Error::Permissions)
-    ));
+    let config = Config::generate().unwrap();
+    assert_variant(
+        &config
+            .create_with_storage(&path, &mut sync_directory, false, &mut FileStorage)
+            .unwrap_err(),
+        &Error::Permissions,
+    );
+    // Successful publication also exercises every storage method's non-failing side.
+    config
+        .create_with_storage(&path, &mut sync_directory, true, &mut FailingStorage(4))
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
     for stage in 0..4 {
         assert!(
             config
@@ -55,7 +68,33 @@ fn storage_failures_are_propagated() -> Result<(), Box<dyn std::error::Error>> {
         );
         assert!(!path.exists());
     }
-    Ok(())
+}
+
+/// Validate the would-be publication even when the test deliberately avoids disk writes.
+fn created(config: &Config, _: &Path) -> Result<(), Error> {
+    config.validate()
+}
+
+#[test]
+fn first_run_success_calls_create_and_sync() {
+    let config = Config::load_or_create_with(
+        Path::new("config.toml"),
+        &mut |_| Err(Error::Io(io::ErrorKind::NotFound.into())),
+        &mut Config::generate,
+        &mut created,
+        &mut sync_directory,
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let loaded = Config::load_or_create_with(
+        Path::new("config.toml"),
+        &mut |_| Ok(config.clone()),
+        &mut Config::generate,
+        &mut created,
+        &mut sync_directory,
+    )
+    .unwrap();
+    assert_eq!(loaded.endpoint_uuid, config.endpoint_uuid);
 }
 
 #[test]
@@ -68,10 +107,10 @@ fn first_run_failures_are_propagated() {
         path,
         &mut |_| Err(missing()),
         &mut || Err(Error::Random),
-        &mut |_, _| Ok(()),
-        &mut |_| Ok(()),
+        &mut created,
+        &mut sync_directory,
     );
-    assert!(matches!(result, Err(Error::Random)));
+    assert_variant(&result.unwrap_err(), &Error::Random);
     let mut calls = 0;
     let result = Config::load_or_create_with(
         path,
@@ -85,9 +124,9 @@ fn first_run_failures_are_propagated() {
         },
         &mut Config::generate,
         &mut |_, _| Err(exists()),
-        &mut |_| Ok(()),
+        &mut sync_directory,
     );
-    assert!(matches!(result, Err(Error::Permissions)));
+    assert_variant(&result.unwrap_err(), &Error::Permissions);
     let mut calls = 0;
     let result = Config::load_or_create_with(
         path,
@@ -103,15 +142,21 @@ fn first_run_failures_are_propagated() {
         &mut |_, _| Err(exists()),
         &mut |_| Err(failure()),
     );
-    assert!(matches!(result, Err(Error::Io(_))));
+    assert_variant(
+        &result.unwrap_err(),
+        &Error::Io(io::ErrorKind::Other.into()),
+    );
     let result = Config::load_or_create_with(
         path,
         &mut |_| Config::generate(),
         &mut Config::generate,
-        &mut |_, _| Ok(()),
+        &mut created,
         &mut |_| Err(failure()),
     );
-    assert!(matches!(result, Err(Error::Io(_))));
+    assert_variant(
+        &result.unwrap_err(),
+        &Error::Io(io::ErrorKind::Other.into()),
+    );
 }
 
 #[test]
@@ -120,12 +165,12 @@ fn random_failures_are_propagated() {
         bytes.fill(0xfa);
         Ok(())
     });
-    assert!(matches!(encoded, Ok(ref value) if value == "fa"));
+    assert_eq!(encoded.unwrap(), "fa");
     let encoded = super::random_hex(1, &mut |bytes| {
         bytes.fill(0x09);
         Ok(())
     });
-    assert!(matches!(encoded, Ok(ref value) if value == "09"));
+    assert_eq!(encoded.unwrap(), "09");
     for fail_at in 0..3 {
         let mut calls = 0;
         let result = Config::generate_with(&mut |bytes| {
@@ -138,7 +183,7 @@ fn random_failures_are_propagated() {
                 Ok(())
             }
         });
-        assert!(matches!(result, Err(Error::Random)));
+        assert_variant(&result.unwrap_err(), &Error::Random);
     }
 }
 
@@ -146,99 +191,107 @@ fn random_failures_are_propagated() {
 fn covers_default_and_relative_paths() {
     let _ = default_path();
     assert!(check_supported_permissions(true).is_ok());
-    assert!(matches!(
-        check_supported_permissions(false),
-        Err(Error::Permissions)
-    ));
+    assert_variant(
+        &check_supported_permissions(false).unwrap_err(),
+        &Error::Permissions,
+    );
     assert_eq!(config_parent(Path::new("config.toml")), Path::new("."));
 }
 
 #[cfg(unix)]
 #[test]
 fn permission_metadata_failure_is_propagated() {
-    assert!(matches!(
-        super::check_permission_metadata(&mut || Err(io::Error::other("synthetic"))),
-        Err(Error::Io(_))
-    ));
+    assert_variant(
+        &super::check_permission_metadata(&mut || Err(io::Error::other("synthetic"))).unwrap_err(),
+        &Error::Io(io::ErrorKind::Other.into()),
+    );
 }
 
 #[test]
-fn directory_created_by_competitor_is_synced() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn directory_created_by_competitor_is_synced() {
+    let temp = tempfile::tempdir().unwrap();
     let directory = temp.path().join("new");
     let mut created = false;
     create_directories(&directory, &mut |path| {
         if !created {
-            std::fs::create_dir(&directory)?;
+            std::fs::create_dir(&directory).unwrap();
             created = true;
         }
         sync_directory(path)
-    })?;
+    })
+    .unwrap();
     assert!(directory.is_dir());
-    Ok(())
 }
 
 #[test]
-fn directory_errors_are_propagated() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn directory_errors_are_propagated() {
+    let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("file");
-    std::fs::write(&file, b"")?;
+    std::fs::write(&file, b"").unwrap();
     assert!(create_directories(&file, &mut sync_directory).is_err());
     assert!(sync_directory(&temp.path().join("missing")).is_err());
     let mut fail = |_: &Path| Err(io::Error::other("synthetic failure"));
     assert!(create_directories(Path::new("relative"), &mut fail).is_err());
-    Ok(())
 }
 
 #[test]
-fn load_or_create_propagates_io_and_validation_failures() -> Result<(), Box<dyn std::error::Error>>
-{
-    let temp = tempfile::tempdir()?;
+fn load_or_create_propagates_io_and_validation_failures() {
+    let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
-    let mut config = Config::generate()?;
+    let mut config = Config::generate().unwrap();
     config.device_name.clear();
-    assert!(matches!(
-        config.create(&path),
-        Err(Error::Validation { .. })
-    ));
-    let config = Config::generate()?;
-    config.create(&path)?;
-    std::fs::write(&path, "invalid = [")?;
-    assert!(matches!(
-        Config::load_or_create(&path),
-        Err(Error::Parse(_))
-    ));
+    assert_variant(
+        &config.create(&path).unwrap_err(),
+        &Error::Validation {
+            key: "device_name",
+            value: String::new(),
+        },
+    );
+    let config = Config::generate().unwrap();
+    config.create(&path).unwrap();
+    std::fs::write(&path, "invalid = [").unwrap();
+    assert_variant(
+        &Config::load_or_create(&path).unwrap_err(),
+        &Error::Parse(String::new()),
+    );
     let blocked = temp.path().join("missing").join("config.toml");
-    std::fs::write(temp.path().join("missing"), b"")?;
-    assert!(matches!(
-        Config::load_or_create(&blocked),
-        Err(Error::Io(_))
-    ));
+    std::fs::write(temp.path().join("missing"), b"").unwrap();
+    assert_variant(
+        &Config::load_or_create(&blocked).unwrap_err(),
+        &Error::Io(io::ErrorKind::Other.into()),
+    );
     let long_path = temp.path().join("new").join("a".repeat(300));
-    assert!(matches!(
-        Config::load_or_create(&long_path),
-        Err(Error::Io(_))
-    ));
-    let mut invalid = Config::generate()?;
+    assert_variant(
+        &Config::load_or_create(&long_path).unwrap_err(),
+        &Error::Io(io::ErrorKind::Other.into()),
+    );
+    let mut invalid = Config::generate().unwrap();
     invalid.device_name.clear();
-    std::fs::write(&path, toml::to_string_pretty(&invalid)?)?;
-    assert!(matches!(Config::load(&path), Err(Error::Validation { .. })));
-    Ok(())
+    std::fs::write(&path, toml::to_string_pretty(&invalid).unwrap()).unwrap();
+    assert_variant(
+        &Config::load(&path).unwrap_err(),
+        &Error::Validation {
+            key: "device_name",
+            value: String::new(),
+        },
+    );
 }
 
 #[test]
-fn syncs_each_new_directory_parent_and_published_file_parent()
--> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn syncs_each_new_directory_parent_and_published_file_parent() {
+    let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first");
     let second = first.join("second");
     let path = second.join("config.toml");
     let mut synced = Vec::new();
-    Config::generate()?.create_with_sync(&path, &mut |directory| {
-        synced.push(directory.to_path_buf());
-        sync_directory(directory)
-    })?;
-    let temp_parent = temp.path().parent().ok_or("missing temp parent")?;
+    Config::generate()
+        .unwrap()
+        .create_with_sync(&path, &mut |directory| {
+            synced.push(directory.to_path_buf());
+            sync_directory(directory)
+        })
+        .unwrap();
+    let temp_parent = temp.path().parent().unwrap();
     assert_eq!(
         synced,
         vec![
@@ -248,45 +301,45 @@ fn syncs_each_new_directory_parent_and_published_file_parent()
             second
         ]
     );
-    Config::load(&path)?;
-    Ok(())
+    Config::load(&path).unwrap();
 }
 
 #[test]
-fn propagates_parent_sync_failure_after_publication() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn propagates_parent_sync_failure_after_publication() {
+    let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");
-    let error = Config::generate()?.create_with_sync(&path, &mut |dir| {
-        if dir == temp.path() {
-            Err(io::Error::other("synthetic sync failure"))
-        } else {
-            sync_directory(dir)
-        }
-    });
-    assert!(
-        matches!(error, Err(Error::Io(ref err)) if err.to_string().contains("synthetic sync failure"))
-    );
+    let error = Config::generate()
+        .unwrap()
+        .create_with_sync(&path, &mut |dir| {
+            if dir == temp.path() {
+                Err(io::Error::other("synthetic sync failure"))
+            } else {
+                sync_directory(dir)
+            }
+        });
+    let error = error.unwrap_err();
+    assert_variant(&error, &Error::Io(io::ErrorKind::Other.into()));
+    assert!(error.to_string().contains("synthetic sync failure"));
     assert!(path.is_file());
-    Config::load(&path)?;
-    Ok(())
+    Config::load(&path).unwrap();
 }
 
 #[test]
-fn propagates_new_directory_sync_failure_before_publication()
--> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
+fn propagates_new_directory_sync_failure_before_publication() {
+    let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("new").join("config.toml");
     let mut synced = Vec::<PathBuf>::new();
-    let error = Config::generate()?.create_with_sync(&path, &mut |dir| {
-        synced.push(dir.to_path_buf());
-        if dir == temp.path() {
-            Err(io::Error::other("synthetic sync failure"))
-        } else {
-            sync_directory(dir)
-        }
-    });
-    assert!(matches!(error, Err(Error::Io(_))));
+    let error = Config::generate()
+        .unwrap()
+        .create_with_sync(&path, &mut |dir| {
+            synced.push(dir.to_path_buf());
+            if dir == temp.path() {
+                Err(io::Error::other("synthetic sync failure"))
+            } else {
+                sync_directory(dir)
+            }
+        });
+    assert_variant(&error.unwrap_err(), &Error::Io(io::ErrorKind::Other.into()));
     assert_eq!(synced.last().map(PathBuf::as_path), Some(temp.path()));
     assert!(!path.exists());
-    Ok(())
 }

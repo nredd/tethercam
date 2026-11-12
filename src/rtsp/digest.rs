@@ -255,7 +255,7 @@ impl Authenticator {
         self.challenge_with(conn, stale, now, &mut getrandom::fill)
     }
 
-    fn challenge_with(
+    pub(super) fn challenge_with(
         &self, conn: ConnectionId, stale: bool, now: Instant,
         fill: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
     ) -> Result<Vec<String>, DigestError> {

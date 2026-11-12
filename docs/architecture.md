@@ -157,12 +157,14 @@ Not yet established, tracked as issues:
 
 ## Testing
 
-- Every layer is tested without hardware against the simulated camera
+- Every layer is tested without hardware against the simulated camera; `make coverage` enforces exact 100% line, function and region counts per instrumented file across the actual `src/` root. llvm-cov's default filename exclusions are explicitly disabled: separately named test modules and nested test directories count too. The former default report silently omitted seven such modules (#61). The JSON validator accepts logical and physical source-root aliases, rejects malformed/empty inventories, and ignores only files outside that root. Non-executable module declarations need no coverage. Scope/schema negative fixtures run before each fresh workspace coverage collection; unfiltered JSON, lcov and HTML reports remain available through `make coverage-report`
 - ONVIF HTTP tests inject timeout-setting, listener-inspection, accept and thread-spawn
   failures through the same non-generic helpers used by the real sockets and threads. Loopback
   tests exercise request deadlines, pipelining, connection caps and wildcard shutdown; IPv4
   must succeed, while IPv6 may skip only an explicitly unavailable address family
 - WS-Discovery UDP tests use OS-assigned loopback ports, check fixed-port sharing and ephemeral-port exclusivity, and exercise socket setup failures without privileged host changes. A concrete receive syscall seam covers fatal errors without invalidating descriptors. Multicast packet round-trips and captured client probes remain tracked in #33
+- RTSP connection tests use real loopback sockets for reset, EOF and stalled-write failures;
+  narrow entropy and UDP allocation seams cover OS failures without relying on ephemeral-port order
 - Property tests for every parser; golden-byte tests for every encoder against captures
 - `criterion` benchmarks for per-frame paths, compiled and smoke-run in CI
 - Hardware-in-the-loop tests are `#[ignore]`d and run by hand with a camera attached

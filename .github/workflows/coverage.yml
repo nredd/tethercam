@@ -25,9 +25,6 @@ jobs:
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-llvm-cov,cargo-nextest
-      # `make coverage` compares `coverage-pending.txt` with `origin/main`, which a shallow
-      # pull request checkout does not have.
-      - run: git fetch --no-tags --depth=1 origin main
       - run: make coverage
       - if: always()
         run: make coverage-report
