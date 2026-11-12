@@ -1,8 +1,13 @@
+//! Concurrent first-run identity regression.
+//!
+//! References:
+//! - <https://docs.rs/tempfile/latest/tempfile/struct.NamedTempFile.html#method.persist_noclobber>
+
 use super::Config;
 
 #[test]
-fn concurrent_first_run_preserves_identity() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = tempfile::tempdir()?;
+fn concurrent_first_run_preserves_identity() {
+    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -12,10 +17,10 @@ fn concurrent_first_run_preserves_identity() -> Result<(), Box<dyn std::error::E
         .collect();
     let mut configs = Vec::new();
     for thread in threads {
-        let result = thread.join().map_err(|_| "thread failed")??;
+        let result = thread.join().unwrap().unwrap();
         configs.push(result);
     }
-    let first = configs.first().ok_or("no configurations")?;
+    let first = configs.first().unwrap();
     for config in &configs {
         assert_eq!(first.endpoint_uuid, config.endpoint_uuid);
         assert!(
@@ -25,5 +30,4 @@ fn concurrent_first_run_preserves_identity() -> Result<(), Box<dyn std::error::E
                 .constant_time_eq(&config.credentials.password)
         );
     }
-    Ok(())
 }

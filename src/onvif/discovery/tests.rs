@@ -67,9 +67,7 @@ impl Transport for MemTransport {
             return Ok(None);
         };
         let len = data.len().min(buf.len());
-        if let (Some(dst), Some(src)) = (buf.get_mut(..len), data.get(..len)) {
-            dst.copy_from_slice(src);
-        }
+        buf[..len].copy_from_slice(&data[..len]);
         Ok(Some(Datagram { len, source }))
     }
 
@@ -81,6 +79,25 @@ impl Transport for MemTransport {
         wire.sent.push((interface, dest, payload.to_vec()));
         Ok(())
     }
+}
+
+/// Recognize malformed input while allowing both assertion outcomes to be tested.
+fn is_malformed(error: &Dropped) -> bool {
+    matches!(error, Dropped::Malformed(_))
+}
+
+/// Inspect the oversized description while keeping the unexpected variant testable.
+fn description_size(error: &ConfigError) -> Option<usize> {
+    match error {
+        ConfigError::DescriptionTooLarge(size) => Some(*size),
+        _ => None,
+    }
+}
+
+#[test]
+fn error_assertion_helpers_reject_other_variants() {
+    assert!(!is_malformed(&Dropped::NoMatch));
+    assert_eq!(description_size(&ConfigError::NoInterfaces), None);
 }
 
 fn iface(last: u8) -> Interface {
@@ -186,10 +203,7 @@ fn drops_with_the_right_reason() {
         e.handle(t0, off_link, PROBE_ANY.as_bytes()),
         Err(Dropped::OffLink)
     );
-    assert!(matches!(
-        e.handle(t0, peer(21), b"junk"),
-        Err(Dropped::Malformed(_))
-    ));
+    assert!(is_malformed(&e.handle(t0, peer(21), b"junk").unwrap_err()));
     assert!(e.handle(t0, peer(22), PROBE_ANY.as_bytes()).is_ok());
     assert_eq!(
         e.handle(t0, peer(23), PROBE_ANY.as_bytes()),
@@ -335,10 +349,10 @@ fn many_spoofed_sources_cannot_exceed_the_global_budget() {
     let budget = u64::from(limits.global_burst) + u64::from(limits.global_per_second * seconds);
     assert!(answered <= budget, "{answered} > {budget}");
     assert!(answered >= budget - 10, "budget refills: {answered}");
+    let byte_limit = budget * MAX_REPLY as u64;
     assert!(
-        bytes <= budget * MAX_REPLY as u64,
-        "reflected {bytes} bytes, bound {}",
-        budget * MAX_REPLY as u64
+        bytes <= byte_limit,
+        "reflected {bytes} bytes, bound {byte_limit}"
     );
     assert_eq!(
         limits.max_reflected_bytes_per_second(),
@@ -434,12 +448,12 @@ fn largest_accepted_config() -> Config {
     };
     let full = format!("a:{}", "b".repeat(126));
     let mut scopes = Vec::new();
-    while build(&scopes).is_ok() && scopes.len() < MAX_SCOPES_FOR_TEST {
+    while build(&scopes).is_ok() {
         scopes.push(full.clone());
     }
     scopes.pop();
     let mut best = build(&scopes).unwrap();
-    for k in 0..=126 {
+    for k in 0..=MAX_REPLY {
         let mut trial = scopes.clone();
         trial.push(format!("a:{}", "c".repeat(k)));
         match build(&trial) {
@@ -450,8 +464,6 @@ fn largest_accepted_config() -> Config {
     best
 }
 
-const MAX_SCOPES_FOR_TEST: usize = 16;
-
 #[test]
 fn worst_case_probe_and_resolve_replies_fit_at_the_size_limit() {
     // 25 x `&` escape to 125 bytes, plus 3: exactly the escaped `MessageID` bound.
@@ -461,11 +473,8 @@ fn worst_case_probe_and_resolve_replies_fit_at_the_size_limit() {
     for doc in [probe, resolve] {
         let mut e = Engine::new(largest_accepted_config(), Counter(1));
         let out = e.handle(Instant::now(), peer(20), doc.as_bytes()).unwrap();
-        assert!(
-            out.payload.len() <= MAX_REPLY,
-            "{} bytes",
-            out.payload.len()
-        );
+        let len = out.payload.len();
+        assert!(len <= MAX_REPLY, "{len} bytes");
         assert!(
             out.payload.len() > MAX_REPLY - 400,
             "config is near the limit"
@@ -485,7 +494,7 @@ fn configuration_check_covers_resolve_matches() {
         config.service.clone(),
     );
     // One more byte-scale scope pushes the longer `ResolveMatches` over the limit.
-    assert!(matches!(bigger, Err(ConfigError::DescriptionTooLarge(n)) if n > MAX_REPLY));
+    assert!(description_size(&bigger.unwrap_err()).unwrap() > MAX_REPLY);
 }
 
 #[test]
@@ -547,9 +556,9 @@ fn garbage_costs_the_sender_its_rate_budget() {
     let mut e = engine();
     let t0 = Instant::now();
     for n in 0..Limits::default().source_burst {
-        assert!(matches!(
-            e.handle(t0, peer(20), format!("junk{n}").as_bytes()),
-            Err(Dropped::Malformed(_))
+        assert!(is_malformed(
+            &e.handle(t0, peer(20), format!("junk{n}").as_bytes())
+                .unwrap_err()
         ));
     }
     assert_eq!(
@@ -654,6 +663,8 @@ fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
     static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
     log::set_logger(&CAPTURE).unwrap();
     log::set_max_level(log::LevelFilter::Warn);
+    assert!(log::logger().enabled(&log::Metadata::builder().level(log::Level::Warn).build()));
+    log::logger().flush();
     let link = Interface {
         addr: "fe80::10".parse().unwrap(),
         prefix_len: 64,
@@ -668,15 +679,16 @@ fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
         port: 8080,
         path: "/onvif/device_service".to_owned(),
     };
-    assert!(matches!(
+    assert_eq!(
         Config::new(
             EndpointReference::parse(ENDPOINT).unwrap(),
             vec![],
             vec![link],
             service
-        ),
-        Err(ConfigError::NoInterfaces)
-    ));
+        )
+        .unwrap_err(),
+        ConfigError::NoInterfaces,
+    );
     let mut e = Engine::new(config_with(vec![link, ula]), Counter(1));
     let source = SocketAddr::V6(std::net::SocketAddrV6::new(
         "fe80::99".parse().unwrap(),
@@ -731,18 +743,18 @@ fn config_validation() {
         prefix_len: 33,
         ..iface(1)
     };
-    assert!(matches!(
+    assert_eq!(
         new(vec![], vec![bad], svc()),
-        ConfigError::InvalidInterface(_)
-    ));
+        ConfigError::InvalidInterface(bad.addr)
+    );
     let mcast = Interface {
         addr: GROUP_V4.into(),
         ..iface(1)
     };
-    assert!(matches!(
+    assert_eq!(
         new(vec![], vec![mcast], svc()),
-        ConfigError::InvalidInterface(_)
-    ));
+        ConfigError::InvalidInterface(mcast.addr)
+    );
     for scope in [
         "",
         "no-scheme",
@@ -751,10 +763,10 @@ fn config_validation() {
         "a:\u{fffe}",
         "a:caf\u{e9}",
     ] {
-        assert!(matches!(
+        assert_eq!(
             new(vec![scope.to_owned()], vec![iface(1)], svc()),
-            ConfigError::InvalidScope(_)
-        ));
+            ConfigError::InvalidScope(scope.to_owned())
+        );
     }
     assert_eq!(
         new(vec!["a:b".to_owned(); 17], vec![iface(1)], svc()),
@@ -765,18 +777,15 @@ fn config_validation() {
             port: 80,
             path: path.to_owned(),
         };
-        assert!(matches!(
+        assert_eq!(
             new(vec![], vec![iface(1)], s),
-            ConfigError::InvalidServicePath(_)
-        ));
+            ConfigError::InvalidServicePath(path.to_owned())
+        );
     }
     let huge = (0..16)
         .map(|n| format!("onvif://www.onvif.org/{n}/{}", "a".repeat(100)))
         .collect();
-    assert!(matches!(
-        new(huge, vec![iface(1)], svc()),
-        ConfigError::DescriptionTooLarge(_)
-    ));
+    assert!(description_size(&new(huge, vec![iface(1)], svc())).unwrap() > MAX_REPLY);
 }
 
 #[test]
@@ -804,10 +813,7 @@ fn endpoint_reference_parse_and_generate() {
     );
     let s = generated.as_str();
     assert_eq!(s.get(23..24), Some("4"), "version nibble");
-    assert!(
-        matches!(s.get(28..29), Some("8" | "9" | "a" | "b")),
-        "variant"
-    );
+    assert!("89ab".contains(s.get(28..29).unwrap()), "variant");
 }
 
 #[test]

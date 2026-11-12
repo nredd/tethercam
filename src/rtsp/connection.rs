@@ -11,6 +11,7 @@ use std::future::{Future, pending};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,6 +86,8 @@ pub(crate) struct Connection<S: MediaSource> {
     session: Option<Session<S>>,
     last_activity: tokio::time::Instant,
     auth_failures: u32,
+    /// Shared entropy seam for nonce challenges and session identifiers.
+    fill_random: fn(&mut [u8]) -> Result<(), getrandom::Error>,
 }
 
 impl<S: MediaSource> Connection<S> {
@@ -106,6 +109,7 @@ impl<S: MediaSource> Connection<S> {
             session: None,
             last_activity: tokio::time::Instant::now(),
             auth_failures: 0,
+            fill_random: getrandom::fill,
         }
     }
 
@@ -197,12 +201,17 @@ impl<S: MediaSource> Connection<S> {
         } = outcome
         {
             self.auth_failures += u32::from(failed_attempt);
-            let reply = match self.shared.auth.challenge(self.id, stale, now) {
-                Ok(values) => values.iter().fold(Response::new(401), |r, v| {
-                    r.with_header("WWW-Authenticate", v)
-                }),
-                Err(_) => Response::new(500),
-            };
+            let reply =
+                match self
+                    .shared
+                    .auth
+                    .challenge_with(self.id, stale, now, &mut self.fill_random)
+                {
+                    Ok(values) => values.iter().fold(Response::new(401), |r, v| {
+                        r.with_header("WWW-Authenticate", v)
+                    }),
+                    Err(_) => Response::new(500),
+                };
             self.send(&reply, Some(cseq)).await?;
             return Ok(self.auth_failures < self.shared.config.max_auth_failures);
         }
@@ -294,7 +303,7 @@ impl<S: MediaSource> Connection<S> {
                 return Response::new(503);
             };
             let mut raw = [0_u8; 8];
-            if getrandom::fill(&mut raw).is_err() {
+            if (self.fill_random)(&mut raw).is_err() {
                 return Response::new(500);
             }
             let id = hex(&raw);
@@ -328,9 +337,13 @@ impl<S: MediaSource> Connection<S> {
     }
 
     fn play(&mut self, request: &Request) -> Response {
-        if let Err(reply) = self.require_session(request) {
-            return reply;
-        }
+        let Some(session) = self
+            .session
+            .as_mut()
+            .filter(|s| session_id(request) == Some(s.id.as_str()))
+        else {
+            return Response::new(454);
+        };
         let track = self.shared.fanout.source().track();
         let mount = &self.shared.config.mount_path;
         let path = uri_path(&request.uri);
@@ -341,9 +354,6 @@ impl<S: MediaSource> Connection<S> {
         }
         let interval = self.shared.config.rtcp_interval;
         let fanout = Arc::clone(&self.shared.fanout);
-        let Some(session) = self.session.as_mut() else {
-            return Response::new(454);
-        };
         if session.playing.is_none() {
             session.playing = Some(Playing {
                 subscription: fanout.subscribe(),
@@ -469,9 +479,9 @@ impl<S: MediaSource> Connection<S> {
         match (&session.spec, &session.udp) {
             (TransportSpec::Tcp { rtcp_channel, .. }, _) => {
                 self.out.clear();
-                if encode_interleaved(*rtcp_channel, &report, &mut self.out).is_ok() {
-                    write_all(&mut self.stream, &self.out, timeout).await?;
-                }
+                // This fixed-size compound report always fits within the u16 framing limit.
+                let _ = encode_interleaved(*rtcp_channel, &report, &mut self.out);
+                write_all(&mut self.stream, &self.out, timeout).await?;
             }
             (TransportSpec::Udp { .. }, Some(udp)) => {
                 let _ = send_udp(&udp.rtcp, &report, udp.control_dest, timeout).await;
@@ -545,7 +555,8 @@ fn uri_path(uri: &str) -> Option<&str> {
         }
         after.find('/').and_then(|i| after.get(i..)).unwrap_or("/")
     };
-    let path = rest.split(['?', '#']).next()?;
+    // split always yields at least one element, including for an empty target.
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
     Some(if path.len() > 1 {
         path.trim_end_matches('/')
     } else {
@@ -557,9 +568,39 @@ async fn bind_udp_pair(
     ip: IpAddr, range: Option<&RangeInclusive<u16>>, media_dest: SocketAddr,
     control_dest: SocketAddr,
 ) -> ConnectionResult<UdpPair> {
-    let finish = |rtp: UdpSocket, rtcp: UdpSocket| -> ConnectionResult<UdpPair> {
+    bind_udp_pair_with(
+        ip,
+        range,
+        media_dest,
+        control_dest,
+        &mut bind_udp_socket,
+        &mut udp_port,
+    )
+    .await
+}
+
+type UdpBind = Pin<Box<dyn Future<Output = io::Result<UdpSocket>> + Send>>;
+
+fn bind_udp_socket(addr: SocketAddr) -> UdpBind {
+    Box::pin(UdpSocket::bind(addr))
+}
+
+fn udp_port(socket: &UdpSocket) -> io::Result<u16> {
+    socket.local_addr().map(|addr| addr.port())
+}
+
+/// Keep allocation retries testable without depending on the OS ephemeral-port sequence.
+async fn bind_udp_pair_with(
+    ip: IpAddr, range: Option<&RangeInclusive<u16>>, media_dest: SocketAddr,
+    control_dest: SocketAddr, bind: &mut (dyn FnMut(SocketAddr) -> UdpBind + Send),
+    port: &mut (dyn FnMut(&UdpSocket) -> io::Result<u16> + Send),
+) -> ConnectionResult<UdpPair> {
+    let finish = |rtp: UdpSocket,
+                  rtcp: UdpSocket,
+                  port: &mut dyn FnMut(&UdpSocket) -> io::Result<u16>|
+     -> ConnectionResult<UdpPair> {
         Ok(UdpPair {
-            server_ports: (rtp.local_addr()?.port(), rtcp.local_addr()?.port()),
+            server_ports: (port(&rtp)?, port(&rtcp)?),
             rtp,
             rtcp,
             media_dest,
@@ -574,26 +615,29 @@ async fn bind_udp_pair(
                 break;
             };
             if let (Ok(rtp), Ok(rtcp)) = (
-                UdpSocket::bind((ip, rtp_port)).await,
-                UdpSocket::bind((ip, rtcp_port)).await,
+                bind(SocketAddr::new(ip, rtp_port)).await,
+                bind(SocketAddr::new(ip, rtcp_port)).await,
             ) {
-                return finish(rtp, rtcp);
+                return finish(rtp, rtcp, port);
             }
         }
     } else {
         for _ in 0..EPHEMERAL_PAIR_ATTEMPTS {
-            let rtp = UdpSocket::bind((ip, 0)).await?;
-            let port = rtp.local_addr()?.port();
-            if port % 2 == 0
-                && let Some(next) = port.checked_add(1)
-                && let Ok(rtcp) = UdpSocket::bind((ip, next)).await
+            let rtp = bind(SocketAddr::new(ip, 0)).await?;
+            let chosen = port(&rtp)?;
+            // An even u16 is at most 65534, so its successor is representable.
+            if chosen % 2 == 0
+                && let Ok(rtcp) = bind(SocketAddr::new(ip, chosen + 1)).await
             {
-                return finish(rtp, rtcp);
+                return finish(rtp, rtcp, port);
             }
         }
     }
     Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no free UDP port pair").into())
 }
+
+#[cfg(test)]
+mod failures;
 
 #[cfg(test)]
 mod tests {

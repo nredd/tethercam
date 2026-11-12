@@ -19,13 +19,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Removed
 
+- Coverage transition list and helpers; the coverage gate now enforces all of `src/`
 - `Session::scoped`; callers explicitly open and close sessions
 ### Changed
+
+- Disable implicit coverage filename exclusions and enforce exact per-file coverage for all executable source modules, including separately named tests
 
 - Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors
 
 ### Added
 
+- Deterministic coverage of RTSP connection failures, completing RTSP's coverage transition
 - Deterministic scripted RTSP media source for tests and examples
 - Reproducible default-branch ruleset payload and workflow inventory tests, with native all-targets/all-features CI checks and staged administrator activation docs
 - Deterministic ONVIF HTTP socket, listener and thread setup failure tests; enforce full coverage of `src/onvif/http.rs`

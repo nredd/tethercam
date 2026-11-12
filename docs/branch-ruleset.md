@@ -18,7 +18,7 @@ after the new jobs have completed successfully and the current merge train is st
 | `bench.yml` | `bench` | PR: `make bench-check`, compile and smoke-run every benchmark |
 | `cross.yml` | `check (aarch64-unknown-linux-gnu)`, `check (armv7-unknown-linux-gnueabihf)` | Embedded cross checks, all features |
 | `deny.yml` | `deny` | `cargo deny check` through the pinned action |
-| `coverage.yml` | `coverage` | `make coverage`, 100% lines, functions and regions, shrinking transition list |
+| `coverage.yml` | `coverage` | `make coverage`, exact 100% per-file lines/functions/regions across the actual `src/` root, including test modules; implicit filename exclusions disabled |
 
 All 16 checks are individual GitHub Actions jobs, not an optional aggregate. Actions app ID
 `15368` was read from this repository's real check runs; every context is bound to it. No

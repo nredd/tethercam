@@ -285,6 +285,11 @@ pub(crate) mod testing {
     use super::*;
     use crate::rtsp::sdp::MediaKind;
 
+    /// Close a subscriber queue to exercise consumers' end-of-stream handling.
+    pub(crate) fn close_queue(subscription: &mut Subscription<ScriptedSource>) {
+        subscription.rx.close();
+    }
+
     /// A source fed by the test through [`TestSource::push`].
     pub(crate) struct TestSource {
         pub(crate) tx: mpsc::UnboundedSender<Packet>,

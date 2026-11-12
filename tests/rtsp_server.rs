@@ -7,7 +7,6 @@ mod suite {
     use std::fmt::Write as _;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use tethercam::rtsp::message::Limits;
@@ -27,44 +26,16 @@ mod suite {
     const REALM: &str = "tethercam";
     const WAIT: Duration = Duration::from_secs(5);
 
-    struct Counter {
-        source: Arc<ScriptedSource>,
-        starts: bool,
-    }
-
-    impl Counter {
-        fn load(&self, _: Ordering) -> usize {
-            if self.starts {
-                self.source.starts()
-            } else {
-                self.source.stops()
-            }
-        }
-    }
-
     struct TestSource {
         tx: mpsc::UnboundedSender<Packet>,
         source: Arc<ScriptedSource>,
-        starts: Counter,
-        stops: Counter,
     }
 
     impl TestSource {
         fn new() -> Self {
             let (source, tx) = ScriptedSource::channel(track("H264"));
             let source = Arc::new(source);
-            Self {
-                tx,
-                starts: Counter {
-                    source: Arc::clone(&source),
-                    starts: true,
-                },
-                stops: Counter {
-                    source: Arc::clone(&source),
-                    starts: false,
-                },
-                source,
-            }
+            Self { tx, source }
         }
 
         fn packet(seq: u16) -> Vec<u8> {
@@ -388,7 +359,7 @@ mod suite {
         assert!(reply.body.contains("a=fmtp:96 packetization-mode=1"));
         assert!(reply.body.contains("a=control:trackID=0"));
         assert_eq!(
-            server.source.starts.load(Ordering::SeqCst),
+            server.source.starts(),
             0,
             "DESCRIBE must not start the camera"
         );
@@ -414,10 +385,7 @@ mod suite {
             .request("PLAY", &base, &[("Session", &session)])
             .await;
         assert_eq!(reply.status, 200);
-        wait_for("camera start", || {
-            server.source.starts.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera start", || server.source.starts() == 1).await;
 
         for seq in 1..=3 {
             server.source.push(seq);
@@ -456,10 +424,7 @@ mod suite {
             .request_skipping_frames("TEARDOWN", &base, &[("Session", &session)])
             .await;
         assert_eq!(reply.status, 200);
-        wait_for("camera stop", || {
-            server.source.stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera stop", || server.source.stops() == 1).await;
         server.shutdown().await;
     }
 
@@ -503,7 +468,7 @@ mod suite {
         assert_eq!(description.status, 200);
         assert_eq!(description.header("content-type"), Some("application/sdp"));
         assert!(description.body.contains("a=control:trackID=0"));
-        assert_eq!(server.source.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(server.source.starts(), 0);
         let transport = format!("RTP/AVP;unicast;client_port={media_port}-{control_port}");
         let reply = client
             .request("SETUP", &track, &[("Transport", &transport)])
@@ -527,10 +492,7 @@ mod suite {
                 .status,
             200
         );
-        wait_for("camera start", || {
-            server.source.starts.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera start", || server.source.starts() == 1).await;
         server.source.push(7);
         server.source.push(8);
 
@@ -559,10 +521,7 @@ mod suite {
                 .status,
             200
         );
-        wait_for("camera stop", || {
-            server.source.stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera stop", || server.source.stops() == 1).await;
         server.shutdown().await;
     }
 
@@ -597,7 +556,7 @@ mod suite {
             );
             assert!(reply.header("cseq").is_some());
         }
-        assert_eq!(server.source.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(server.source.starts(), 0);
         server.shutdown().await;
     }
 
@@ -1104,7 +1063,7 @@ mod suite {
                 .status,
             454
         );
-        assert_eq!(server.source.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(server.source.starts(), 0);
         server.shutdown().await;
     }
 
@@ -1169,15 +1128,9 @@ mod suite {
                 .status,
             200
         );
-        wait_for("camera start", || {
-            server.source.starts.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera start", || server.source.starts() == 1).await;
         drop(client);
-        wait_for("camera stop", || {
-            server.source.stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera stop", || server.source.stops() == 1).await;
         server.shutdown().await;
     }
 
@@ -1207,15 +1160,9 @@ mod suite {
                 .status,
             200
         );
-        wait_for("camera start", || {
-            server.source.starts.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera start", || server.source.starts() == 1).await;
         assert!(client.is_closed().await);
-        wait_for("camera stop", || {
-            server.source.stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera stop", || server.source.stops() == 1).await;
         server.shutdown().await;
     }
 
@@ -1259,11 +1206,7 @@ mod suite {
             );
             clients.push(client);
         }
-        assert_eq!(
-            server.source.starts.load(Ordering::SeqCst),
-            1,
-            "one start for both clients"
-        );
+        assert_eq!(server.source.starts(), 1, "one start for both clients");
         for seq in 0..5 {
             server.source.push(seq);
         }
@@ -1278,10 +1221,7 @@ mod suite {
             }
         }
         drop(clients);
-        wait_for("camera stop", || {
-            server.source.stops.load(Ordering::SeqCst) == 1
-        })
-        .await;
+        wait_for("camera stop", || server.source.stops() == 1).await;
         server.shutdown().await;
     }
 

@@ -1,9 +1,15 @@
-use super::{Config, Error};
+//! Listener overlap validation regressions.
+//!
+//! References:
+//! - <https://doc.rust-lang.org/std/net/enum.IpAddr.html>
+
+use super::Config;
+use super::tests::validation;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[test]
-fn listener_overlaps_are_rejected_per_address_family() -> Result<(), Box<dyn std::error::Error>> {
-    let base = Config::generate()?;
+fn listener_overlaps_are_rejected_per_address_family() {
+    let base = Config::generate().unwrap();
     let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
     let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
     let wild4 = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -17,9 +23,7 @@ fn listener_overlaps_are_rejected_per_address_family() -> Result<(), Box<dyn std
             onvif_port: 1234,
             ..base.clone()
         };
-        let Err(Error::Validation { key, value }) = config.validate() else {
-            return Err("overlapping listeners accepted".into());
-        };
+        let (key, value) = validation(config.validate().unwrap_err());
         for expected in ["rtsp_address", "rtsp_port", "onvif_address", "onvif_port"] {
             assert!(key.contains(expected));
         }
@@ -35,7 +39,6 @@ fn listener_overlaps_are_rejected_per_address_family() -> Result<(), Box<dyn std
             onvif_port: 1234,
             ..base.clone()
         };
-        config.validate()?;
+        config.validate().unwrap();
     }
-    Ok(())
 }
