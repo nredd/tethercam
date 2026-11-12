@@ -10,7 +10,7 @@ privilege sandbox. `default-run = "tethercam"` preserves ordinary `cargo run` se
 
 ```toml
 [dependencies]
-tethercam = { version = "0.0.1", features = ["test-support"] }
+tethercam = { version = "0.0.2", features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt", "net"] }
 ```
 
@@ -18,13 +18,15 @@ tokio = { version = "1", features = ["macros", "rt", "net"] }
 use tethercam::test_support::{Server, Synthetic};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> std::io::Result<()> {
+async fn main() -> Result<(), tethercam::test_support::Error> {
     let export = Server::start(0, Synthetic::default()).await?;
     assert!(export.address.ip().is_loopback());
     export.shutdown().await
 }
 ```
 
+`Error` distinguishes malformed protocol data, invalid identities, model transport failures,
+I/O, deadlines and owned-task failures; `kind()` provides a payload-free retry/observation category.
 `DeviceModel` supplies identity/descriptors, endpoint transfers and class/vendor controls.
 `Identity` describes a single interface in configuration one, including its alternate settings
 and bulk endpoint numbers. Standard USB configuration/descriptor handling, network framing,
@@ -179,7 +181,9 @@ and fully decodes recordings, and fails on client errors/deadlines. It never man
 import daemons or host services.
 
 The verifier owns its exact children, never searches for process names/PIDs, never uses shell
-strings, and joins termination on failures. The native `time` process waits for a Rust controller
+strings, and joins termination on failures. Media clients receive TERM, then a one-second grace
+period before targeted kill/reap if they resist; client cleanup cannot indefinitely block server
+shutdown. Camera/server processes never use that escalation. The native `time` process waits for a Rust controller
 which owns the server. Closing the controller's stdin requests graceful server shutdown, even on
 an early verifier failure. No force-kill deadline shortens camera session cleanup. Resource
 accounting includes the small controller and its waited-for server, **not** the separate media

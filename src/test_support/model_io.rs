@@ -7,10 +7,10 @@
 //! References:
 //! - <https://doc.rust-lang.org/reference/types/trait-object.html>
 
-use super::{Control, DeviceModel, Identity};
+use super::{Control, DeviceModel, Error, Identity};
 use crate::transport::TransportError;
 use std::future::Future;
-use std::io;
+
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,7 +22,8 @@ pub(super) trait ModelIo: Send + Sync {
     fn transfer<'a>(
         &'a self, endpoint: u32, direction: u32, payload: &'a [u8], bytes: &'a mut [u8],
     ) -> Call<'a, Result<usize, TransportError>>;
-    fn control<'a>(&'a self, setup: [u8; 8], payload: &'a [u8]) -> Call<'a, io::Result<Control>>;
+    fn control<'a>(&'a self, setup: [u8; 8], payload: &'a [u8])
+    -> Call<'a, Result<Control, Error>>;
 }
 
 struct Shared<M>(Arc<Mutex<M>>);
@@ -41,7 +42,9 @@ impl<M: DeviceModel> ModelIo for Shared<M> {
                 .await
         })
     }
-    fn control<'a>(&'a self, setup: [u8; 8], payload: &'a [u8]) -> Call<'a, io::Result<Control>> {
+    fn control<'a>(
+        &'a self, setup: [u8; 8], payload: &'a [u8],
+    ) -> Call<'a, Result<Control, Error>> {
         Box::pin(async move { self.0.lock().await.control(setup, payload).await })
     }
 }

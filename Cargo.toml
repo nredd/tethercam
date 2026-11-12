@@ -1,6 +1,6 @@
 [package]
 name = "tethercam"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.90"
 description = "Turn a USB-tethered Sony Alpha camera into an ONVIF/RTSP network camera for UniFi Protect and Home Assistant"

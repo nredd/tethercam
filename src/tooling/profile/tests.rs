@@ -167,6 +167,7 @@ fn deterministic_parser_error_boundaries_do_not_depend_on_generated_inputs() {
     for input in [
         "#tb 0: bad/1".into(),
         "#tb 0: 1/bad".into(),
+        "0,\"bad\"".into(),
         hashes().replace("0, 0, 0", "0, 0, NaN"),
         hashes().replace("0, 0, 0", "0, 0, 9007199254740992"),
         hashes().replace("0, 0, 0", "0, 0, 0.5"),

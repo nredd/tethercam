@@ -19,6 +19,14 @@ struct Owned {
     child: Child,
     ops: Processes,
     requested: bool,
+    termination: Termination,
+}
+
+/// Only camera/server ownership may wait indefinitely for graceful session cleanup.
+#[derive(Clone, Copy)]
+enum Termination {
+    Client(Duration),
+    JoinedServer,
 }
 
 /// Narrow native process seam; fake failures never signal unrelated processes.
@@ -27,6 +35,7 @@ struct Processes {
     poll: fn(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
     signal: fn(u32) -> std::io::Result<bool>,
     reap: fn(&mut Child) -> std::io::Result<std::process::ExitStatus>,
+    kill: fn(&mut Child) -> std::io::Result<()>,
 }
 impl Default for Processes {
     fn default() -> Self {
@@ -34,6 +43,7 @@ impl Default for Processes {
             poll: Child::try_wait,
             signal,
             reap: Child::wait,
+            kill: Child::kill,
         }
     }
 }
@@ -51,7 +61,13 @@ impl Owned {
             child,
             ops: Processes::default(),
             requested: false,
+            termination: Termination::Client(Duration::from_secs(1)),
         }
+    }
+    fn joined(child: Child) -> Self {
+        let mut owned = Self::new(child);
+        owned.termination = Termination::JoinedServer;
+        owned
     }
     fn start(program: &Path, args: &[OsString]) -> Result<Self, Error> {
         Ok(Self::new(
@@ -64,14 +80,16 @@ impl Owned {
         ))
     }
     fn wait(&mut self, budget: Duration) -> Result<(), Error> {
+        if !self.wait_exit(budget)?.success() {
+            return Err(Error::Invalid("verification subprocess failed"));
+        }
+        Ok(())
+    }
+    fn wait_exit(&mut self, budget: Duration) -> Result<std::process::ExitStatus, Error> {
         let deadline = Instant::now() + budget;
         loop {
             if let Some(status) = (self.ops.poll)(&mut self.child)? {
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(Error::Invalid("verification subprocess failed"))
-                };
+                return Ok(status);
             }
             if Instant::now() >= deadline {
                 return Err(Error::Invalid("verification subprocess deadline exceeded"));
@@ -97,7 +115,14 @@ impl Owned {
                 "owned verification child did not accept shutdown",
             ));
         }
-        // Camera shutdown is joined, never force-killed at a shorter measurement deadline.
+        // Media clients have no camera session to preserve: a TERM-resistant client must
+        // not prevent the later server shutdown barrier. Escalate only those exact children.
+        if let Termination::Client(grace) = self.termination
+            && self.wait_exit(grace).is_err()
+        {
+            (self.ops.kill)(&mut self.child)?;
+        }
+        // Camera/controller shutdown remains joined, without a force-kill deadline.
         (self.ops.reap)(&mut self.child)?;
         Ok(())
     }

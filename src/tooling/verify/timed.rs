@@ -57,7 +57,7 @@ impl TimedServer {
         let mut child = spawn(&mut command)?;
         let input = child.stdin.take();
         Ok(Self {
-            time: Owned::new(child),
+            time: Owned::joined(child),
             input,
         })
     }
@@ -100,6 +100,7 @@ fn serve_with(
         server_args.extend(["--simulate".into(), simulation.clone()]);
     }
     let mut server = Owned::start(Path::new(bin), &server_args)?;
+    server.termination = super::Termination::JoinedServer;
     server.ops = processes;
     // Bounded pipe protocol. Ordinary runs send EOF; any data is an explicit invalid request.
     let mut command = Vec::new();

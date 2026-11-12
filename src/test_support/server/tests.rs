@@ -22,8 +22,8 @@ impl DeviceModel for FaultModel {
     }
     fn control(
         &mut self, _setup: [u8; 8], _payload: &[u8],
-    ) -> impl Future<Output = io::Result<Control>> + Send {
-        ready(Err(io::Error::other("injected control")))
+    ) -> impl Future<Output = Result<Control, Error>> + Send {
+        ready(Err(io::Error::other("injected control").into()))
     }
 }
 
@@ -159,15 +159,19 @@ async fn bounded_error_categories_and_shutdown_results_are_explicit() {
         io::ErrorKind::ConnectionReset,
         io::ErrorKind::BrokenPipe,
     ] {
-        record_error(&server.state, io::Error::from(kind)).await;
+        record_error(&server.state, io::Error::from(kind).into()).await;
     }
     assert_eq!(server.state.lock().await.errors, [] as [String; 0]);
     for _ in 0..66 {
-        record_error(&server.state, io::Error::other("not retained payload")).await;
+        record_error(
+            &server.state,
+            io::Error::other("not retained payload").into(),
+        )
+        .await;
     }
     assert_eq!(server.state.lock().await.errors.len(), 64);
     server.task.abort();
-    server.task = tokio::spawn(async { Err(io::Error::other("injected accept")) });
+    server.task = tokio::spawn(async { Err(io::Error::other("injected accept").into()) });
     tokio::task::yield_now().await;
     assert!(server.shutdown().await.is_err());
     let mut server = Server::start(0, Sony::default()).await.expect("start");
@@ -284,11 +288,11 @@ impl DeviceModel for BoundaryModel {
             Ok(usize::MAX)
         }
     }
-    async fn control(&mut self, _setup: [u8; 8], _payload: &[u8]) -> io::Result<Control> {
+    async fn control(&mut self, _setup: [u8; 8], _payload: &[u8]) -> Result<Control, Error> {
         if self.hang {
             std::future::pending().await
         } else {
-            Err(io::Error::other("injected"))
+            Err(io::Error::other("injected").into())
         }
     }
 }
@@ -364,7 +368,7 @@ impl DeviceModel for OversizedAfterPending {
     }
     fn control(
         &mut self, _setup: [u8; 8], _payload: &[u8],
-    ) -> impl Future<Output = io::Result<Control>> + Send {
+    ) -> impl Future<Output = Result<Control, Error>> + Send {
         ready(Ok(Control {
             data: None,
             flush_bulk: false,

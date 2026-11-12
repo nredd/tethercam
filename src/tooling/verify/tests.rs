@@ -57,6 +57,42 @@ fn child_success_failure_deadline_and_graceful_cleanup() {
 }
 
 #[test]
+fn term_resistant_clients_are_killed_and_reaped_but_server_cleanup_stays_joined() {
+    let mut client = Owned::start(Path::new("/bin/sleep"), &args(&["10"])).expect("client");
+    // A successful signal that is ignored, without changing the host signal disposition.
+    client.ops.signal = |_| Ok(true);
+    client.termination = Termination::Client(Duration::ZERO);
+    assert!(client.wait(Duration::ZERO).is_err());
+    client.stop().expect("bounded escalation and reap");
+    assert!(
+        client
+            .child
+            .try_wait()
+            .expect("poll reaped client")
+            .is_some()
+    );
+
+    let mut failed = Owned::start(Path::new("/bin/sleep"), &args(&["10"])).expect("client");
+    failed.ops.signal = |_| Ok(true);
+    failed.ops.kill = |_| Err(std::io::Error::other("injected kill failure"));
+    failed.termination = Termination::Client(Duration::ZERO);
+    assert!(failed.stop().is_err());
+    failed.ops = Processes::default();
+    failed
+        .stop()
+        .expect("native cleanup after injected failure");
+
+    let child = Command::new("/bin/sleep")
+        .arg("1.1")
+        .spawn()
+        .expect("server");
+    let mut server = Owned::joined(child);
+    server.ops.signal = |_| Ok(true);
+    server.stop().expect("unlimited graceful server join");
+    assert!(server.child.wait().expect("joined server").success());
+}
+
+#[test]
 fn every_verification_plan_uses_owned_children_and_protected_files() {
     let (temp, program, cfg) = fixture();
     let tools = Tools {

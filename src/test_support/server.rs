@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::DeviceModel;
 use super::model_io::{self, ModelIo};
+use super::{DeviceModel, Error};
 use crate::transport::TransportError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,7 +82,7 @@ pub struct Server<M> {
     pub changed: Arc<Notify>,
     /// Bound loopback address; port zero selects an unused port.
     pub address: std::net::SocketAddr,
-    task: JoinHandle<io::Result<()>>,
+    task: JoinHandle<Result<(), Error>>,
     stop: Arc<Notify>,
 }
 
@@ -121,11 +121,11 @@ impl<M: DeviceModel> Server<M> {
     ///
     /// # Errors
     /// Returns descriptor validation, bind or socket address errors.
-    pub async fn start(port: u16, model: M) -> io::Result<Self> {
+    pub async fn start(port: u16, model: M) -> Result<Self, Error> {
         Self::start_with(port, model, SocketOps::default()).await
     }
 
-    async fn start_with(port: u16, model: M, ops: SocketOps) -> io::Result<Self> {
+    async fn start_with(port: u16, model: M, ops: SocketOps) -> Result<Self, Error> {
         let model = Arc::new(Mutex::new(model));
         build(port, model_io::shared(&model), ops)
             .await
@@ -143,7 +143,7 @@ impl<M: DeviceModel> Server<M> {
     ///
     /// # Errors
     /// Returns a task failure if the server panicked, not for requested cancellation.
-    pub async fn shutdown(mut self) -> io::Result<()> {
+    pub async fn shutdown(mut self) -> Result<(), Error> {
         finish(&mut self.task, &self.stop).await
     }
 }
@@ -156,11 +156,11 @@ impl<M> Drop for Server<M> {
 }
 
 /// Task completion has no device-type-dependent decisions.
-async fn finish(task: &mut JoinHandle<io::Result<()>>, stop: &Notify) -> io::Result<()> {
+async fn finish(task: &mut JoinHandle<Result<(), Error>>, stop: &Notify) -> Result<(), Error> {
     stop.notify_one();
     match task.await {
         Err(error) if error.is_cancelled() => Ok(()),
-        Err(error) => Err(io::Error::other(error)),
+        Err(error) => Err(Error::Task(error)),
         Ok(result) => result,
     }
 }
@@ -169,11 +169,11 @@ struct Parts {
     state: Arc<Mutex<State>>,
     changed: Arc<Notify>,
     address: std::net::SocketAddr,
-    task: JoinHandle<io::Result<()>>,
+    task: JoinHandle<Result<(), Error>>,
     stop: Arc<Notify>,
 }
 
-async fn build(port: u16, personality: Arc<dyn ModelIo>, ops: SocketOps) -> io::Result<Parts> {
+async fn build(port: u16, personality: Arc<dyn ModelIo>, ops: SocketOps) -> Result<Parts, Error> {
     personality.identity().await.validate()?;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let address = (ops.address)(&listener)?;
@@ -203,7 +203,7 @@ async fn build(port: u16, personality: Arc<dyn ModelIo>, ops: SocketOps) -> io::
 async fn serve(
     listener: TcpListener, shared: Arc<Mutex<State>>, notification: Arc<Notify>,
     stopping: Arc<Notify>, personality: Arc<dyn ModelIo>, ops: SocketOps,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mut tasks = tokio::task::JoinSet::new();
     let result = async { loop {
                 tokio::select! {
@@ -230,7 +230,7 @@ async fn serve(
 }
 
 /// Retain only bounded error categories, ignoring ordinary peer disconnects.
-async fn record_error(state: &Mutex<State>, error: io::Error) {
+async fn record_error(state: &Mutex<State>, error: Error) {
     if matches!(
         error.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
@@ -249,7 +249,7 @@ async fn write(writer: &mut Writer, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-async fn read<const N: usize>(socket: &mut TcpStream) -> io::Result<[u8; N]> {
+async fn read<const N: usize>(socket: &mut TcpStream) -> Result<[u8; N], Error> {
     let mut bytes = [0; N];
     timeout(Duration::from_secs(30), socket.read_exact(&mut bytes)).await??;
     Ok(bytes)
@@ -264,7 +264,7 @@ impl Drop for ImportLease {
 
 async fn negotiate(
     socket: &mut TcpStream, state: &Mutex<State>, write_op: WriteOp, model: &dyn ModelIo,
-) -> io::Result<Option<ImportLease>> {
+) -> Result<Option<ImportLease>, Error> {
     let op = read::<8>(socket).await?;
     let [
         version_high,
@@ -317,7 +317,7 @@ async fn negotiate(
 async fn connection(
     mut socket: TcpStream, state: &Mutex<State>, changed: &Notify, ops: SocketOps,
     model: &dyn ModelIo,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     (ops.nodelay)(&socket)?;
     let Some(_lease) = negotiate(&mut socket, state, ops.write, model).await? else {
         return Ok(());
@@ -396,7 +396,7 @@ impl Drop for PendingCount {
 /// Complete pending bulk URBs when a class cancellation flushes the active transaction.
 async fn cancel_bulk(
     pending: &mut Pending, writer: &mut Writer, endpoints: &[u32], write_op: WriteOp,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let mut interrupts = Pending::new();
     for (urb, payload, deadline) in std::mem::take(pending) {
         if endpoints.contains(&urb.endpoint) {
@@ -430,7 +430,7 @@ impl<'a> Framed<'a> {
             deadline: Instant::now() + Duration::from_secs(30),
         }
     }
-    async fn next(&mut self) -> io::Result<(Urb, Vec<u8>)> {
+    async fn next(&mut self) -> Result<(Urb, Vec<u8>), Error> {
         loop {
             match &mut self.state {
                 FrameState::Header(bytes) => {
@@ -459,12 +459,12 @@ impl<'a> Framed<'a> {
 /// Limit reads to this frame, retaining successful partial reads across select cancellation.
 async fn fill(
     reader: &mut Reader<'_>, bytes: &mut Vec<u8>, length: usize, deadline: Instant,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     while bytes.len() < length {
         let mut limited = (&mut *reader).take((length - bytes.len()) as u64);
         let count = tokio::time::timeout_at(deadline, limited.read_buf(bytes)).await??;
         if count == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
     }
     Ok(())
@@ -472,7 +472,7 @@ async fn fill(
 
 async fn execute(
     urb: &Urb, payload: &[u8], state: &mut State, model: &dyn ModelIo,
-) -> io::Result<Option<Vec<u8>>> {
+) -> Result<Option<Vec<u8>>, Error> {
     if urb.endpoint == 0 {
         return control(urb, payload, state, model).await.map(Some);
     }
@@ -512,7 +512,7 @@ async fn execute(
 
 async fn control(
     urb: &Urb, payload: &[u8], state: &mut State, model: &dyn ModelIo,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>, Error> {
     let [
         kind,
         request,

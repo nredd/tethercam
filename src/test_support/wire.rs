@@ -4,7 +4,7 @@
 //! - <https://docs.kernel.org/usb/usbip_protocol.html>
 //! - <https://www.usb.org/document-library/usb-20-specification>
 
-use std::io;
+use super::Error;
 
 /// Exported synthetic bus identifier.
 pub const BUS_ID: &str = "1-1";
@@ -23,18 +23,15 @@ pub const CONFIG: [u8; 69] = [
 
 /// Invalid or unsupported protocol input.
 #[must_use]
-pub fn invalid() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "invalid or unsupported USB/IP request",
-    )
+pub fn invalid() -> Error {
+    Error::Protocol
 }
 
 /// Read one big-endian network word without indexing.
 ///
 /// # Errors
 /// Returns an invalid-data error for short input or offset overflow.
-pub fn word(bytes: &[u8], offset: usize) -> io::Result<u32> {
+pub fn word(bytes: &[u8], offset: usize) -> Result<u32, Error> {
     let part = bytes
         .get(offset..)
         .and_then(<[u8]>::first_chunk::<4>)
@@ -66,7 +63,7 @@ impl Urb {
     ///
     /// # Errors
     /// Rejects short headers, invalid fields and oversized transfers.
-    pub fn parse(bytes: &[u8]) -> io::Result<Self> {
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let header: [u8; 48] = bytes.try_into().map_err(|_| invalid())?;
         let [
             c0,
@@ -148,7 +145,7 @@ impl Urb {
     ///
     /// # Errors
     /// Rejects payload lengths inconsistent with the request.
-    pub fn reply(&self, status: i32, data: &[u8], actual: usize) -> io::Result<Vec<u8>> {
+    pub fn reply(&self, status: i32, data: &[u8], actual: usize) -> Result<Vec<u8>, Error> {
         if actual > self.length
             || (self.command == 1 && self.direction == 1 && actual != data.len())
         {

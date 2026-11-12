@@ -19,6 +19,43 @@ pub use server::Server;
 
 use std::io;
 
+/// Failures from the verification engine, with protocol and identity errors kept distinct.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Malformed or unsupported USB/IP request or response data.
+    #[error("invalid or unsupported USB/IP request")]
+    Protocol,
+    /// Inconsistent or unbounded device descriptors.
+    #[error("invalid verification device identity")]
+    Identity,
+    /// Underlying socket or operating-system failure.
+    #[error("verification I/O failed")]
+    Io(#[from] io::Error),
+    /// A model-specific transport operation failed.
+    #[error("verification model transfer failed")]
+    Transport(#[from] crate::transport::TransportError),
+    /// A bounded protocol operation exceeded its deadline.
+    #[error("verification operation timed out")]
+    Deadline(#[from] tokio::time::error::Elapsed),
+    /// An owned server task failed.
+    #[error("verification server task failed")]
+    Task(#[from] tokio::task::JoinError),
+}
+
+impl Error {
+    /// Payload-free category suitable for bounded observations and caller retry decisions.
+    #[must_use]
+    pub fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Protocol => io::ErrorKind::InvalidData,
+            Self::Identity => io::ErrorKind::InvalidInput,
+            Self::Io(error) => error.kind(),
+            Self::Deadline(_) => io::ErrorKind::TimedOut,
+            Self::Transport(_) | Self::Task(_) => io::ErrorKind::Other,
+        }
+    }
+}
+
 /// Result of a model-specific control request.
 #[derive(Debug)]
 pub struct Control {
@@ -80,7 +117,7 @@ impl Identity {
     ///
     /// # Errors
     /// Returns an error for inconsistent identity fields or oversized descriptors.
-    pub fn validate(&self) -> io::Result<()> {
+    pub fn validate(&self) -> Result<(), Error> {
         if self.device.len() != 18
             || self.device.get(..2) != Some(&[18, 1])
             || self.device.get(8..10) != Some(self.vendor.to_le_bytes().as_slice())
@@ -106,7 +143,7 @@ impl Identity {
                 .iter()
                 .any(|endpoint| !(1..=15).contains(endpoint))
         {
-            return Err(wire::invalid());
+            return Err(Error::Identity);
         }
         Ok(())
     }

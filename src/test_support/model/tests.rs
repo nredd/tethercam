@@ -1,6 +1,49 @@
 //! Device personalities are independent of USB/IP framing and of one another.
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn public_errors_preserve_domain_variants_sources_and_payload_free_categories() {
+    use std::error::Error as _;
+    use std::io;
+    let deadline = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .expect_err("deadline");
+    let task = tokio::spawn(std::future::pending::<()>());
+    task.abort();
+    let cancelled = task.await.expect_err("cancelled task");
+    for (error, kind, source) in [
+        (Error::Protocol, io::ErrorKind::InvalidData, false),
+        (Error::Identity, io::ErrorKind::InvalidInput, false),
+        (
+            io::Error::from(io::ErrorKind::BrokenPipe).into(),
+            io::ErrorKind::BrokenPipe,
+            true,
+        ),
+        (
+            TransportError::Disconnected.into(),
+            io::ErrorKind::Other,
+            true,
+        ),
+        (deadline.into(), io::ErrorKind::TimedOut, true),
+        (cancelled.into(), io::ErrorKind::Other, true),
+    ] {
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.source().is_some(), source);
+        assert_ne!(error.to_string(), "");
+        assert_ne!(format!("{error:?}"), "");
+    }
+    assert_eq!(
+        wire::Urb::parse(&[]).expect_err("protocol").kind(),
+        io::ErrorKind::InvalidData
+    );
+    let mut invalid = Synthetic::default().identity();
+    invalid.device.clear();
+    assert_eq!(
+        invalid.validate().expect_err("identity").kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
 #[tokio::test]
 async fn synthetic_device_uses_non_sony_endpoints_and_stalls_unknown_requests() {
     let mut device = Synthetic::default();

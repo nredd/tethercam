@@ -33,7 +33,7 @@ fn header(command: u32, seq: u32, endpoint: u32, direction: u32, length: u32) ->
     bytes
 }
 
-async fn import(server: &Server) -> io::Result<TcpStream> {
+async fn import(server: &Server) -> Result<TcpStream, tethercam::test_support::Error> {
     let mut socket = TcpStream::connect(server.address).await?;
     socket.write_all(&wire::operation(0x8003, 0)).await?;
     let mut bus = [0; 32];
@@ -49,7 +49,9 @@ async fn import(server: &Server) -> io::Result<TcpStream> {
     Ok(socket)
 }
 
-async fn control(socket: &mut TcpStream, seq: u32, setup: [u8; 8]) -> io::Result<(u32, Vec<u8>)> {
+async fn control(
+    socket: &mut TcpStream, seq: u32, setup: [u8; 8],
+) -> Result<(u32, Vec<u8>), tethercam::test_support::Error> {
     let [kind, _, _, _, _, _, low, high] = setup;
     let length = u16::from_le_bytes([low, high]);
     let mut request = header(1, seq, 0, u32::from(kind >> 7), u32::from(length));

@@ -137,7 +137,7 @@ or detach. Local native testing requires explicitly preconfigured delegated acce
 `src/transport/usb/nusb_backend.rs`, only when `CI` is absent and VHCI is absent. It is announced
 loudly; any `CI` value disables it, and no other source file is eligible.
 
-The off-by-default `test-support` feature publishes reusable `DeviceModel`/`Server` APIs and
+The next `0.0.2` release adds the off-by-default `test-support` feature with reusable `DeviceModel`/`Server` APIs and
 diagnostics, separate from normal camera runtime. The optional `repo-tools` feature builds
 `tethercam-tools` for native provisioning, protected client inputs, subprocess verification,
 offline profiling summaries and release-tag validation. Default install/run behavior is unchanged.

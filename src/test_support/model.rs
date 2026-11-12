@@ -4,14 +4,14 @@
 //! - <https://www.usb.org/document-library/still-image-capture-device-definition-10-and-errata-16-mar-2007>
 
 use std::future::Future;
-use std::io;
+
 use std::time::Duration;
 
 use crate::transport::sim::SimCamera;
 use crate::transport::sim::sony::{SonySimConfig, sony_camera};
 use crate::transport::{Endpoint, Transport, TransportError};
 
-use super::{Control, Identity, wire};
+use super::{Control, Error, Identity, wire};
 
 const LIMIT: Duration = Duration::from_secs(5);
 
@@ -30,7 +30,7 @@ pub trait DeviceModel: Send + 'static {
     /// Execute class/vendor control or endpoint halt clearing; unknown requests stall.
     fn control(
         &mut self, setup: [u8; 8], payload: &[u8],
-    ) -> impl Future<Output = io::Result<Control>> + Send;
+    ) -> impl Future<Output = Result<Control, Error>> + Send;
 }
 
 /// Sony/SICDD fixture using the production simulator and its transaction cancellation.
@@ -95,7 +95,7 @@ impl DeviceModel for Sony {
         }
     }
 
-    async fn control(&mut self, setup: [u8; 8], payload: &[u8]) -> io::Result<Control> {
+    async fn control(&mut self, setup: [u8; 8], payload: &[u8]) -> Result<Control, Error> {
         let [
             kind,
             request,
@@ -132,17 +132,14 @@ impl DeviceModel for Sony {
                     _ => None,
                 };
                 if let Some(endpoint) = endpoint {
-                    self.camera
-                        .clear_halt(endpoint, LIMIT)
-                        .await
-                        .map_err(io::Error::other)?;
+                    self.camera.clear_halt(endpoint, LIMIT).await?;
                     Some(Vec::new())
                 } else {
                     None
                 }
             }
             (0x21, 0x66) if !self.class_stall && index == 0 && length == 0 => {
-                self.camera.reset(LIMIT).await.map_err(io::Error::other)?;
+                self.camera.reset(LIMIT).await?;
                 self.status = 0x2001;
                 self.busy_status = false;
                 flush_bulk = true;
@@ -213,7 +210,7 @@ impl DeviceModel for Synthetic {
 
     fn control(
         &mut self, _setup: [u8; 8], _payload: &[u8],
-    ) -> impl Future<Output = io::Result<Control>> + Send {
+    ) -> impl Future<Output = Result<Control, Error>> + Send {
         std::future::ready(Ok(Control {
             data: None,
             flush_bulk: false,
