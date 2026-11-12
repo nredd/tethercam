@@ -53,6 +53,24 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 - `DeviceInfo`, `ObjectInfo`, `DevicePropDesc`: dataset decode and encode. Decoders are total (typed `CodecError`, never a panic) and ignore trailing padding
 - `OperationCode`, `ResponseCode`, `EventCode`, `DevicePropCode`: `u16` newtypes with named constants. Vendor codes pass through; `Display` names standard codes and prints the rest as hex
 
+### RTSP server contract
+
+- `rtsp::MediaSource` hands the server ready RTP packets as bytes plus a `TrackInfo` (codec, clock
+  rate, `fmtp`) for SDP. The server pulls only while a client is playing
+- `on_first_subscriber` / `on_last_unsubscribe` fire on the first `PLAY` and the last leaver, so
+  the supervisor can start and stop the capture pipeline
+- Each client has a bounded queue; a full queue drops packets for that client only
+- Sessions are bound to the control connection that created them and die with it. UDP media goes
+  only to that connection's peer address
+- Digest nonces are server-issued, expire, and carry an `nc` high-water mark; a repeated `nc` is a
+  replay
+- RFC 2069 clients (`qop`-less `MD5`, e.g. live555-based) are accepted. Their nonce is valid only on
+  the control connection that received it and until it expires; a correct digest on another
+  connection or an expired nonce gets `401` with `stale=true`. Replay is therefore bounded to
+  someone who already owns that TCP connection. `SHA-256` always requires `qop`
+- Source hooks and polls run on one task per fan-out: a stop finishes cancelling the pump before
+  the stop hook runs or a new start begins, so hooks lag the subscription slightly and never overlap
+
 ## Streams
 
 The camera produces two things over USB:

@@ -14,6 +14,7 @@ All notable changes to this project are documented here. The format follows
 
 - ONVIF Device and Media services (`tethercam::onvif`): SOAP 1.2 parser, WS-Security `UsernameToken` digest with replay cache, HTTP Digest, bounded HTTP/1.1 server, snapshot endpoint, golden tests and benchmark
 - WS-Discovery responder for ONVIF (`tethercam::onvif::discovery`): `Hello`/`Bye`, `Probe`/`Resolve` matching in both the ONVIF-era (2005/04) and WS-Discovery 1.1 dialects, with per-source and global rate limits (reflected traffic bounded) and de-duplication
+- RTSP 1.0 server (`tethercam::rtsp`): `OPTIONS`/`DESCRIBE`/`SETUP`/`PLAY`/`TEARDOWN`/`GET_PARAMETER`, TCP-interleaved and UDP unicast RTP, RTCP sender reports, Digest authentication (`SHA-256`, `MD5`) on every request, `MediaSource` trait with drop-on-full fan-out and on-demand start/stop, RFC 2069 `qop`-less `MD5` accepted for live555-style clients
 - PTP generic container codec (`tethercam::ptp`) with property tests and benchmarks
 - `Transport` trait, scriptable simulated camera (`transport::sim`) and PTP session engine (`ptp::session`) with stall and wedge recovery
 - Project scaffold: gate (`make all`), CI workflows, crates.io release workflow
