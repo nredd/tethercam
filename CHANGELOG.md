@@ -20,6 +20,7 @@ All notable changes to this project are documented here. The format follows
 
 - Deterministic configuration failure tests and full coverage for `src/config.rs`
 - Configurable outgoing and simulated PTP container payload limits, checked before encoding
+- Sony SDIO extension driver (`tethercam::sony`): connect handshake with protocol-generation negotiation (2.00 and 3.00), property table with change tracking, property writes and shutter controls, live-view frames with the Sony header stripped, still capture and download, battery and power source, protocol fallback from 3.00 to 2.00 (including after a stalled request), deadline-based waits with a short event-poll timeout, capability detection and a per-model quirks registry. `transport::sim::sony` teaches the simulated camera the extension for both generations, `transport::sim::Responder` lets any extension keep state. Adds the `sony_live_view` benchmark and an `#[ignore]`d hardware soak test
 - Coverage gate: `make coverage` (part of `make all`) and a `Coverage` workflow require 100% line, function and region coverage of `src/` via `cargo-llvm-cov`; `coverage-pending.txt` lists the files exempt during the transition and may only shrink
 - `tethercam::cli::run`, the testable core of the binary, with an integration test that runs the built binary
 - PTP data types, `DeviceInfo` / `ObjectInfo` / `DevicePropDesc` datasets and operation, response, event and property code tables (`tethercam::ptp`)

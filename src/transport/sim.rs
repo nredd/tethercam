@@ -29,6 +29,8 @@ use super::{Endpoint, Transport, TransportError};
 use crate::ptp::session::code;
 use crate::ptp::{Container, ContainerHeader, ContainerKind, HEADER_LEN, PayloadLen};
 
+pub mod sony;
+
 /// A fault injected into an endpoint with [`SimCamera::inject`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
@@ -131,6 +133,31 @@ impl Reply {
     }
 }
 
+/// A vendor extension plugged into a [`SimCamera`] with [`SimCamera::with_responder`].
+///
+/// Scripted operations answer with a fixed [`Reply`]; an extension keeps state, so it can answer
+/// the same operation differently over time and react to the data the host sends. It is
+/// consulted after the built-in session operations and before the scripted ones.
+pub trait Responder: std::fmt::Debug + Send {
+    /// Handles `operation`, or returns `None` to leave it to the scripted operations. A reply
+    /// with `expects_data_out` is completed by [`Responder::data_out`].
+    fn command(&mut self, operation: u16, params: &[u32]) -> Option<Reply>;
+
+    /// Completes an operation whose reply expected a host-to-device data phase, or returns
+    /// `None` to answer with the reply [`Responder::command`] produced.
+    fn data_out(&mut self, operation: u16, params: &[u32], payload: &[u8]) -> Option<Reply>;
+
+    /// The session opened (`true`) or ended by `CloseSession` or a device reset (`false`).
+    fn session_changed(&mut self, open: bool);
+
+    /// Whether the camera stalls the bulk pipe instead of answering `operation`.
+    fn stall(&mut self, operation: u16, params: &[u32]) -> bool;
+
+    /// Events to deliver on the interrupt pipe now, as `(code, params)`. Called after every
+    /// command, data phase and reset; the extension hands each event out once.
+    fn take_events(&mut self) -> Vec<(u16, Vec<u32>)>;
+}
+
 /// A command the camera received, for assertions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
@@ -147,6 +174,7 @@ pub struct CommandRecord {
 struct PendingData {
     code: u16,
     transaction_id: u32,
+    params: Vec<u32>,
     reply: Reply,
 }
 
@@ -165,6 +193,8 @@ enum Link {
 pub struct SimCamera {
     device_info: Vec<u8>,
     operations: HashMap<u16, Reply>,
+    responder: Option<Box<dyn Responder>>,
+    idle_sink: Option<fn(Duration)>,
     wedge_model: bool,
     max_packet_size: usize,
     max_payload: usize,
@@ -201,6 +231,8 @@ impl SimCamera {
         Self {
             device_info: Vec::new(),
             operations: HashMap::new(),
+            responder: None,
+            idle_sink: None,
             wedge_model: true,
             max_packet_size: 512,
             max_payload: 256 * 1024 * 1024,
@@ -236,6 +268,22 @@ impl SimCamera {
     #[must_use]
     pub fn with_operation(mut self, operation: u16, reply: Reply) -> Self {
         self.operations.insert(operation, reply);
+        self
+    }
+
+    /// Plugs in a vendor extension. Replaces any earlier one.
+    #[must_use]
+    pub fn with_responder(mut self, responder: impl Responder + 'static) -> Self {
+        self.responder = Some(Box::new(responder));
+        self
+    }
+
+    /// Calls `sink` with the requested timeout whenever a receive finds nothing queued, just
+    /// before it times out. Real hardware spends that time waiting; a test passes a sink that
+    /// advances its injected clock by it.
+    #[must_use]
+    pub fn with_idle_sink(mut self, sink: fn(Duration)) -> Self {
+        self.idle_sink = Some(sink);
         self
     }
 
@@ -387,11 +435,17 @@ impl SimCamera {
     /// Delivers up to `buffer.len()` bytes of the next queued transfer.
     fn receive(
         queue_of: fn(&mut Self) -> &mut VecDeque<Vec<u8>>, camera: &mut Self, endpoint: Endpoint,
-        buffer: &mut [u8],
+        buffer: &mut [u8], timeout: Duration,
     ) -> Result<usize, TransportError> {
         let short = camera.begin(endpoint)?;
+        let sink = camera.idle_sink;
         let queue = queue_of(camera);
-        let transfer = queue.pop_front().ok_or(TransportError::Timeout)?;
+        let Some(transfer) = queue.pop_front() else {
+            if let Some(sink) = sink {
+                sink(timeout);
+            }
+            return Err(TransportError::Timeout);
+        };
         let mut deliver = transfer.len().min(buffer.len());
         if let Some(limit) = short {
             deliver = deliver.min(limit);
@@ -457,8 +511,13 @@ impl SimCamera {
             }
         };
         self.host_buffer.clear();
+        let reply = self
+            .responder
+            .as_mut()
+            .and_then(|r| r.data_out(pending.code, &pending.params, &payload))
+            .unwrap_or(pending.reply);
         self.received_data.push(payload);
-        self.respond(pending.code, pending.transaction_id, &pending.reply)
+        self.respond(pending.code, pending.transaction_id, &reply)
     }
 
     /// Strict device-side checks: `OpenSession` carries transaction id 0 and one non-zero
@@ -500,12 +559,13 @@ impl SimCamera {
         }
         let reply = match rejection {
             Some(response) => Reply::with_code(response),
-            None => self.execute(op)?,
+            None => self.execute(op, params)?,
         };
         if reply.expects_data_out && reply.response == code::RESPONSE_OK {
             self.pending = Some(PendingData {
                 code: op,
                 transaction_id,
+                params: params.to_vec(),
                 reply,
             });
             return Ok(());
@@ -514,7 +574,7 @@ impl SimCamera {
     }
 
     /// Runs a validated command and returns its reply.
-    fn execute(&mut self, op: u16) -> Result<Reply, TransportError> {
+    fn execute(&mut self, op: u16, params: &[u32]) -> Result<Reply, TransportError> {
         Ok(match op {
             code::OPEN_SESSION if self.session_open => {
                 if self.wedge_model {
@@ -526,16 +586,25 @@ impl SimCamera {
             code::OPEN_SESSION => {
                 self.session_open = true;
                 self.expected_transaction = 1;
+                self.notify_session(true);
                 Reply::ok()
             }
             code::CLOSE_SESSION => {
                 self.session_open = false;
+                self.notify_session(false);
                 Reply::ok()
             }
             code::GET_DEVICE_INFO => Reply::data(self.device_info.clone()),
-            _ => match self.operations.get(&op) {
-                Some(reply) => reply.clone(),
-                None => Reply::with_code(code::OPERATION_NOT_SUPPORTED),
+            _ if self.responder.as_mut().is_some_and(|r| r.stall(op, params)) => {
+                self.halt(Endpoint::BulkOut);
+                return Err(TransportError::Stall);
+            }
+            _ => match self.responder.as_mut().and_then(|r| r.command(op, params)) {
+                Some(reply) => reply,
+                None => match self.operations.get(&op) {
+                    Some(reply) => reply.clone(),
+                    None => Reply::with_code(code::OPERATION_NOT_SUPPORTED),
+                },
             },
         })
     }
@@ -621,7 +690,29 @@ impl SimCamera {
         self.begin(Endpoint::BulkOut)?;
         self.bulk_out_transfers.push(bytes.len());
         self.host_buffer.extend_from_slice(bytes);
-        self.process()
+        let result = self.process();
+        self.flush_responder_events();
+        result
+    }
+
+    fn notify_session(&mut self, open: bool) {
+        if let Some(responder) = self.responder.as_mut() {
+            responder.session_changed(open);
+        }
+    }
+
+    /// Moves the extension's pending events onto the interrupt pipe. An event that cannot be
+    /// encoded (more parameters than a container holds) is dropped.
+    fn flush_responder_events(&mut self) {
+        let events = self
+            .responder
+            .as_mut()
+            .map(|r| r.take_events())
+            .unwrap_or_default();
+        for (event, params) in events {
+            // Only too many parameters can fail the push; such an event is dropped.
+            let _ = self.push_event(event, 0xFFFF_FFFF, &params);
+        }
     }
 
     fn halt_cleared(&mut self, endpoint: Endpoint) -> Result<(), TransportError> {
@@ -650,6 +741,7 @@ impl SimCamera {
         self.halted = [false; 3];
         self.link = Link::Up;
         self.session_open = false;
+        self.notify_session(false);
         self.pending = None;
         self.host_buffer.clear();
         self.bulk_in.clear();
@@ -667,24 +759,26 @@ impl Transport for SimCamera {
     }
 
     fn bulk_in(
-        &mut self, bytes: &mut [u8], _timeout: Duration,
+        &mut self, bytes: &mut [u8], timeout: Duration,
     ) -> impl Future<Output = Result<usize, TransportError>> + Send {
         std::future::ready(Self::receive(
             |c| &mut c.bulk_in,
             self,
             Endpoint::BulkIn,
             bytes,
+            timeout,
         ))
     }
 
     fn interrupt_in(
-        &mut self, bytes: &mut [u8], _timeout: Duration,
+        &mut self, bytes: &mut [u8], timeout: Duration,
     ) -> impl Future<Output = Result<usize, TransportError>> + Send {
         std::future::ready(Self::receive(
             |c| &mut c.interrupt_in,
             self,
             Endpoint::InterruptIn,
             bytes,
+            timeout,
         ))
     }
 

@@ -275,6 +275,13 @@ impl<T: Transport> Session<T> {
         self.transport
     }
 
+    /// The current time on this handle's clock (see [`Session::with_clock`]), so callers
+    /// measure their own deadlines on the same injected clock.
+    #[must_use]
+    pub fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
     /// Whether a session is open on this handle.
     #[must_use]
     pub fn is_open(&self) -> bool {
@@ -414,11 +421,21 @@ impl<T: Transport> Session<T> {
     /// Transport errors other than a timeout, or a malformed or non-event container. A stall
     /// clears the interrupt endpoint's halt before returning.
     pub async fn poll_event(&mut self) -> Result<Option<Event>, SessionError> {
+        self.poll_event_within(self.config.timeout).await
+    }
+
+    /// As [`Session::poll_event`], waiting at most `timeout` for an event instead of
+    /// [`SessionConfig::timeout`]. An idle interrupt pipe holds the call for the whole wait on
+    /// real hardware, so loops that poll between other work pass a short one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::poll_event`].
+    pub async fn poll_event_within(
+        &mut self, timeout: Duration,
+    ) -> Result<Option<Event>, SessionError> {
         let mut bytes = [0_u8; EVENT_BUFFER_LEN];
-        let read = self
-            .transport
-            .interrupt_in(&mut bytes, self.config.timeout)
-            .await;
+        let read = self.transport.interrupt_in(&mut bytes, timeout).await;
         let len = match read {
             Ok(0) | Err(TransportError::Timeout) => return Ok(None),
             Ok(len) => len,
