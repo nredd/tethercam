@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use super::{Endpoint, Transport, TransportError};
 use crate::ptp::session::code;
-use crate::ptp::{Container, ContainerKind, HEADER_LEN};
+use crate::ptp::{Container, ContainerHeader, ContainerKind, HEADER_LEN, PayloadLen};
 
 /// A fault injected into an endpoint with [`SimCamera::inject`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +167,7 @@ pub struct SimCamera {
     operations: HashMap<u16, Reply>,
     wedge_model: bool,
     max_packet_size: usize,
+    max_payload: usize,
     session_open: bool,
     expected_transaction: u32,
     link: Link,
@@ -181,6 +182,10 @@ pub struct SimCamera {
     bulk_out_transfers: Vec<usize>,
     clear_halts: usize,
     resets: usize,
+    #[cfg(test)]
+    pub(crate) fail_clear: usize,
+    #[cfg(test)]
+    pub(crate) fail_reset: bool,
 }
 
 impl Default for SimCamera {
@@ -198,6 +203,7 @@ impl SimCamera {
             operations: HashMap::new(),
             wedge_model: true,
             max_packet_size: 512,
+            max_payload: 256 * 1024 * 1024,
             session_open: false,
             expected_transaction: 1,
             link: Link::Up,
@@ -212,6 +218,10 @@ impl SimCamera {
             bulk_out_transfers: Vec::new(),
             clear_halts: 0,
             resets: 0,
+            #[cfg(test)]
+            fail_clear: 0,
+            #[cfg(test)]
+            fail_reset: false,
         }
     }
 
@@ -243,6 +253,13 @@ impl SimCamera {
         self
     }
 
+    /// Sets the maximum payload size of generated data, response, and event containers.
+    #[must_use]
+    pub fn with_max_payload(mut self, max_payload: usize) -> Self {
+        self.max_payload = max_payload;
+        self
+    }
+
     /// Injects `fault` into `endpoint` after `after` more operations on it succeed.
     pub fn inject(&mut self, endpoint: Endpoint, after: usize, fault: Fault) {
         self.injections.push(Injection {
@@ -260,8 +277,9 @@ impl SimCamera {
     pub fn push_event(
         &mut self, event: u16, transaction_id: u32, params: &[u32],
     ) -> Result<(), TransportError> {
+        let len = validate_payload(params.len().saturating_mul(4), self.max_payload)?;
         let payload: Vec<u8> = params.iter().flat_map(|p| p.to_le_bytes()).collect();
-        let bytes = encode(ContainerKind::Event, event, transaction_id, &payload)?;
+        let bytes = encode(ContainerKind::Event, event, transaction_id, &payload, len);
         self.interrupt_in.push_back(bytes);
         Ok(())
     }
@@ -330,18 +348,16 @@ impl SimCamera {
         if self.link == Link::Gone {
             return Err(TransportError::Disconnected);
         }
-        let halted = self.halted.get(slot(endpoint)).copied().unwrap_or_default();
+        let halted = *halt_flag(&mut self.halted, endpoint);
         if halted || (self.link == Link::Wedged && endpoint != Endpoint::InterruptIn) {
             return Err(TransportError::Stall);
         }
-        let Some(index) = self
+        let Some((index, injection)) = self
             .injections
-            .iter()
-            .position(|inj| inj.endpoint == endpoint)
+            .iter_mut()
+            .enumerate()
+            .find(|(_, inj)| inj.endpoint == endpoint)
         else {
-            return Ok(None);
-        };
-        let Some(injection) = self.injections.get_mut(index) else {
             return Ok(None);
         };
         if injection.remaining > 0 {
@@ -365,9 +381,7 @@ impl SimCamera {
     }
 
     fn halt(&mut self, endpoint: Endpoint) {
-        if let Some(flag) = self.halted.get_mut(slot(endpoint)) {
-            *flag = true;
-        }
+        *halt_flag(&mut self.halted, endpoint) = true;
     }
 
     /// Delivers up to `buffer.len()` bytes of the next queued transfer.
@@ -383,8 +397,8 @@ impl SimCamera {
             deliver = deliver.min(limit);
         }
         let (head, tail) = transfer.split_at(deliver);
-        if let Some(out) = buffer.get_mut(..deliver) {
-            out.copy_from_slice(head);
+        for (out, byte) in buffer.iter_mut().zip(head) {
+            *out = *byte;
         }
         if short.is_none() && !tail.is_empty() {
             queue.push_front(tail.to_vec());
@@ -531,16 +545,27 @@ impl SimCamera {
         &mut self, op: u16, transaction_id: u32, reply: &Reply,
     ) -> Result<(), TransportError> {
         let data = match &reply.data_in {
-            Some(payload) => Some(encode(ContainerKind::Data, op, transaction_id, payload)?),
+            Some(payload) => {
+                let len = validate_payload(payload.len(), self.max_payload)?;
+                Some(encode(
+                    ContainerKind::Data,
+                    op,
+                    transaction_id,
+                    payload,
+                    len,
+                ))
+            }
             None => None,
         };
+        let len = validate_payload(reply.params.len().saturating_mul(4), self.max_payload)?;
         let params: Vec<u8> = reply.params.iter().flat_map(|p| p.to_le_bytes()).collect();
         let response = encode(
             ContainerKind::Response,
             reply.response,
             transaction_id,
             &params,
-        )?;
+            len,
+        );
         if let Some(cuts) = &reply.cuts {
             let mut stream = data.unwrap_or_default();
             stream.extend_from_slice(&response);
@@ -568,27 +593,27 @@ impl SimCamera {
     }
 }
 
-fn slot(endpoint: Endpoint) -> usize {
+fn halt_flag(halted: &mut [bool; 3], endpoint: Endpoint) -> &mut bool {
+    let [bulk_out, bulk_in, interrupt_in] = halted;
     match endpoint {
-        Endpoint::BulkOut => 0,
-        Endpoint::BulkIn => 1,
-        Endpoint::InterruptIn => 2,
+        Endpoint::BulkOut => bulk_out,
+        Endpoint::BulkIn => bulk_in,
+        Endpoint::InterruptIn => interrupt_in,
     }
 }
 
+fn validate_payload(len: usize, max: usize) -> Result<PayloadLen, TransportError> {
+    PayloadLen::new(len, max).map_err(|err| TransportError::Other(err.to_string()))
+}
+
 fn encode(
-    kind: ContainerKind, code: u16, transaction_id: u32, payload: &[u8],
-) -> Result<Vec<u8>, TransportError> {
+    kind: ContainerKind, code: u16, transaction_id: u32, payload: &[u8], len: PayloadLen,
+) -> Vec<u8> {
+    let header = ContainerHeader::for_payload(kind, code, transaction_id, len);
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    Container {
-        kind,
-        code,
-        transaction_id,
-        payload,
-    }
-    .encode_into(&mut out)
-    .map_err(|err| TransportError::Other(err.to_string()))?;
-    Ok(out)
+    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(payload);
+    out
 }
 
 impl SimCamera {
@@ -600,17 +625,24 @@ impl SimCamera {
     }
 
     fn halt_cleared(&mut self, endpoint: Endpoint) -> Result<(), TransportError> {
+        #[cfg(test)]
+        if self.fail_clear > 0 {
+            self.fail_clear -= 1;
+            return Err(TransportError::Other("injected".into()));
+        }
         if self.link == Link::Gone {
             return Err(TransportError::Disconnected);
         }
         self.clear_halts += 1;
-        if let Some(flag) = self.halted.get_mut(slot(endpoint)) {
-            *flag = false;
-        }
+        *halt_flag(&mut self.halted, endpoint) = false;
         Ok(())
     }
 
     fn reset_state(&mut self) -> Result<(), TransportError> {
+        #[cfg(test)]
+        if self.fail_reset {
+            return Err(TransportError::Other("reset".into()));
+        }
         if self.link == Link::Gone {
             return Err(TransportError::Disconnected);
         }
@@ -941,6 +973,39 @@ mod tests {
         let mut camera = SimCamera::new().with_operation(0x9001, Reply::ok());
         send(&mut camera, 0x9001, 1, &[]).await;
         assert_eq!(response_code(&mut camera).await, code::SESSION_NOT_OPEN);
+    }
+
+    #[test]
+    fn generated_containers_reject_oversized_payloads() {
+        let mut camera = SimCamera::new().with_max_payload(3);
+        assert!(camera.push_event(0x4002, 0, &[1]).is_err());
+        assert!(camera.respond(0x9001, 1, &Reply::data(vec![0; 4])).is_err());
+        assert!(
+            camera
+                .respond(0x9001, 1, &Reply::ok().with_params(&[1]))
+                .is_err()
+        );
+        assert!(camera.bulk_in.is_empty());
+        assert!(camera.interrupt_in.is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_disconnected_and_exact_cut() {
+        let mut camera = SimCamera {
+            link: Link::Gone,
+            ..SimCamera::default()
+        };
+        assert_eq!(
+            camera.begin(Endpoint::BulkIn),
+            Err(TransportError::Disconnected)
+        );
+
+        let mut reply = Reply::ok();
+        reply.cuts = Some(vec![HEADER_LEN]);
+        let mut camera = SimCamera::new();
+        camera.respond(0x9001, 1, &reply).unwrap();
+        assert_eq!(read(&mut camera, 64).await.unwrap().len(), HEADER_LEN);
+        assert_eq!(read(&mut camera, 64).await, Err(TransportError::Timeout));
     }
 
     #[tokio::test]

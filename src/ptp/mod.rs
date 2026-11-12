@@ -19,7 +19,7 @@ pub mod session;
 pub use codec::{CodecError, MAX_STRING_UNITS, Reader, Writer};
 pub use codes::{DevicePropCode, EventCode, OperationCode, ResponseCode};
 pub use container::{
-    Container, ContainerError, ContainerHeader, ContainerKind, HEADER_LEN, MAX_PARAMS,
+    Container, ContainerError, ContainerHeader, ContainerKind, HEADER_LEN, MAX_PARAMS, PayloadLen,
 };
 pub use dataset::{DeviceInfo, DevicePropDesc, GetSet, ObjectInfo, PropertyForm};
 pub use datatype::{DataType, Value};

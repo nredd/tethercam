@@ -8,7 +8,6 @@ src/onvif/model.rs #29
 src/onvif/service.rs #29
 src/onvif/soap.rs #29
 src/onvif/time.rs #29
-src/ptp/session.rs #27
 src/rtsp/connection.rs #31
 src/rtsp/digest.rs #31
 src/rtsp/message.rs #31
@@ -16,4 +15,3 @@ src/rtsp/rtcp.rs #31
 src/rtsp/server.rs #31
 src/rtsp/setup.rs #31
 src/rtsp/source.rs #31
-src/transport/sim.rs #27

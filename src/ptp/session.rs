@@ -7,8 +7,6 @@
 //!
 //! Session hygiene is part of the contract, because a camera whose session was abandoned
 //! without `CloseSession` stalls the next `OpenSession` until it is reset:
-//! - [`Session::scoped`] opens a session, runs a closure and closes the session on every exit
-//!   path, including errors from the closure. Prefer it to calling `open` and `close` by hand
 //! - [`Session::open`] recovers from a stalled or wedged camera: clear the halted endpoints,
 //!   retry, then reset the device and retry once more, and only then give up
 //! - [`Session::close`] sends `CloseSession`. If `CloseSession` fails, or the pipe state is
@@ -31,10 +29,9 @@
 //! completes is a success even if it ran over, because the camera has already acted on it. A
 //! missed deadline is never retried, including in `open`. A cancelled or abandoned future is not bounded by it.
 //!
-//! Dropping a [`Session`] cannot send `CloseSession` (drop is not async), and cancelling a
-//! [`Session::scoped`] future skips its close. Always run the future to completion. If a
-//! transaction future is cancelled after its command was sent, the handle refuses further
-//! transactions and `close` resets the device.
+//! Dropping a [`Session`] cannot send `CloseSession` (drop is not async). Call `close`
+//! explicitly. If a transaction future is cancelled after its command was sent, the handle
+//! refuses further transactions and `close` resets the device.
 //!
 //! This layer takes raw `u16` codes and `&[u32]` parameters and returns raw payload bytes.
 //!
@@ -46,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use super::{Container, ContainerError, ContainerHeader, ContainerKind, HEADER_LEN};
+use super::{Container, ContainerError, ContainerHeader, ContainerKind, HEADER_LEN, PayloadLen};
 use crate::transport::{Endpoint, Transport, TransportError};
 
 /// Operation and response codes this layer needs.
@@ -159,6 +156,8 @@ pub struct SessionConfig {
     pub transfer_size: usize,
     /// Largest data phase accepted from the camera, in bytes.
     pub max_data_len: usize,
+    /// Largest data phase sent to the camera, in bytes.
+    pub max_data_out: usize,
     /// Session id sent in `OpenSession`.
     pub session_id: u32,
     /// Deadline for a whole transaction (or `OpenSession` / `CloseSession`), from the first
@@ -173,6 +172,7 @@ impl Default for SessionConfig {
             max_packet_size: 512,
             transfer_size: 16 * 1024,
             max_data_len: 64 * 1024 * 1024,
+            max_data_out: 256 * 1024 * 1024,
             session_id: 1,
             transaction_timeout: Duration::from_secs(60),
         }
@@ -326,10 +326,13 @@ impl<T: Transport> Session<T> {
             return Ok(());
         }
         self.clear_halts_then_reset().await?;
-        self.try_open().await.map_err(|err| match recoverable(err) {
-            Ok(cause) => SessionError::Unrecoverable(cause),
-            Err(other) => other,
-        })
+        match self.try_open().await {
+            Ok(()) => Ok(()),
+            Err(err) => match recoverable(err) {
+                Ok(cause) => Err(SessionError::Unrecoverable(cause)),
+                Err(other) => Err(other),
+            },
+        }
     }
 
     /// Closes the session. Does nothing when none is open.
@@ -348,26 +351,6 @@ impl<T: Transport> Session<T> {
         let result = self.close_inner().await;
         self.open = false;
         result
-    }
-
-    /// Opens a session, runs `body`, and closes the session on every exit path.
-    ///
-    /// The body's error wins over a close error; a close error after a successful body is
-    /// returned.
-    ///
-    /// # Errors
-    ///
-    /// Any error from [`Session::open`], `body` or [`Session::close`].
-    pub async fn scoped<R>(
-        &mut self, body: impl AsyncFnOnce(&mut Self) -> Result<R, SessionError>,
-    ) -> Result<R, SessionError> {
-        self.open().await?;
-        let result = body(self).await;
-        let closed = self.close().await;
-        match result {
-            Ok(value) => closed.map(|()| value),
-            Err(err) => Err(err),
-        }
     }
 
     /// Runs one transaction: `operation` with `params`, an optional host-to-device data phase
@@ -400,6 +383,11 @@ impl<T: Transport> Session<T> {
         if !self.open || self.dirty || self.in_flight {
             return Err(SessionError::NotOpen);
         }
+        let data_out = data_out
+            .map(|data| {
+                PayloadLen::new(data.len(), self.config.max_data_out).map(|len| (data, len))
+            })
+            .transpose()?;
         let transaction_id = self.take_transaction_id();
         let result = self
             .exchange(operation, params, data_out, (transaction_id, limit))
@@ -577,7 +565,7 @@ impl<T: Transport> Session<T> {
     }
 
     async fn exchange(
-        &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+        &mut self, operation: u16, params: &[u32], data_out: Option<(&[u8], PayloadLen)>,
         (transaction_id, limit): (u32, Duration),
     ) -> Result<Outcome, SessionError> {
         self.deadline = Some(Deadline {
@@ -623,7 +611,8 @@ impl<T: Transport> Session<T> {
     }
 
     async fn exchange_phases(
-        &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>, transaction_id: u32,
+        &mut self, operation: u16, params: &[u32], data_out: Option<(&[u8], PayloadLen)>,
+        transaction_id: u32,
     ) -> Result<Outcome, SessionError> {
         let command = Container::command(operation, transaction_id, params)?;
         self.leftover.clear();
@@ -634,8 +623,8 @@ impl<T: Transport> Session<T> {
             self.in_flight = !matches!(err, SessionError::Transport(TransportError::Stall));
             return Err(err);
         }
-        if let Some(data) = data_out
-            && let Err(err) = self.send_data(operation, transaction_id, data).await
+        if let Some((data, len)) = data_out
+            && let Err(err) = self.send_data(operation, transaction_id, data, len).await
         {
             return Err(self.early_response(transaction_id).await.unwrap_or(err));
         }
@@ -725,16 +714,13 @@ impl<T: Transport> Session<T> {
     /// Sends a data container in whole-packet transfers, then a zero-length packet when the
     /// container ends exactly on a packet boundary.
     async fn send_data(
-        &mut self, operation: u16, transaction_id: u32, data: &[u8],
+        &mut self, operation: u16, transaction_id: u32, data: &[u8], len: PayloadLen,
     ) -> Result<(), SessionError> {
+        let header =
+            ContainerHeader::for_payload(ContainerKind::Data, operation, transaction_id, len);
         let mut wire = Vec::new();
-        Container {
-            kind: ContainerKind::Data,
-            code: operation,
-            transaction_id,
-            payload: data,
-        }
-        .encode_into(&mut wire)?;
+        wire.extend_from_slice(&header.encode());
+        wire.extend_from_slice(data);
         for chunk in wire.chunks(self.config.chunk_size()) {
             self.send(chunk).await?;
         }
@@ -841,6 +827,207 @@ mod tests {
             .iter()
             .map(|c| (c.code, c.transaction_id))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn interrupt_errors_and_close_failures_are_reported() {
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        s.transport
+            .inject(Endpoint::InterruptIn, 0, Fault::Disconnect);
+        assert_eq!(
+            s.poll_event().await,
+            Err(TransportError::Disconnected.into())
+        );
+        assert_eq!(s.close().await, Err(TransportError::Disconnected.into()));
+
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        s.transport.inject(Endpoint::BulkOut, 0, Fault::Stall);
+        s.close().await.unwrap();
+        assert_eq!(s.transport().reset_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_halt_clear_during_open_falls_back_to_reset() {
+        let mut camera = SimCamera::new();
+        camera.inject(Endpoint::BulkOut, 0, Fault::Stall);
+        let mut s = Session::new(
+            FlakyClear {
+                inner: camera,
+                failures: 1,
+                reset_fails: false,
+            },
+            SessionConfig::default(),
+        );
+        s.open().await.unwrap();
+        assert_eq!(s.transport().inner.reset_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn delegated_interrupts_and_missing_deadline() {
+        let mut s = Session::new(
+            FlakyClear {
+                inner: SimCamera::new(),
+                failures: 0,
+                reset_fails: false,
+            },
+            SessionConfig::default(),
+        );
+        assert_eq!(s.poll_event().await.unwrap(), None);
+        assert_eq!(s.transfer_timeout().unwrap(), s.config.timeout);
+        let mut s = trickle_session();
+        assert_eq!(s.poll_event().await.unwrap(), None);
+        let mut s = Session::new(
+            Stalling {
+                inner: SimCamera::new(),
+                step: Duration::ZERO,
+                armed: false,
+                out_calls: 0,
+            },
+            SessionConfig::default(),
+        );
+        assert_eq!(s.poll_event().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn early_response_rejects_missing_or_unsuitable_response() {
+        let mut s = session(SimCamera::new());
+        assert_eq!(s.early_response(1).await, None);
+        s.transport
+            .push_raw_bulk_in(Container::command(code::GET_DEVICE_INFO, 1, &[]).unwrap());
+        assert_eq!(s.early_response(1).await, None);
+    }
+
+    #[tokio::test]
+    async fn open_reports_disconnect_on_final_attempt() {
+        let mut camera = SimCamera::new();
+        camera.inject(Endpoint::BulkOut, 0, Fault::Stall);
+        camera.inject(Endpoint::BulkOut, 0, Fault::Stall);
+        camera.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
+        let mut s = session(camera);
+        assert_eq!(s.open().await, Err(TransportError::Disconnected.into()));
+    }
+
+    #[tokio::test]
+    async fn transaction_rejects_an_unexpected_command() {
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        s.transport
+            .push_raw_bulk_in(Container::command(code::GET_DEVICE_INFO, 1, &[]).unwrap());
+        assert_eq!(
+            s.transaction(code::GET_DEVICE_INFO, &[], None).await,
+            Err(SessionError::UnexpectedContainer {
+                expected: "a data or response container",
+                actual: ContainerKind::Command
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn open_recovery_reports_failed_resets() {
+        for (faults, failures) in [
+            (vec![Fault::Timeout], 0),
+            (vec![Fault::Stall], 1),
+            (vec![Fault::Stall, Fault::Stall], 0),
+        ] {
+            let mut camera = SimCamera::new();
+            for fault in faults {
+                camera.inject(Endpoint::BulkOut, 0, fault);
+            }
+            let mut s = Session::new(
+                FlakyClear {
+                    inner: camera,
+                    failures,
+                    reset_fails: true,
+                },
+                SessionConfig::default(),
+            );
+            assert_eq!(
+                s.open().await,
+                Err(TransportError::Other("reset".into()).into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_retry_reports_disconnect() {
+        let mut camera = SimCamera::new();
+        camera.inject(Endpoint::BulkOut, 0, Fault::Stall);
+        camera.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
+        let mut s = session(camera);
+        assert_eq!(s.open().await, Err(TransportError::Disconnected.into()));
+    }
+
+    #[tokio::test]
+    async fn stale_session_reset_failure_is_reported() {
+        let mut camera = SimCamera::new().with_wedge_model(false);
+        let command = Container::command(code::OPEN_SESSION, 0, &[1]).unwrap();
+        camera
+            .bulk_out(&command, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut buffer = [0; 64];
+        camera
+            .bulk_in(&mut buffer, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut s = Session::new(
+            FlakyClear {
+                inner: camera,
+                failures: 0,
+                reset_fails: true,
+            },
+            SessionConfig::default(),
+        );
+        assert_eq!(
+            s.open().await,
+            Err(TransportError::Other("reset".into()).into())
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_clear_failure_and_device_info_without_session() {
+        let mut camera = SimCamera::new();
+        camera.inject(Endpoint::InterruptIn, 0, Fault::Stall);
+        let mut s = Session::new(
+            FlakyClear {
+                inner: camera,
+                failures: 1,
+                reset_fails: false,
+            },
+            SessionConfig::default(),
+        );
+        assert_eq!(
+            s.poll_event().await,
+            Err(TransportError::Other("injected".into()).into())
+        );
+        let mut s = session(SimCamera::new());
+        assert_eq!(s.get_device_info().await, Err(SessionError::NotOpen));
+    }
+
+    #[tokio::test]
+    async fn command_with_too_many_parameters_is_rejected() {
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        assert!(
+            s.transaction(code::GET_DEVICE_INFO, &[0; 6], None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn data_out_zero_length_packet_failure_is_reported() {
+        let camera = SimCamera::new().with_operation(SEND_OBJECT, Reply::accepting_data());
+        let mut s = session(camera);
+        s.open().await.unwrap();
+        s.transport.inject(Endpoint::BulkOut, 2, Fault::Timeout);
+        assert!(
+            s.transaction(SEND_OBJECT, &[], Some(&payload(500)))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -960,6 +1147,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_data_out_is_rejected_before_sending() {
+        let config = SessionConfig {
+            max_data_out: 3,
+            ..SessionConfig::default()
+        };
+        let mut s = Session::new(SimCamera::new(), config);
+        s.open().await.unwrap();
+        let sent = s.transport().bulk_out_transfers().len();
+        assert_eq!(
+            s.transaction(SEND_OBJECT, &[], Some(&[0; 4])).await,
+            Err(SessionError::Container(ContainerError::PayloadTooLarge(4)))
+        );
+        assert_eq!(s.transport().bulk_out_transfers().len(), sent);
+        assert!(s.is_open());
+    }
+
+    #[tokio::test]
     async fn data_out_off_boundary_sends_no_zlp() {
         let camera = SimCamera::new().with_operation(SEND_OBJECT, Reply::accepting_data());
         let mut s = session(camera);
@@ -1041,6 +1245,92 @@ mod tests {
         *BASE.get_or_init(Instant::now) + ELAPSED.get()
     }
 
+    fn ticking_now() -> Instant {
+        let now = fake_now();
+        ELAPSED.set(ELAPSED.get() + Duration::from_secs(1));
+        now
+    }
+
+    #[tokio::test]
+    async fn simulator_recovery_failures_are_reported() {
+        for (faults, failures) in [
+            (vec![Fault::Timeout], 0),
+            (vec![Fault::Stall], 1),
+            (vec![Fault::Stall, Fault::Stall], 0),
+        ] {
+            let mut camera = SimCamera::new();
+            for fault in faults {
+                camera.inject(Endpoint::BulkOut, 0, fault);
+            }
+            camera.fail_clear = failures;
+            camera.fail_reset = true;
+            let mut s = session(camera);
+            assert_eq!(
+                s.open().await,
+                Err(TransportError::Other("reset".into()).into())
+            );
+        }
+        let mut camera = SimCamera::new().with_wedge_model(false);
+        camera
+            .bulk_out(
+                &Container::command(code::OPEN_SESSION, 0, &[1]).unwrap(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0; 64];
+        camera
+            .bulk_in(&mut buf, Duration::from_secs(1))
+            .await
+            .unwrap();
+        camera.fail_reset = true;
+        let mut s = session(camera);
+        assert_eq!(
+            s.open().await,
+            Err(TransportError::Other("reset".into()).into())
+        );
+        let mut camera = SimCamera::new();
+        camera.fail_clear = 1;
+        camera.inject(Endpoint::InterruptIn, 0, Fault::Stall);
+        let mut s = session(camera);
+        assert_eq!(
+            s.poll_event().await,
+            Err(TransportError::Other("injected".into()).into())
+        );
+    }
+
+    #[tokio::test]
+    async fn simulator_deadline_and_early_response_paths() {
+        ELAPSED.set(Duration::ZERO);
+        let mut s = session(SimCamera::new()).with_clock(ticking_now);
+        s.deadline = Some(Deadline {
+            at: Some(fake_now() + Duration::from_secs(1)),
+            limit: Duration::from_secs(1),
+        });
+        s.transport.inject(Endpoint::BulkIn, 0, Fault::Timeout);
+        assert_eq!(
+            s.early_response(1).await,
+            Some(SessionError::DeadlineExceeded(Duration::from_secs(1)))
+        );
+        assert_eq!(
+            s.read_transfer().await,
+            Err(SessionError::DeadlineExceeded(Duration::from_secs(1)))
+        );
+
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        s.transport.fail_clear = 1;
+        s.transport.fail_reset = true;
+        assert_eq!(
+            s.transaction(0x9999, &[], Some(&[1])).await,
+            Err(SessionError::Response {
+                code: code::OPERATION_NOT_SUPPORTED,
+                params: vec![]
+            })
+        );
+        assert!(s.dirty);
+    }
+
     /// Delivers one byte per read and advances the fake clock by `step` per read, so every
     /// read is within the per-transfer timeout while the transaction as a whole crawls.
     struct Trickle {
@@ -1106,6 +1396,25 @@ mod tests {
             config,
         )
         .with_clock(fake_now)
+    }
+
+    #[tokio::test]
+    async fn trickle_transport_handles_outgoing_data_and_stalls() {
+        let mut s = trickle_session();
+        s.transport.inner = SimCamera::new().with_operation(SEND_OBJECT, Reply::accepting_data());
+        s.open().await.unwrap();
+        s.transaction(SEND_OBJECT, &[], Some(&[1])).await.unwrap();
+        s.config.max_data_out = 0;
+        assert_eq!(
+            s.transaction(SEND_OBJECT, &[], Some(&[1])).await,
+            Err(SessionError::Container(ContainerError::PayloadTooLarge(1)))
+        );
+        s.config.max_data_out = 8;
+        s.transport.inner.inject(Endpoint::BulkOut, 1, Fault::Stall);
+        assert_eq!(
+            s.transaction(SEND_OBJECT, &[], Some(&[1])).await,
+            Err(TransportError::Stall.into())
+        );
     }
 
     #[tokio::test]
@@ -1340,10 +1649,14 @@ mod tests {
             SessionConfig::default(),
         );
         s.open().await.unwrap();
-        assert!(matches!(
-            s.transaction(0x9999, &[], Some(&[1])).await,
-            Err(SessionError::Response { .. })
-        ));
+        let result = s.transaction(0x9999, &[], Some(&[1])).await;
+        assert_eq!(
+            result,
+            Err(SessionError::Response {
+                code: code::OPERATION_NOT_SUPPORTED,
+                params: vec![]
+            })
+        );
         assert!(!s.is_open());
         assert_eq!(s.transport().inner.reset_count(), 1);
     }
@@ -1426,14 +1739,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_event_rejects_truncated_container() {
+        let mut s = session(SimCamera::new());
+        s.transport.push_raw_interrupt(vec![0]);
+        assert_eq!(
+            s.poll_event().await,
+            Err(SessionError::Container(ContainerError::TruncatedHeader(1)))
+        );
+    }
+
+    #[tokio::test]
     async fn poll_event_rejects_non_event_containers() {
         let mut s = session(SimCamera::new());
         s.transport
             .push_raw_interrupt(Container::command(0x1001, 0, &[]).unwrap());
-        assert!(matches!(
-            s.poll_event().await,
-            Err(SessionError::UnexpectedContainer { .. })
-        ));
+        let result = s.poll_event().await;
+        assert_eq!(
+            result,
+            Err(SessionError::UnexpectedContainer {
+                expected: "an event",
+                actual: ContainerKind::Command
+            })
+        );
     }
 
     #[tokio::test]
@@ -1500,12 +1827,13 @@ mod tests {
 
     #[tokio::test]
     async fn failed_open_does_not_leave_the_camera_open() {
-        let mut s = session(SimCamera::new());
+        let mut s = session(SimCamera::new().with_operation(GET_OBJECT, Reply::ok()));
         // The camera accepts OpenSession but the response read hits garbage first.
         s.transport.push_raw_bulk_in(vec![0xFF; 12]);
-        let result = s.scoped(async |_| Ok(())).await;
-        assert!(result.is_err());
+        assert!(s.open().await.is_err());
         assert!(!s.transport().session_open());
+        s.open().await.unwrap();
+        s.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1568,10 +1896,13 @@ mod tests {
         let mut s = session(SimCamera::new());
         s.open().await.unwrap();
         s.transport.push_raw_bulk_in(vec![0xFF; 12]);
-        assert!(matches!(
-            s.transaction(code::GET_DEVICE_INFO, &[], None).await,
-            Err(SessionError::Container(_))
-        ));
+        let result = s.transaction(code::GET_DEVICE_INFO, &[], None).await;
+        assert_eq!(
+            result,
+            Err(SessionError::Container(ContainerError::UnknownKind(
+                u16::MAX
+            )))
+        );
     }
 
     #[tokio::test]
@@ -1739,10 +2070,14 @@ mod tests {
         };
         let mut s = Session::new(camera, config);
         s.open().await.unwrap();
-        assert!(matches!(
-            s.transaction(GET_OBJECT, &[], None).await,
-            Err(SessionError::DataTooLarge { limit: 1000, .. })
-        ));
+        let result = s.transaction(GET_OBJECT, &[], None).await;
+        assert_eq!(
+            result,
+            Err(SessionError::DataTooLarge {
+                announced: 5012,
+                limit: 1000
+            })
+        );
     }
 
     #[tokio::test]
@@ -1781,23 +2116,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_closes_after_success_and_after_error() {
-        let camera = SimCamera::new();
+    async fn explicit_close_after_success_and_after_error() {
+        let camera = SimCamera::new().with_operation(GET_OBJECT, Reply::ok());
         let mut s = session(camera);
-        let ok = s
-            .scoped(async |s| s.transaction(code::GET_DEVICE_INFO, &[], None).await)
-            .await;
-        assert!(ok.is_ok());
+        s.open().await.unwrap();
+        assert!(s.transaction(GET_OBJECT, &[1], None).await.is_ok());
+        s.close().await.unwrap();
         assert!(!s.transport().session_open());
         assert_eq!(
             s.transport().commands().last().map(|c| c.code),
             Some(code::CLOSE_SESSION)
         );
 
-        let err = s
-            .scoped(async |s| s.transaction(0x9999, &[], None).await)
-            .await;
-        assert!(matches!(err, Err(SessionError::Response { .. })));
+        let mut s = session(SimCamera::new());
+        s.open().await.unwrap();
+        let err = s.transaction(GET_OBJECT, &[1], None).await;
+        s.close().await.unwrap();
+        assert_eq!(
+            err,
+            Err(SessionError::Response {
+                code: code::OPERATION_NOT_SUPPORTED,
+                params: vec![]
+            })
+        );
         assert!(!s.transport().session_open());
         assert_eq!(
             s.transport().commands().last().map(|c| c.code),
@@ -1806,15 +2147,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_closes_after_a_fault_so_the_next_open_is_not_wedged() {
+    async fn close_reports_error_after_successful_transaction() {
+        let mut camera = SimCamera::new().with_operation(GET_OBJECT, Reply::ok());
+        camera.inject(Endpoint::BulkOut, 2, Fault::Disconnect);
+        let mut s = session(camera);
+        s.open().await.unwrap();
+        s.transaction(GET_OBJECT, &[1], None).await.unwrap();
+        assert_eq!(s.close().await, Err(TransportError::Disconnected.into()));
+    }
+
+    #[tokio::test]
+    async fn close_after_a_fault_allows_reopening() {
         let camera = SimCamera::new().with_operation(GET_OBJECT, Reply::data(payload(3000)));
         let mut s = session(camera);
         s.transport
             .inject(Endpoint::BulkIn, 1, Fault::ShortRead(20));
-        let result = s
-            .scoped(async |s| s.transaction(GET_OBJECT, &[1], None).await)
-            .await;
+        s.open().await.unwrap();
+        let result = s.transaction(GET_OBJECT, &[1], None).await;
         assert!(result.is_err());
+        s.close().await.unwrap();
         assert!(!s.transport().session_open());
         let mut again = session(s.into_transport());
         again.open().await.unwrap();
@@ -1835,7 +2186,7 @@ mod tests {
             let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
             runtime.block_on(async {
                 let mut camera = SimCamera::new();
-                for transfer in transfers {
+                for transfer in transfers.into_iter().chain(std::iter::once(Vec::new())) {
                     camera.push_raw_bulk_in(transfer);
                 }
                 camera.push_raw_interrupt(events);

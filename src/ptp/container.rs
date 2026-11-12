@@ -31,6 +31,24 @@ fn wire_length(payload_len: usize) -> Result<u32, ContainerError> {
         .ok_or(ContainerError::PayloadTooLarge(payload_len))
 }
 
+/// A payload length validated against an application limit and the PTP wire limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadLen(u32);
+
+impl PayloadLen {
+    /// Validates `len` against `max` and the 32-bit container length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContainerError::PayloadTooLarge`] if either limit is exceeded.
+    pub fn new(len: usize, max: usize) -> Result<Self, ContainerError> {
+        if len > max {
+            return Err(ContainerError::PayloadTooLarge(len));
+        }
+        wire_length(len).map(Self)
+    }
+}
+
 /// Maximum number of `u32` parameters in a command or response container.
 pub const MAX_PARAMS: usize = 5;
 
@@ -104,6 +122,19 @@ pub struct ContainerHeader {
 }
 
 impl ContainerHeader {
+    /// Constructs a header using a previously validated payload length.
+    #[must_use]
+    pub fn for_payload(
+        kind: ContainerKind, code: u16, transaction_id: u32, len: PayloadLen,
+    ) -> Self {
+        Self {
+            length: len.0,
+            kind,
+            code,
+            transaction_id,
+        }
+    }
+
     /// Decodes a header from the start of `bytes`. Trailing bytes are ignored.
     ///
     /// # Errors
@@ -263,6 +294,23 @@ mod tests {
         0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x10, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00,
     ];
+
+    #[test]
+    fn validated_payload_lengths_enforce_both_limits() {
+        let len = PayloadLen::new(4, 4).unwrap();
+        assert_eq!(
+            ContainerHeader::for_payload(ContainerKind::Command, 0x1002, 0, len).encode(),
+            OPEN_SESSION[..HEADER_LEN]
+        );
+        assert_eq!(
+            PayloadLen::new(5, 4),
+            Err(ContainerError::PayloadTooLarge(5))
+        );
+        assert_eq!(
+            PayloadLen::new(usize::MAX, usize::MAX),
+            Err(ContainerError::PayloadTooLarge(usize::MAX))
+        );
+    }
 
     #[test]
     fn command_matches_known_open_session_bytes() {

@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 
 - Do not advertise IPv6 link-local addresses in WS-Discovery `XAddrs`
+### Removed
+
+- `Session::scoped`; callers explicitly open and close sessions
 
 ### Added
 
@@ -16,6 +19,7 @@ All notable changes to this project are documented here. The format follows
 - Deterministic coverage of the media pipeline, removing its files from `coverage-pending.txt`
 
 - Deterministic configuration failure tests and full coverage for `src/config.rs`
+- Configurable outgoing and simulated PTP container payload limits, checked before encoding
 - Coverage gate: `make coverage` (part of `make all`) and a `Coverage` workflow require 100% line, function and region coverage of `src/` via `cargo-llvm-cov`; `coverage-pending.txt` lists the files exempt during the transition and may only shrink
 - `tethercam::cli::run`, the testable core of the binary, with an integration test that runs the built binary
 - PTP data types, `DeviceInfo` / `ObjectInfo` / `DevicePropDesc` datasets and operation, response, event and property code tables (`tethercam::ptp`)
