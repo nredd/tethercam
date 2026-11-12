@@ -23,6 +23,13 @@ pub enum Command {
     Run,
     /// Check clock, ports, permissions and camera readiness.
     Doctor,
+    /// Manage a native service without touching a camera.
+    Service {
+        /// Requested lifecycle operation.
+        action: crate::service::Action,
+        /// Select Linux's unprivileged user manager; macOS is always per-user.
+        user: bool,
+    },
 }
 
 /// Validated CLI syntax. Paths preserve non-UTF-8 OS strings.
@@ -65,6 +72,7 @@ impl Options {
             Some(Some("probe")) => Command::Probe,
             Some(Some("run")) => Command::Run,
             Some(Some("doctor")) => Command::Doctor,
+            Some(Some("service")) => return service(&mut args),
             _ => return Err(ParseError::Invalid),
         };
         let mut options = Self {
@@ -95,6 +103,36 @@ impl Options {
         }
         Ok(options)
     }
+}
+
+fn service(args: &mut dyn Iterator<Item = OsString>) -> Result<Options, ParseError> {
+    use crate::service::Action;
+    let first = args.next().ok_or(ParseError::Invalid)?;
+    let action = match first.to_str() {
+        Some("install") => Action::Install,
+        Some("uninstall") => Action::Uninstall,
+        Some("status") => Action::Status,
+        Some("--help" | "-h") if args.next().is_none() => {
+            return Ok(Options {
+                command: Command::Help,
+                config: None,
+                simulate: None,
+                no_discovery: false,
+            });
+        }
+        _ => return Err(ParseError::Invalid),
+    };
+    let user = match args.next() {
+        None => false,
+        Some(value) if value == "--user" && args.next().is_none() => true,
+        _ => return Err(ParseError::Invalid),
+    };
+    Ok(Options {
+        command: Command::Service { action, user },
+        config: None,
+        simulate: None,
+        no_discovery: false,
+    })
 }
 
 fn path(args: &mut dyn Iterator<Item = OsString>) -> Result<PathBuf, ParseError> {

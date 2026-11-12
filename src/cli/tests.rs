@@ -318,13 +318,76 @@ fn simulator_cli_probe_and_doctor_use_real_driver_transactions() {
     );
 }
 
+#[test]
+fn service_dispatch_is_explicit_and_never_loads_runtime_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let opts = || Options::parse(["service", "status", "--user"].map(std::ffi::OsString::from));
+    let mut out = Vec::new();
+    let mut factory = |user: bool| {
+        assert!(user);
+        Ok(crate::service::Manager::test_status(
+            temp.path().into(),
+            false,
+        ))
+    };
+    super::execute_with_service(
+        opts(),
+        &mut out,
+        Err(config::Error::ConfigDirectory),
+        &mut factory,
+    )
+    .unwrap();
+    assert_eq!(out, b"Service: absent\n");
+    assert!(
+        super::execute_with_service(
+            opts(),
+            &mut out,
+            Err(config::Error::ConfigDirectory),
+            &mut |_| Ok(crate::service::Manager::test_status(
+                temp.path().into(),
+                true
+            ))
+        )
+        .is_err()
+    );
+    let mut full: &mut [u8] = &mut [];
+    assert!(
+        super::execute_with_service(
+            opts(),
+            &mut full,
+            Err(config::Error::ConfigDirectory),
+            &mut factory
+        )
+        .is_err()
+    );
+    let err = super::execute_with_service(
+        opts(),
+        &mut out,
+        Err(config::Error::ConfigDirectory),
+        &mut |_| Err(crate::service::Error::Manager),
+    )
+    .unwrap_err();
+    assert_eq!(
+        kind(&err),
+        kind(&Error::Service(crate::service::Error::Manager))
+    );
+}
+
 #[tokio::test]
 async fn command_dispatch_and_sanitized_probe_failures() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unused.toml");
     let cfg = Config::generate().unwrap();
     let mut out = Vec::new();
-    for command in [Command::Setup, Command::Version, Command::Help] {
+    for command in [
+        Command::Setup,
+        Command::Version,
+        Command::Help,
+        Command::Service {
+            action: crate::service::Action::Status,
+            user: true,
+        },
+    ] {
         super::command(
             Factory::new(Vec::new()),
             &cfg,

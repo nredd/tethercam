@@ -8,6 +8,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- Bind privileged service config ownership changes to validated no-follow file handles, and retain owned uninstall receipts across unlink, sync and native-reload failures
+
 - Reject unrepresentable USB reset deadlines before port I/O instead of panicking
 
 - Reject unusable Digest credential syntax during config validation, before opening a camera
@@ -32,6 +34,8 @@ All notable changes to this project are documented here. The format follows
 - Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors
 
 ### Added
+
+- Explicit `service install|uninstall|status` for protected per-user launchd agents and Linux system/user systemd units, with persisted identity, dedicated system account, Sony USB udev access, native state diagnostics and unlimited graceful stop time
 
 - Loopback-only, pure-Rust USB/IP Sony simulator for real `nusb` Linux backend tests on hosted x64 and arm64 runners, with targeted synthetic-device permissions, stateful cancellation and an export-lifetime memory admission budget
 

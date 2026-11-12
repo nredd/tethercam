@@ -44,7 +44,7 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 | `onvif` | WS-Discovery responder, Device and Media services, WS-Security `UsernameToken` digest, snapshot endpoint |
 | `config` | TOML configuration, credential generation and storage |
 | `supervisor` | Camera hot-plug, reconnect with backoff, session hygiene, battery and power telemetry, on-demand start and stop of the capture pipeline |
-| `service` | Install as a `launchd` agent or `systemd` unit |
+| `service` | Explicit, idempotent native lifecycle for per-user `launchd` agents and Linux system/user `systemd` units, secure generated files and persisted configuration; see [`service.md`](service.md) |
 
 The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 
@@ -65,6 +65,35 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 - Stills: `capture_still` discards a stale in-memory image, half-presses, full-presses, looks once for the image, releases both buttons on every path, then waits if needed for the object-added event or the object-in-memory property (either can be missed) and downloads handle `0xFFFFC001`. Captured and discarded stale images use `SonyConfig::download_timeout` (default five minutes), independent of the capture wait budget
 - Right after connecting, property values read as zero for a few seconds and live view is not ready. Battery readings and stale-image detection are only meaningful after `wait_live_view_ready`
 - The simulated body (`transport::sim::sony`) models the handshake order, both table layouts, the warm-up, denied live-view fetches, shutter and memory behavior, and injectable defects. It is an independent implementation of the protocol, not a mirror of the driver
+
+### Native service contract
+
+- `service::Manager` resolves platform/identity without installing anything. Its explicit
+  `manage` operation owns only fixed standard paths; exact matching, ownership, permission,
+  symlink and hardlink checks prevent replacing unrelated files. Privileged config and directory
+  ownership changes use validated no-follow descriptor-relative opens and same-handle `fchown`,
+  so an unprivileged service account cannot redirect root's chown through a replacement entry.
+  A protected exact-template uninstall receipt survives unlink/sync/reload failures and authorizes
+  only retry cleanup of the owned installation, never arbitrary cached manager jobs. Configuration uses the same
+  protected `Config::load_or_create` identity/credential store as foreground setup and is retained
+  on uninstall. Native argv contains only executable/config paths and fixed manager arguments,
+  never secrets; external command output is not echoed and inherited environment is filtered
+- Generated templates escape XML and systemd independently, including `%`, `$`, quotes and
+  backslashes. Linux system scope requires root, a durable binary under `/usr` or `/opt`,
+  `systemd-sysusers` and Sony-vendor-scoped udev access. User scope never escalates or emits
+  privileged namespace/device hardening that would guarantee startup failure
+- Stop uses unlimited native timeouts (`TimeoutStopSec=infinity`, launchd `ExitTimeOut=0`),
+  preserving the actor's joined five-minute still-download/session hygiene. A truly wedged
+  process can delay uninstall/host shutdown; force-killing remains an explicit operator choice
+- The process runner and concrete syscall table are narrow test seams. Tests execute real
+  temp-root file lifecycles and generated-template native validators, never host daemon,
+  account, udev or physical-camera lifecycle operations. Details and limitations: [`service.md`](service.md)
+
+The Unix service filesystem uses `rustix` with only `std` and `fs` features for safe `openat`
+with `NOFOLLOW`/`DIRECTORY` and `fchown`. Standard Rust exposes path-based chown but not these
+safe descriptor-relative operations. `rustix` is a permissively licensed Rust syscall wrapper,
+already present transitively via `tempfile`; it vendors no C/C++ and requires no native build.
+No local unsafe code, platform-number constants, or new license exception is needed.
 
 ### RTSP server contract
 
@@ -92,7 +121,10 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 ### CLI and supervisor contract
 
 - `cli::Options::parse` is total over OS strings, rejects unknown/duplicate options, preserves
-  non-UTF-8 paths, and consumes at most seven arguments. `setup`, `probe`, `doctor` and `run`
+  non-UTF-8 foreground paths, and consumes at most seven arguments. The bounded `service`
+  syntax accepts only `install|uninstall|status [--user]` and dispatches before runtime config,
+  signals or USB access; service template paths reject unsupported bytes/control characters.
+  `setup`, `probe`, `doctor` and `run`
   use explicit `Write` outputs. Setup loads or atomically creates the existing config-layer
   credentials and UUID; it does not create a second identity or credential store
 - The executable bridges the existing `log` facade into `tracing`. A scoped subscriber takes
