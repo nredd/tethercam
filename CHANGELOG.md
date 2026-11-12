@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Do not advertise IPv6 link-local addresses in WS-Discovery `XAddrs`
+
 ### Added
 
 - Reject fully covered stale entries in `coverage-pending.txt` during `make coverage`

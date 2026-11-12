@@ -566,25 +566,23 @@ mod tests {
 
     #[test]
     fn parses_onvif_probe() {
-        let Request::Probe(p) = parse_request(PROBE_ONVIF.as_bytes()).unwrap() else {
-            panic!("not a probe");
-        };
-        assert_eq!(p.message_id, "uuid:11111111-2222-3333-4444-555555555555");
-        assert_eq!(p.types.len(), 1);
-        assert!(types_match(&p.types));
-        assert_eq!(p.scopes.len(), 0);
+        assert_eq!(
+            parse_request(PROBE_ONVIF.as_bytes()).unwrap(),
+            Request::Probe(ProbeRequest {
+                message_id: "uuid:11111111-2222-3333-4444-555555555555".to_owned(),
+                dialect: Dialect::Legacy,
+                types: vec![QName {
+                    ns: Some(NS_DN.to_owned()),
+                    local: "NetworkVideoTransmitter".to_owned()
+                }],
+                scopes: vec![],
+                match_by: None,
+            })
+        );
     }
 
     #[test]
     fn detects_the_request_dialect() {
-        let Request::Probe(legacy) = parse_request(PROBE_ONVIF.as_bytes()).unwrap() else {
-            panic!("not a probe");
-        };
-        assert_eq!(legacy.dialect, Dialect::Legacy);
-        let Request::Probe(std) = parse_request(PROBE_ANY.as_bytes()).unwrap() else {
-            panic!("not a probe");
-        };
-        assert_eq!(std.dialect, Dialect::Standard);
         // A legacy body with a 2009/01 action is not a valid message in either dialect.
         let mixed = PROBE_ONVIF.replace(
             "http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe<",
@@ -620,14 +618,70 @@ mod tests {
 
     #[test]
     fn parses_untyped_probe_and_resolve() {
-        let Request::Probe(p) = parse_request(PROBE_ANY.as_bytes()).unwrap() else {
-            panic!("not a probe");
-        };
-        assert!(p.types.is_empty() && p.scopes.is_empty());
-        let Request::Resolve(r) = parse_request(RESOLVE.as_bytes()).unwrap() else {
-            panic!("not a resolve");
-        };
-        assert_eq!(r.endpoint, "urn:uuid:01234567-89ab-4def-8123-456789abcdef");
+        assert_eq!(
+            parse_request(PROBE_ANY.as_bytes()).unwrap(),
+            Request::Probe(ProbeRequest {
+                message_id: "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+                dialect: Dialect::Standard,
+                types: vec![],
+                scopes: vec![],
+                match_by: None,
+            })
+        );
+        assert_eq!(
+            parse_request(RESOLVE.as_bytes()).unwrap(),
+            Request::Resolve(ResolveRequest {
+                message_id: "urn:uuid:99999999-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+                dialect: Dialect::Standard,
+                endpoint: "urn:uuid:01234567-89ab-4def-8123-456789abcdef".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn matches_scopes_without_an_authority() {
+        assert!(rfc3986_match("urn:test", "urn:test/path"));
+    }
+
+    #[test]
+    fn rejects_missing_headers_wrong_namespaces_and_long_type_lists() {
+        for (doc, err) in [
+            (PROBE_ANY.replace("<a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe</a:Action>", ""), ParseError::MissingAction),
+            (
+                PROBE_ANY
+                    .replace("<s:Header>", "<s:Other>")
+                    .replace("</s:Header>", "</s:Other>"),
+                ParseError::MissingHeader,
+            ),
+            (
+                PROBE_ANY
+                    .replace("<s:Body>", "<s:Other>")
+                    .replace("</s:Body>", "</s:Other>"),
+                ParseError::MissingBody,
+            ),
+            (
+                PROBE_ANY
+                    .replace("<d:Probe/>", "<Probe xmlns=''/ >")
+                    .replace("/ >", "/>"),
+                ParseError::NotARequest,
+            ),
+            (
+                PROBE_ANY.replace("<d:Probe/>", "<Probe xmlns='urn:unknown'/>"),
+                ParseError::NotARequest,
+            ),
+            (
+                PROBE_ANY.replace(
+                    "<d:Probe/>",
+                    &format!(
+                        "<d:Probe><d:Types>{}</d:Types></d:Probe>",
+                        "d:Thing ".repeat(MAX_LIST + 1)
+                    ),
+                ),
+                ParseError::ListTooLong,
+            ),
+        ] {
+            assert_eq!(parse_request(doc.as_bytes()).unwrap_err(), err);
+        }
     }
 
     #[test]
@@ -658,10 +712,10 @@ mod tests {
         for (doc, want) in cases {
             assert_eq!(parse_request(doc.as_bytes()).unwrap_err(), want);
         }
-        assert!(matches!(
+        assert_eq!(
             parse_request(&[0xff, 0xfe]),
             Err(ParseError::Xml(SyntaxError::NotUtf8))
-        ));
+        );
     }
 
     #[test]

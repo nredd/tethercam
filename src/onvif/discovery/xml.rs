@@ -168,8 +168,9 @@ impl<'a> Parser<'a> {
     fn take_until(&mut self, end: &str) -> Result<&'a str, SyntaxError> {
         let unterminated = SyntaxError::Malformed("unterminated construct");
         let at = self.rest.find(end).ok_or(unterminated)?;
-        let head = self.rest.get(..at).ok_or(unterminated)?;
-        self.rest = self.rest.get(at + end.len()..).ok_or(unterminated)?;
+        // `find` returns a UTF-8 boundary and the matched delimiter ends at one too.
+        let (head, suffix) = self.rest.split_at(at);
+        (_, self.rest) = suffix.split_at(end.len());
         Ok(head)
     }
 
@@ -180,8 +181,11 @@ impl<'a> Parser<'a> {
             .find(|c: char| c.is_whitespace() || matches!(c, '/' | '>' | '='))
             .unwrap_or(self.rest.len());
         let bad = SyntaxError::Malformed("expected a name");
-        let name = self.rest.get(..end).filter(|n| !n.is_empty()).ok_or(bad)?;
-        self.rest = self.rest.get(end..).ok_or(bad)?;
+        let (name, rest) = self.rest.split_at(end);
+        if name.is_empty() {
+            return Err(bad);
+        }
+        self.rest = rest;
         Ok(name)
     }
 
@@ -300,9 +304,9 @@ impl<'a> Parser<'a> {
         loop {
             let unterminated = SyntaxError::Malformed("unterminated element");
             let at = self.rest.find('<').ok_or(unterminated)?;
-            let chunk = self.rest.get(..at).ok_or(unterminated)?;
+            let (chunk, rest) = self.rest.split_at(at);
             text.push_str(&decode(chunk)?);
-            self.rest = self.rest.get(at..).ok_or(unterminated)?;
+            self.rest = rest;
             if self.eat("</") {
                 if self.take_until(">")?.trim() != raw_name {
                     return Err(SyntaxError::Malformed("mismatched end tag"));
@@ -362,10 +366,11 @@ fn decode(input: &str) -> Result<String, SyntaxError> {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(at) = rest.find('&') {
-        out.push_str(rest.get(..at).ok_or(bad)?);
-        let after = rest.get(at + 1..).ok_or(bad)?;
+        let (head, suffix) = rest.split_at(at);
+        out.push_str(head);
+        let (_, after) = suffix.split_at(1);
         let semi = after.find(';').filter(|&i| i <= 10).ok_or(bad)?;
-        let name = after.get(..semi).ok_or(bad)?;
+        let (name, suffix) = after.split_at(semi);
         out.push(match name {
             "lt" => '<',
             "gt" => '>',
@@ -384,7 +389,7 @@ fn decode(input: &str) -> Result<String, SyntaxError> {
                     .ok_or(bad)?
             }
         });
-        rest = after.get(semi + 1..).ok_or(bad)?;
+        (_, rest) = suffix.split_at(1);
     }
     out.push_str(rest);
     Ok(out)
@@ -441,6 +446,69 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn parses_reserved_xml_prefix_and_misc_content() {
+        let root =
+            parse("<root xml:lang='en'><!-- comment --><?pi x?><![CDATA[data]]></root>").unwrap();
+        assert_eq!(root.attrs[0].ns.as_deref(), Some(XML_NS));
+        assert_eq!(root.text, "data");
+        assert_eq!(
+            root.resolve_qname("xml:lang").unwrap().ns.as_deref(),
+            Some(XML_NS)
+        );
+        assert_eq!(
+            parse("<root><!DOCTYPE x></root>").unwrap_err(),
+            SyntaxError::Doctype
+        );
+        assert_eq!(
+            parse("<root x:y='z'/>").unwrap_err(),
+            SyntaxError::UnboundPrefix
+        );
+        assert!(parse("<root x/>").is_err());
+        for bad in [
+            "<r><!--",
+            "<r><?pi",
+            "<r><![CDATA[",
+            "<r xmlns:p='x' p:a='&bogus;'/>",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse("<r xmlns=''><x/></r>").unwrap().children[0].ns, None);
+        for doc in [
+            "<?unfinished",
+            "<!--unfinished",
+            "<r/><?unfinished",
+            "<r/><!--unfinished",
+            "<r>&#no;</r>",
+            "<r>&unfinished</r>",
+            "< >",
+            "<r></r",
+        ] {
+            assert!(parse(doc).is_err(), "{doc}");
+        }
+        assert_eq!(
+            parse("<r xmlns='urn:x'/>")
+                .unwrap()
+                .resolve_qname("x")
+                .unwrap()
+                .ns
+                .as_deref(),
+            Some("urn:x")
+        );
+        assert_eq!(
+            parse("<r xmlns=''/>")
+                .unwrap()
+                .resolve_qname("x")
+                .unwrap()
+                .ns,
+            None
+        );
+        assert_eq!(parse("<r>&amp;;</r>").unwrap().text, "&;");
+        assert_eq!(parse("<r>\u{e000}</r>").unwrap().text, "\u{e000}");
+        let attrs = " a='v'".repeat(MAX_ATTRS + 1);
+        assert!(parse(&format!("<root{attrs}/>")).is_err());
     }
 
     #[test]

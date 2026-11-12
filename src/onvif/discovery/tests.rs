@@ -48,6 +48,8 @@ struct Wire {
     inbox: VecDeque<(SocketAddr, Vec<u8>)>,
     sent: Vec<(usize, SocketAddr, Vec<u8>)>,
     fail_sends: bool,
+    fail_receives: bool,
+    stop_on_receive: Option<std::sync::Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +57,12 @@ struct MemTransport(Rc<RefCell<Wire>>);
 
 impl Transport for MemTransport {
     fn recv(&mut self, buf: &mut [u8], _timeout: Duration) -> Result<Option<Datagram>, Error> {
+        if let Some(stop) = &self.0.borrow().stop_on_receive {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if self.0.borrow().fail_receives {
+            return Err(std::io::Error::other("receive failed").into());
+        }
         let Some((source, data)) = self.0.borrow_mut().inbox.pop_front() else {
             return Ok(None);
         };
@@ -611,7 +619,12 @@ fn scoped_link_local_senders_pick_the_interface_with_that_index() {
         prefix_len: 64,
         index,
     };
-    let e = Engine::new(config_with(vec![ll(4), ll(5)]), Counter(1));
+    let ula = |index| Interface {
+        addr: "fd00::10".parse().unwrap(),
+        prefix_len: 64,
+        index,
+    };
+    let e = Engine::new(config_with(vec![ll(4), ll(5), ula(4), ula(5)]), Counter(1));
     let from = |scope| {
         SocketAddr::V6(std::net::SocketAddrV6::new(
             "fe80::99".parse().unwrap(),
@@ -624,6 +637,79 @@ fn scoped_link_local_senders_pick_the_interface_with_that_index() {
     assert_eq!(e.arrival_interface(from(4)), Some(0));
     assert_eq!(e.arrival_interface(from(9)), None);
     assert_eq!(e.arrival_interface(from(0)), Some(0));
+}
+
+#[test]
+fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
+    struct Capture(std::sync::Mutex<Vec<String>>);
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            self.0.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+    log::set_logger(&CAPTURE).unwrap();
+    log::set_max_level(log::LevelFilter::Warn);
+    let link = Interface {
+        addr: "fe80::10".parse().unwrap(),
+        prefix_len: 64,
+        index: 4,
+    };
+    let ula = Interface {
+        addr: "fd00::10".parse().unwrap(),
+        prefix_len: 64,
+        index: 4,
+    };
+    let service = ServiceAddress {
+        port: 8080,
+        path: "/onvif/device_service".to_owned(),
+    };
+    assert!(matches!(
+        Config::new(
+            EndpointReference::parse(ENDPOINT).unwrap(),
+            vec![],
+            vec![link],
+            service
+        ),
+        Err(ConfigError::NoInterfaces)
+    ));
+    let mut e = Engine::new(config_with(vec![link, ula]), Counter(1));
+    let source = SocketAddr::V6(std::net::SocketAddrV6::new(
+        "fe80::99".parse().unwrap(),
+        4000,
+        0,
+        4,
+    ));
+    let out = e
+        .handle(Instant::now(), source, PROBE_ANY.as_bytes())
+        .unwrap();
+    let text = String::from_utf8(out.payload).unwrap();
+    assert!(text.contains("http://[fd00::10]:8080/"));
+    assert!(!text.contains("fe80"));
+    let cfg = config_with(vec![link, iface(10)]);
+    assert_eq!(cfg.interfaces(), &[iface(10)]);
+    assert!(
+        CAPTURE
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.contains("interface index '4'")
+                && s.contains("no non-link-local IPv6 address"))
+    );
+    let mut e = Engine::new(cfg, Counter(1));
+    assert_eq!(
+        e.handle(Instant::now(), source, PROBE_ANY.as_bytes()),
+        Err(Dropped::OffLink)
+    );
+    assert!(
+        e.handle(Instant::now(), peer(20), PROBE_ANY.as_bytes())
+            .is_ok()
+    );
 }
 
 #[test]
@@ -858,6 +944,36 @@ fn pending_queue_is_bounded() {
     assert_eq!(stats.received, 200);
     assert!(r.responder.pending.len() <= MAX_PENDING);
     assert!(stats.dropped > 0);
+}
+
+#[test]
+fn run_processes_a_successful_step_before_stopping() {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let mut r = rig();
+    r.wire.0.borrow_mut().stop_on_receive = Some(stop.clone());
+    r.responder.run(&stop).unwrap();
+    assert_eq!(r.responder.stats().sent, 2);
+}
+
+#[test]
+fn run_reports_receive_errors_and_still_sends_bye() {
+    let mut r = rig();
+    r.wire.0.borrow_mut().fail_receives = true;
+    assert!(r.responder.run(&AtomicBool::new(false)).is_err());
+    assert_eq!(r.wire.0.borrow().sent.len(), 2);
+}
+
+#[test]
+fn metadata_version_is_advertised() {
+    let mut e = Engine::new(config().with_metadata_version(123), Counter(1));
+    let out = e
+        .handle(Instant::now(), peer(20), PROBE_ANY.as_bytes())
+        .unwrap();
+    assert!(
+        String::from_utf8(out.payload)
+            .unwrap()
+            .contains("<d:MetadataVersion>123</d:MetadataVersion>")
+    );
 }
 
 #[test]

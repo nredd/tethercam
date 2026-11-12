@@ -103,8 +103,8 @@ const POLL: Duration = Duration::from_millis(100);
 /// Why a [`Config`] was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ConfigError {
-    /// No interface was given.
-    #[error("at least one interface is required")]
+    /// No usable interface was given.
+    #[error("at least one interface with an advertisable address is required")]
     NoInterfaces,
     /// More interfaces than the responder serves.
     #[error("at most {MAX_INTERFACES} interfaces are supported")]
@@ -392,6 +392,29 @@ impl Config {
         if !path_ok {
             return Err(ConfigError::InvalidServicePath(service.path));
         }
+        // Link-local senders still need their subnet for matching, but an unscoped URL is
+        // unusable. Keep such entries only when the same interface has an IPv6 URL address.
+        let advertisable: Vec<_> = interfaces
+            .iter()
+            .filter_map(|i| match i.addr {
+                IpAddr::V6(a) if !a.is_unicast_link_local() => Some(i.index),
+                _ => None,
+            })
+            .collect();
+        let interfaces: Vec<_> = interfaces
+            .into_iter()
+            .filter(|i| {
+                let usable = !matches!(i.addr, IpAddr::V6(a) if a.is_unicast_link_local())
+                    || (i.index != 0 && advertisable.contains(&i.index));
+                if !usable {
+                    log::warn!("Omitting IPv6 discovery on interface index '{}' because it has no non-link-local IPv6 address", i.index);
+                }
+                usable
+            })
+            .collect();
+        if interfaces.is_empty() {
+            return Err(ConfigError::NoInterfaces);
+        }
         let instance_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -495,7 +518,22 @@ impl Config {
     }
 
     fn xaddr(&self, interface: &Interface) -> String {
-        let host = match interface.addr {
+        let addr = match interface.addr {
+            IpAddr::V6(a) if a.is_unicast_link_local() => self
+                .interfaces
+                .iter()
+                .find_map(|i| match i.addr {
+                    IpAddr::V6(candidate)
+                        if i.index == interface.index && !candidate.is_unicast_link_local() =>
+                    {
+                        Some(i.addr)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(interface.addr),
+            addr => addr,
+        };
+        let host = match addr {
             IpAddr::V4(a) => a.to_string(),
             IpAddr::V6(a) => format!("[{a}]"),
         };
@@ -665,9 +703,6 @@ impl<E: Entropy> Engine<E> {
                 message::build_resolve_matches(r.dialect, &reply_id, &r.message_id, seq, &target)
             }
         };
-        if payload.len() > MAX_REPLY {
-            return Err(Dropped::ReplyTooLarge);
-        }
         Ok(Outgoing {
             due: self.delayed(now),
             dest: source,
@@ -707,7 +742,7 @@ impl<E: Entropy> Engine<E> {
     /// dialect, WS-Discovery 1.1 clients for 2009/01, so both are announced.
     fn announce(&mut self, now: Instant, hello: bool) -> Vec<Outgoing> {
         let mut out = Vec::new();
-        for interface in 0..self.config.interfaces.len() {
+        for (interface, i) in self.config.interfaces.clone().into_iter().enumerate() {
             for dialect in Dialect::ALL {
                 let id = format!("urn:uuid:{}", random_uuid(&mut self.entropy));
                 let seq = self.next_sequence();
@@ -719,14 +754,12 @@ impl<E: Entropy> Engine<E> {
                     message::build_bye(dialect, &id, seq, &target)
                 };
                 let due = if hello { self.delayed(now) } else { now };
-                if let Some(i) = self.config.interfaces.get(interface) {
-                    out.push(Outgoing {
-                        due,
-                        dest: i.group(),
-                        interface,
-                        payload: payload.into_bytes(),
-                    });
-                }
+                out.push(Outgoing {
+                    due,
+                    dest: i.group(),
+                    interface,
+                    payload: payload.into_bytes(),
+                });
             }
         }
         out

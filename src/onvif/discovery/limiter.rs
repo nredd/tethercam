@@ -164,9 +164,7 @@ impl SourceLimiter {
                 .iter()
                 .min_by_key(|(_, (_, seen))| *seen)
                 .map(|(ip, _)| *ip);
-            if let Some(ip) = oldest {
-                self.buckets.remove(&ip);
-            }
+            self.buckets.retain(|ip, _| Some(*ip) != oldest);
         }
         let burst = self.burst;
         let (bucket, seen) = self

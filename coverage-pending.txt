@@ -1,11 +1,7 @@
 src/onvif/auth/digest.rs #29
 src/onvif/auth/wsse.rs #29
 src/onvif/device.rs #29
-src/onvif/discovery.rs #30
-src/onvif/discovery/limiter.rs #30
-src/onvif/discovery/message.rs #30
 src/onvif/discovery/net.rs #30
-src/onvif/discovery/xml.rs #30
 src/onvif/http.rs #29
 src/onvif/media.rs #29
 src/onvif/model.rs #29

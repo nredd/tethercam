@@ -89,13 +89,41 @@ impl UdpTransport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MulticastInterface {
+    V4(Ipv4Addr),
+    V6(u32),
+}
+
+impl From<&Interface> for MulticastInterface {
+    fn from(interface: &Interface) -> Self {
+        match interface.addr {
+            IpAddr::V4(addr) => Self::V4(addr),
+            IpAddr::V6(_) => Self::V6(interface.index),
+        }
+    }
+}
+
+impl MulticastInterface {
+    fn binding(self, port: u16) -> (Domain, SocketAddr) {
+        match self {
+            Self::V4(_) => (
+                Domain::IPV4,
+                SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port),
+            ),
+            Self::V6(_) => (
+                Domain::IPV6,
+                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port),
+            ),
+        }
+    }
+}
+
 fn open(interface: &Interface, port: u16, join: bool) -> io::Result<UdpSocket> {
     // Wildcard bind on every platform, so unicast probes (add-by-IP flows) arrive as well as
     // multicast ones. Several sockets share the port: each interface joins the group on its own.
-    let (domain, bind_ip): (_, IpAddr) = match interface.addr {
-        IpAddr::V4(_) => (Domain::IPV4, Ipv4Addr::UNSPECIFIED.into()),
-        IpAddr::V6(_) => (Domain::IPV6, Ipv6Addr::UNSPECIFIED.into()),
-    };
+    let multicast = MulticastInterface::from(interface);
+    let (domain, bind_addr) = multicast.binding(port);
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     // Other WS-Discovery stacks on the host share the port.
     socket.set_reuse_address(true)?;
@@ -110,28 +138,42 @@ fn open(interface: &Interface, port: u16, join: bool) -> io::Result<UdpSocket> {
         ))
     ))]
     socket.set_reuse_port(true)?;
-    if interface.addr.is_ipv6() {
+    if matches!(multicast, MulticastInterface::V6(_)) {
         socket.set_only_v6(true)?;
     }
-    socket.bind(&SockAddr::from(SocketAddr::new(bind_ip, port)))?;
+    socket.bind(&SockAddr::from(bind_addr))?;
     if join {
-        match interface.addr {
-            IpAddr::V4(addr) => {
-                socket.join_multicast_v4(&GROUP_V4, &addr)?;
-                socket.set_multicast_if_v4(&addr)?;
-                socket.set_multicast_ttl_v4(1)?;
-                socket.set_multicast_loop_v4(false)?;
-            }
-            IpAddr::V6(_) => {
-                socket.join_multicast_v6(&GROUP_V6, interface.index)?;
-                socket.set_multicast_if_v6(interface.index)?;
-                socket.set_multicast_hops_v6(1)?;
-                socket.set_multicast_loop_v6(false)?;
-            }
+        match multicast {
+            MulticastInterface::V4(addr) => socket.join_multicast_v4(&GROUP_V4, &addr)?,
+            MulticastInterface::V6(index) => socket.join_multicast_v6(&GROUP_V6, index)?,
         }
+        configure_multicast(&socket, multicast)?;
     }
     socket.set_nonblocking(true)?;
     Ok(socket.into())
+}
+
+fn configure_multicast(socket: &Socket, interface: MulticastInterface) -> io::Result<()> {
+    match interface {
+        MulticastInterface::V4(addr) => {
+            socket.set_multicast_if_v4(&addr)?;
+            socket.set_multicast_ttl_v4(1)?;
+            socket.set_multicast_loop_v4(false)?;
+        }
+        MulticastInterface::V6(index) => {
+            socket.set_multicast_hops_v6(1)?;
+            socket.set_multicast_loop_v6(false)?;
+            socket.set_multicast_if_v6(index)?;
+        }
+    }
+    Ok(())
+}
+
+fn retry_receive(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionReset
+    )
 }
 
 impl Transport for UdpTransport {
@@ -139,23 +181,20 @@ impl Transport for UdpTransport {
         let start = Instant::now();
         loop {
             let count = self.sockets.len();
-            for offset in 0..count {
-                let index = (self.next + offset) % count;
-                let Some(socket) = self.sockets.get(index) else {
-                    continue;
-                };
+            for (index, socket) in self
+                .sockets
+                .iter()
+                .enumerate()
+                .cycle()
+                .skip(self.next)
+                .take(count)
+            {
                 match socket.recv_from(buf) {
                     Ok((len, source)) => {
                         self.next = (index + 1) % count;
                         return Ok(Some(Datagram { len, source }));
                     }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock
-                                | io::ErrorKind::Interrupted
-                                | io::ErrorKind::ConnectionReset
-                        ) => {}
+                    Err(e) if retry_receive(&e) => {}
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -189,6 +228,55 @@ mod tests {
             prefix_len: 8,
             index: 0,
         }
+    }
+
+    #[test]
+    fn socket_plan_and_receive_errors_are_family_specific() {
+        let v4 = MulticastInterface::from(&loopback());
+        let v6 = MulticastInterface::from(&Interface {
+            addr: Ipv6Addr::LOCALHOST.into(),
+            prefix_len: 128,
+            index: 0,
+        });
+        assert_eq!(
+            v4.binding(123).1,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 123))
+        );
+        assert_eq!(
+            v6.binding(123).1,
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 123))
+        );
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(retry_receive(&io::Error::from(kind)));
+        }
+        assert!(!retry_receive(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(UdpTransport::bind(&[]).unwrap().sockets.is_empty());
+    }
+
+    #[test]
+    fn multicast_options_and_ipv4_join_use_loopback_without_sending_multicast() {
+        let _v4 = open(&loopback(), 0, true).unwrap();
+        let v6 = Interface {
+            addr: Ipv6Addr::LOCALHOST.into(),
+            prefix_len: 128,
+            index: 0,
+        };
+        let _v6 = open(&v6, 0, false).unwrap();
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        // A zero egress index is accepted by Linux but rejected by macOS. Both can set
+        // the independent hop and loop options without joining or sending a group.
+        let result = configure_multicast(&socket, MulticastInterface::V6(0));
+        if let Err(error) = result {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(socket.multicast_hops_v6().unwrap(), 1);
+        assert!(!socket.multicast_loop_v6().unwrap());
     }
 
     #[test]
