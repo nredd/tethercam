@@ -425,8 +425,10 @@ fn parse_status_line(line: &str) -> Result<u16, ParseError> {
     if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ParseError::Malformed("bad status code"));
     }
-    code.parse()
-        .map_err(|_| ParseError::Malformed("bad status code"))
+    // Exactly three ASCII digits were validated above, so the value is bounded by 999.
+    Ok(code
+        .bytes()
+        .fold(0_u16, |number, digit| number * 10 + u16::from(digit - b'0')))
 }
 
 fn parse_headers<'a>(
@@ -891,12 +893,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_every_three_digit_status() {
+        for status in 0_u16..=999 {
+            for suffix in ["", " Synthetic reason"] {
+                let wire = format!("RTSP/1.0 {status:03}{suffix}\r\n\r\n");
+                let (reply, used) = parse_response(wire.as_bytes(), &LIMITS).unwrap().unwrap();
+                assert_eq!(reply.status, status);
+                assert_eq!(used, wire.len());
+            }
+        }
+    }
+
+    #[test]
     fn rejects_malformed_responses() {
         for wire in [
             &b"HTTP/1.1 200 OK\r\n\r\n"[..],
             b"RTSP/1.0\r\n\r\n",
             b"RTSP/1.0 2x0 OK\r\n\r\n",
             b"RTSP/1.0 20 OK\r\n\r\n",
+            b"RTSP/1.0 1000 OK\r\n\r\n",
+            b"RTSP/1.0 +20 OK\r\n\r\n",
+            b"RTSP/1.0 -20 OK\r\n\r\n",
+            "RTSP/1.0 ２ OK\r\n\r\n".as_bytes(),
         ] {
             assert_eq!(
                 std::mem::discriminant(&parse_response(wire, &LIMITS).unwrap_err()),
@@ -904,6 +922,10 @@ mod tests {
                 "{wire:?}"
             );
         }
+        assert_eq!(
+            parse_response(b"RTSP/2.0 200 OK\r\n\r\n", &LIMITS),
+            Err(ParseError::UnsupportedVersion)
+        );
         assert_eq!(
             parse_response(b"RTSP/1.0 200\r\nCSeq: 1\r\n\r\n", &LIMITS)
                 .map(|r| r.map(|(r, _)| r.status)),
