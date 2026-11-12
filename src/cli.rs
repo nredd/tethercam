@@ -1,39 +1,215 @@
-//! Command-line entry point logic, kept in the library so it is testable.
+//! Explicit operator I/O, total argument parsing and command dispatch.
 //!
-//! `src/main.rs` is a one-line shell over [`run`]. Subcommands land with the layers they drive.
+//! References:
+//! - `docs/architecture.md`, configuration, security and supervisor contracts
+
+#[cfg(test)]
+mod diagnostic_tests;
+mod diagnostics;
+mod native;
+mod options;
+#[cfg(test)]
+mod options_tests;
+mod simulator;
+#[cfg(test)]
+mod tests;
+
+pub use options::{Command, Options, ParseError};
 
 use std::io::Write;
 use std::process::ExitCode;
 
-/// The version banner printed by the binary.
-pub const BANNER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
+use thiserror::Error;
 
-/// Print the version banner to `out`.
-///
-/// Returns [`ExitCode::FAILURE`] when `out` cannot be written.
+use crate::config::{self, Config};
+use crate::supervisor::CameraFactory;
+
+/// The version banner printed without arguments or with `--version`.
+pub const BANNER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
+/// Short command/option help. There is no default password, daemon installation or backgrounding.
+pub const HELP: &str = "tethercam setup|probe|run|doctor [--config PATH] [--simulate JPEG] [--no-discovery]\n\
+setup creates owner-only credentials and identity; probe inspects a camera; run serves in the foreground; doctor checks readiness.\n";
+
+/// User-facing diagnostic categories. Values supplied by cameras and configuration parsers are
+/// retained as sources but never interpolated into CLI errors or logs.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Invalid arguments.
+    #[error(transparent)]
+    Arguments(#[from] ParseError),
+    /// Configuration parsing, permissions or validation failed.
+    #[error("configuration rejected; check syntax, values and owner-only permissions")]
+    Config(#[from] config::Error),
+    /// Writing operator output or reading a simulator JPEG failed.
+    #[error("operator input/output failed")]
+    Io(#[from] std::io::Error),
+    /// No selected camera is attached.
+    #[error("no selected camera; connect a camera in PC Remote mode")]
+    NoCamera,
+    /// A sanitized USB enumeration/opening failure.
+    #[error(transparent)]
+    Open(#[from] crate::supervisor::OpenError),
+    /// A selected camera cannot be opened or driven.
+    #[error("camera unavailable; check USB permissions and PC Remote mode")]
+    Camera,
+    /// The clock is unsuitable for authenticated ONVIF clients.
+    #[error("system clock is implausible; synchronize time before adoption")]
+    Clock,
+    /// A configured port is not available.
+    #[error("configured listener unavailable; check addresses, permissions and port conflicts")]
+    Ports,
+    /// No selected network interface can advertise this listener.
+    #[error("no usable network interface for discovery")]
+    Interface,
+    /// The simulator input is not a supported JPEG.
+    #[error("simulator JPEG rejected")]
+    Simulator,
+    /// Network/media service startup or serving failed.
+    #[error("runtime failed; check listener permissions and media settings")]
+    Runtime(#[from] crate::supervisor::RunError),
+}
+
+/// Parse process arguments, dispatch and report errors through `out`, never an implicit print.
 pub fn run(out: &mut dyn Write) -> ExitCode {
-    match out.write_all(BANNER.as_bytes()) {
+    // The executable owns global logging. If an embedding host already installed a logger,
+    // retain it; `execute` itself changes only the scoped tracing subscriber.
+    let _ = tracing_log::LogTracer::init();
+    finish(
+        execute(Options::parse(std::env::args_os().skip(1)), out),
+        out,
+    )
+}
+
+fn finish(result: Result<(), Error>, out: &mut dyn Write) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
+        Err(error) => {
+            let _ = writeln!(out, "Error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Dispatch already parsed options. Setup explicitly presents the generated credentials to
+/// the operator through `out`; no tracing event contains credentials, URLs or device identity.
+///
+/// # Errors
+/// Returns typed argument, file, camera or runtime diagnostics.
+pub fn execute(options: Result<Options, ParseError>, out: &mut dyn Write) -> Result<(), Error> {
+    execute_with_path(options, out, config::default_path())
+}
 
-    #[test]
-    fn prints_the_banner() {
-        let mut out = Vec::new();
-        assert_eq!(run(&mut out), ExitCode::SUCCESS);
-        assert_eq!(out, BANNER.as_bytes());
-        assert!(BANNER.starts_with("tethercam "));
+fn execute_with_path(
+    options: Result<Options, ParseError>, out: &mut dyn Write,
+    default_path: Result<std::path::PathBuf, config::Error>,
+) -> Result<(), Error> {
+    let options = options?;
+    match options.command {
+        Command::Version => {
+            out.write_all(BANNER.as_bytes())?;
+            return Ok(());
+        }
+        Command::Help => {
+            out.write_all(HELP.as_bytes())?;
+            return Ok(());
+        }
+        _ => {}
     }
+    let path = options.config.clone().map_or(default_path, Ok)?;
+    if options.command == Command::Setup {
+        let cfg = Config::load_or_create(&path)?;
+        let address = if cfg.onvif_address.is_unspecified() {
+            format!("<host>:{}", cfg.onvif_port)
+        } else {
+            std::net::SocketAddr::new(cfg.onvif_address, cfg.onvif_port).to_string()
+        };
+        writeln!(
+            out,
+            "Configuration: {}\nONVIF: http://{address}/onvif/device_service\nUsername: {}\nPassword: {}\nAdopt by the host's reachable address using these credentials.",
+            path.display(),
+            cfg.credentials.username.expose(),
+            cfg.credentials.password.expose()
+        )?;
+        return Ok(());
+    }
+    let cfg = Config::load(&path)?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(diagnostics::level(&cfg.log_level))
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        dispatch_runtime(
+            &options,
+            &cfg,
+            out,
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            crate::transport::usb::NusbBus,
+        )
+    })
+}
 
-    #[test]
-    fn write_failure_is_a_failure_exit() {
-        // A full sink accepts zero bytes, which `write_all` reports as an error.
-        let mut full: &mut [u8] = &mut [];
-        assert_eq!(run(&mut full), ExitCode::FAILURE);
+fn dispatch_runtime<B: crate::transport::usb::Bus + Send>(
+    options: &Options, cfg: &Config, out: &mut dyn Write,
+    runtime: std::io::Result<tokio::runtime::Runtime>, bus: B,
+) -> Result<(), Error> {
+    runtime?.block_on(async {
+        if let Some(path) = &options.simulate {
+            let jpeg = std::fs::read(path)?;
+            let factory = simulator::Simulator::new(jpeg)?;
+            command(factory, cfg, options, out, diagnostics::Signals::install()).await
+        } else {
+            if options.command == Command::Probe {
+                native::report(&bus, out)?;
+            }
+            let factory = native::Native::new(bus, cfg.camera_serial.clone());
+            command(factory, cfg, options, out, diagnostics::Signals::install()).await
+        }
+    })
+}
+
+async fn command<F: CameraFactory>(
+    factory: F, cfg: &Config, options: &Options, out: &mut dyn Write,
+    signals: std::io::Result<diagnostics::Signals>,
+) -> Result<(), Error> {
+    let signals = signals?;
+    command_until(factory, cfg, options, out, Box::pin(signals.wait())).await
+}
+
+async fn command_until<F: CameraFactory>(
+    factory: F, cfg: &Config, options: &Options, out: &mut dyn Write,
+    shutdown: std::pin::Pin<Box<dyn Future<Output = ()> + '_>>,
+) -> Result<(), Error> {
+    match options.command {
+        Command::Probe => diagnostics::probe(factory, out).await,
+        Command::Doctor => {
+            diagnostics::check_host(
+                cfg,
+                crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
+            )?;
+            diagnostics::probe(factory, out).await?;
+            writeln!(
+                out,
+                "Clock, permissions, listener ports and camera mode are ready."
+            )?;
+            Ok(())
+        }
+        Command::Run => {
+            diagnostics::check_host(
+                cfg,
+                crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
+            )?;
+            let discovery = if options.no_discovery {
+                None
+            } else {
+                Some(diagnostics::local_discovery(cfg, if_addrs::get_if_addrs())?)
+            };
+            crate::supervisor::serve(factory, cfg, discovery, shutdown, out).await?;
+            Ok(())
+        }
+        Command::Setup | Command::Version | Command::Help => Ok(()),
     }
 }

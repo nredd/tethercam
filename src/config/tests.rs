@@ -7,6 +7,24 @@ use super::{Config, Error, Secret};
 use proptest::prelude::*;
 use std::fs;
 
+#[test]
+fn credential_syntax_is_rejected_before_camera_or_listener_startup() {
+    for (username, password) in [
+        ("bad:name", "synthetic-password"),
+        ("bad\"name", "synthetic-password"),
+        ("bad\\name", "synthetic-password"),
+        ("bad\nname", "synthetic-password"),
+        ("synthetic-operator", "bad\npassword"),
+    ] {
+        let mut cfg = Config::generate().unwrap();
+        cfg.credentials.username = Secret::new(username.into());
+        cfg.credentials.password = Secret::new(password.into());
+        let (key, value) = validation(cfg.validate().unwrap_err());
+        assert_eq!(key, "credentials");
+        assert_eq!(value, "[REDACTED]");
+    }
+}
+
 /// Check an error variant without introducing an unreachable `matches!` fallback per test.
 pub(super) fn assert_variant(actual: &Error, expected: &Error) {
     assert_eq!(

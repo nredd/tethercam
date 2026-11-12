@@ -10,6 +10,8 @@ All notable changes to this project are documented here. The format follows
 
 - Reject unrepresentable USB reset deadlines before port I/O instead of panicking
 
+- Reject unusable Digest credential syntax during config validation, before opening a camera
+- Join ONVIF HTTP connection threads on shutdown instead of leaving detached workers behind
 - Exercise pacer slot-accounting invariants deterministically even with one property-test case
 - Consume a completed Sony capture property refresh even when it finishes after the wait deadline
 - Keep RTSP benchmark subscribers alive across bursts so repeated Criterion iterations cannot lose a packet to a stale pump and hang
@@ -33,6 +35,8 @@ All notable changes to this project are documented here. The format follows
 
 - Loopback-only, pure-Rust USB/IP Sony simulator for real `nusb` Linux backend tests on hosted x64 and arm64 runners, with targeted synthetic-device permissions, stateful cancellation and an export-lifetime memory admission budget
 
+- Foreground `setup`, `probe`, `doctor` and `run` commands with generated config/identity reuse, sanitized tracing, explicit operator output, and an opt-in JPEG simulator
+- End-to-end on-demand Sony actor, bounded paced H.264/JPEG pipelines, shared-port RTSP mounts, matching ONVIF profiles/full-resolution snapshots, reconnect/backoff and joined signal/error cleanup, with real authenticated simulator network tests and a persistent-client pipeline benchmark
 - Deterministic coverage of RTSP connection failures, completing RTSP's coverage transition
 - Deterministic scripted RTSP media source for tests and examples
 - Reproducible default-branch ruleset payload and workflow inventory tests, with native all-targets/all-features CI checks and staged administrator activation docs

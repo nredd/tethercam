@@ -73,6 +73,10 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
   supplies a finite or repeating packet list, optionally gated, or a channel-fed stream for tests and examples
 - `on_first_subscriber` / `on_last_unsubscribe` fire on the first `PLAY` and the last leaver, so
   the supervisor can start and stop the capture pipeline
+- `RtspServer::bind_mounts` puts distinct, non-nested stream paths on one configured listener.
+  Authentication, connection/session caps, deadlines and UDP policy are shared across mounts;
+  a session stays bound to the mount selected by its `SETUP`. The primary mount's fan-out
+  remains available through `fanout()`
 - Each client has a bounded queue; a full queue drops packets for that client only
 - Sessions are bound to the control connection that created them and die with it. UDP media goes
   only to that connection's peer address
@@ -84,6 +88,67 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
   someone who already owns that TCP connection. `SHA-256` always requires `qop`
 - Source hooks and polls run on one task per fan-out: a stop finishes cancelling the pump before
   the stop hook runs or a new start begins, so hooks lag the subscription slightly and never overlap
+
+### CLI and supervisor contract
+
+- `cli::Options::parse` is total over OS strings, rejects unknown/duplicate options, preserves
+  non-UTF-8 paths, and consumes at most seven arguments. `setup`, `probe`, `doctor` and `run`
+  use explicit `Write` outputs. Setup loads or atomically creates the existing config-layer
+  credentials and UUID; it does not create a second identity or credential store
+- The executable bridges the existing `log` facade into `tracing`. A scoped subscriber takes
+  its maximum level from validated configuration. Lifecycle events are static and USB-open
+  categories are the payload-free `OpenError` enum; no untrusted transport error, config Debug,
+  URL, request body, credential or device serial is logged
+- `Supervisor<F>` owns the only runtime `Session<F::Camera>`. `CameraFactory` opens a transport,
+  never a PTP session. Native selection reuses `usb::camera::pick` or matches the configured
+  serial exactly. Factory-built unopened sessions preserve caller timeouts/limits while using
+  the endpoint's actual 512/1024-byte geometry, including for `probe`. One initial JPEG
+  determines actual dimensions before listeners start; ongoing capture is demanded by the first `PLAY` across either stream and stops after both streams'
+  last subscriber leaves. Missing/unplugged cameras reconnect with exponential 100 ms to 5 s
+  backoff, and battery/power telemetry is refreshed while idle too
+- Every handshake, frame fetch, capture, download and close is awaited to completion. Only
+  idle waits and backoff timers enter cancellation `select!` branches. `SonyCamera::run`
+  always owns session cleanup. Shutdown never aborts a camera task, shortens a live transaction
+  to a caller wait budget, or drops a shutter operation; the driver's normal transaction and
+  five-minute still-download timeouts remain intact
+- Camera-to-media delivery is one latest-frame `watch` slot. A `Pacer` driven by a monotonic,
+  injectable clock supplies constant-rate output. Decode, encode and RTP packetization run in
+  at most one joined blocking-pool job, so CPU work cannot stall PTP I/O or create an unbounded
+  work queue. Each stream has a 512-packet queue and existing per-client queues still drop on
+  full. New subscription generations discard stale packets. Unplug clears the retained image,
+  forces the next H.264 IDR, and preserves the RTP timeline across the new pacer epoch.
+  Per-run SSRCs, initial sequence numbers and timestamp origin use system entropy, with no
+  fallback to predictable identifiers; reconnect keeps that identity and timeline
+- ONVIF profiles advertise actual dimensions, configured frame rate/bitrate, H.264 Baseline
+  `/live/main` and/or JPEG `/live/mjpeg` on that one RTSP port. A changed camera resolution is
+  rejected, not silently sent under stale SDP. Enabled JPEG is validated against RFC 2435
+  before opening listeners; unsupported layouts are not silently omitted. Bridge identity
+  comes from the persisted UUID, including a stable locally administered logical MAC, not a fabricated physical-host MAC
+- Authenticated snapshot requests use a four-entry bounded actor channel. They execute between
+  complete live-view transactions, capture/download a full-resolution still and validate the
+  PTP JPEG object format/SOI before serving it. RAW objects are refused without discarding an
+  otherwise usable session. A snapshot caller's 360 s reply budget never cancels the actor's
+  in-flight work. Shutdown drains queued replies as unavailable
+- `supervisor::serve` joins actor, media and network cleanup even after startup or media errors.
+  A shutdown future requests a stop; callers must keep polling `serve` until completion rather
+  than aborting/dropping it. SIGINT/SIGTERM registrations are installed before any CLI PTP
+  session is opened. Enabled discovery sends `Bye`; RTSP closes all sessions; HTTP joins connection
+  threads off the executor so a pending snapshot cannot deadlock the actor's shutdown
+
+New glue dependencies are pure Rust: `tracing` with `std`, `tracing-subscriber` with formatting,
+registry and facade bridging (no environment-filter language), `tracing-log` for the existing
+`log` producers, and `if-addrs` without default features for local interface addresses/prefixes.
+The Tokio `signal` feature supplies portable OS signal handling. These wrap platform APIs but
+vendor no native codec, compile no C/C++, and add no external runtime executable.
+
+`--simulate JPEG` uses the same Sony actor, pacer, encoders, packetizers and network servers over
+`SimCamera`, with no USB enumeration. `--no-discovery` omits only multicast discovery. The fixture
+example writes a synthetic image, while the steady-state `pipeline` benchmark keeps both real
+RTSP clients subscribed outside its measured loop. Network integration tests authenticate ONVIF
+profile/URI calls and snapshots, reassemble H.264 FU-A and JPEG scan data from actual RTP, unplug
+and reconnect the simulator, and reopen the cleanly closed camera without a reset. Fault tests
+cover malformed media after a valid startup frame, bounded queues, native worker failures,
+clock/permission/port diagnostics and shutdown during Sony waits and shutter release.
 
 ## Streams
 

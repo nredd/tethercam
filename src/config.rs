@@ -273,6 +273,15 @@ impl Config {
             "credentials.password",
             &"[REDACTED]",
         )?;
+        crate::rtsp::digest::Credentials::validate(
+            self.credentials.username.expose(),
+            self.credentials.password.expose(),
+            "tethercam",
+        )
+        .map_err(|_| Error::Validation {
+            key: "credentials",
+            value: "[REDACTED]".into(),
+        })?;
         check(
             !self.endpoint_uuid.is_nil(),
             "endpoint_uuid",

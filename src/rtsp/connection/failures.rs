@@ -22,6 +22,29 @@ use crate::rtsp::source::{Fanout, ScriptedSource};
 
 const WAIT: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn mounts_select_distinct_sources_without_rebinding_a_session() {
+    let source = TestSource::new();
+    let (mut connection, _peer, _stop) = connection(Arc::clone(&source)).await;
+    Arc::get_mut(&mut connection.shared)
+        .unwrap()
+        .mounts
+        .push(crate::rtsp::server::Mount {
+            path: "/jpeg".into(),
+            fanout: Fanout::new(Arc::clone(&source), 8),
+        });
+    assert!(connection.mount("http://192.0.2.1/stream", false).is_none());
+    assert!(connection.mount("/jpeg", false).is_some());
+    assert!(connection.mount("/jpeg/trackID=0", true).is_some());
+    let describe = request(b"DESCRIBE /jpeg RTSP/1.0\r\nCSeq: 1\r\n\r\n");
+    assert_eq!(connection.describe(&describe).status, 200);
+    let setup = request(b"SETUP /stream/trackID=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
+    assert_eq!(connection.setup(&setup).await.status, 200);
+    let id = connection.session.as_ref().unwrap().id.clone();
+    let other = request(format!("SETUP /jpeg/trackID=0 RTSP/1.0\r\nCSeq: 3\r\nSession: {id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n").as_bytes());
+    assert_eq!(connection.setup(&other).await.status, 455);
+}
+
 async fn connection(
     source: Arc<ScriptedSource>,
 ) -> (Connection<ScriptedSource>, TcpStream, watch::Sender<bool>) {
@@ -33,7 +56,7 @@ async fn connection(
     let local = stream.local_addr().unwrap();
     let config = ServerConfig::default();
     let shared = Arc::new(Shared {
-        track: source.track(),
+        mounts: Vec::new(),
         fanout: Fanout::new(source, config.client_queue),
         auth: Authenticator::new(
             Credentials::new("camera", "synthetic-password", "test").unwrap(),
