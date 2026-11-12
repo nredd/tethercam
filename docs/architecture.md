@@ -277,9 +277,13 @@ Not yet established, tracked as issues:
   with and without a reason phrase, without retaining an impossible integer-parse error path
 - Supervisor lifecycle regressions attach scoped tracing subscribers to synchronous snapshot
   checks and each poll of actor/runtime futures. They assert rejected-snapshot, sanitized
-  open-failure, disconnect and orderly-stop events without exposing payloads or credentials.
+  open-failure, disconnect, orderly-stop and runtime-failure events without exposing payloads,
+  underlying error text or credentials. The flush-failure regression also verifies joined camera
+  session cleanup and listener release on the error path.
   Testing with logging enabled exercises event-field construction as well as the disabled
   logging paths, whose coverage regions differ between LLVM platforms
+- Discovery scope matching deterministically rejects non-ASCII requested and offered URIs;
+  this invalid-input branch must not depend on arbitrary-byte property-test generation
 - Property tests for every parser; golden-byte tests for every encoder against captures
 - `criterion` benchmarks for per-frame paths, compiled and smoke-run in CI
 - Hardware-in-the-loop tests are `#[ignore]`d and run by hand with a camera attached
