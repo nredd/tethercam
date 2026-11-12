@@ -38,7 +38,7 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 | `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, the session and transaction engine (`ptp::session`, generic over `Transport`: it does no I/O itself, `CloseSession` on every exit path, clear-halt then reset recovery) |
 | `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery; generic, not object-safe, so no boxed future per transfer). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb). `sim`: an in-memory simulated camera used by every test |
 | `sony` | Sony SDIO extension: connect handshake, extended device info, property table, set-property and control operations, live-view fetch, still capture and download, capability detection, model quirks |
-| `media` | Live-view frame source, constant-frame-rate pacing, JPEG decode, `Encoder` trait with a pure-Rust software H.264 backend. Hardware encoders are optional features |
+| `media` | Live-view frame source, constant-frame-rate pacing, JPEG decode, `Encoder` trait with a pure-Rust software H.264 backend. Hardware encoders are optional features. Contract: the `Pacer` is a pull-style state machine over an injected `Clock` (no sleeping, no threads); `JpegDecoder` yields limited-range BT.601 I420; `Encoder::encode` writes exactly one Annex B access unit per frame, each IDR prefixed with SPS and PPS; `sps()` / `pps()` are bare NAL units for SDP `sprop-parameter-sets`. Dependencies (`zune-jpeg`, `rusty_h264-encoder`) are pure Rust; the encoder's SIMD kernels use `unsafe` inside the dependency only, and its global-allocator feature is off |
 | `rtp` | RTP packetizers: H.264 (RFC 6184) and JPEG (RFC 2435). Frames in, packets out into a caller-owned reusable `PacketPool` (no per-packet allocation once warm). No I/O: `rtsp` sends what the pool holds |
 | `rtsp` | RTSP 1.0 server: `OPTIONS` / `DESCRIBE` / `SETUP` / `PLAY` / `TEARDOWN`, TCP-interleaved and UDP transport, Digest authentication |
 | `onvif` | WS-Discovery responder, Device and Media services, WS-Security `UsernameToken` digest, snapshot endpoint |
@@ -132,7 +132,7 @@ existed:
 Not yet established, tracked as issues:
 
 - Which codecs UniFi Protect accepts from third-party cameras (H.264 assumed)
-- Whether a pure-Rust H.264 encoder reaches 15 fps at 1024x680 on an SoC board
+- Whether a pure-Rust H.264 encoder reaches 15 fps at 1024x680 on an SoC board. Measured on a desktop core: yes, 137 fps Baseline (41 fps without the SIMD kernels), see `docs/encoder-evaluation.md`. Still unmeasured on `aarch64` / `armv7` hardware
 - Battery endurance on bus power during continuous live view
 
 ## Testing

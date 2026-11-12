@@ -14,6 +14,9 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
+    # rusty_h264-encoder, rusty_h264-common, rusty_h264-accel: the chosen pure-Rust H.264 encoder (best
+    # speed and quality of those evaluated), see docs/encoder-evaluation.md. Permissive, no copyleft.
+    "BSD-2-Clause",
 ]
 confidence-threshold = 0.9
 

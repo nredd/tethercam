@@ -36,12 +36,21 @@ tokio = { version = "1", default-features = false, features = ["io-util", "macro
 toml = "1.2.1"
 uuid = { version = "1.29.2", features = ["serde", "std"], default-features = false }
 zeroize = "1.9.1"
+# Pure-Rust JPEG decoder. The `x86` / `neon` intrinsics features are off: the safe path measured
+# as fast or faster (docs/encoder-evaluation.md).
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+# Pure-Rust H.264 encoder. `asm` is the portable-Rust SIMD kernels (2x faster, `unsafe` quarantined in
+# `rusty_h264-accel`); `global-alloc` is off because it installs a process-wide `#[global_allocator]`.
+rusty_h264-encoder = { version = "0.17", default-features = false, features = ["std", "asm"] }
+rusty_h264-common = { version = "0.17", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+# Synthetic JPEG fixtures for tests and benches (any subsampling, any size).
+jpeg-encoder = { version = "0.7", default-features = false }
 
 [[bench]]
 name = "ptp_container"
@@ -61,6 +70,10 @@ harness = false
 
 [[bench]]
 name = "rtsp"
+harness = false
+
+[[bench]]
+name = "media"
 harness = false
 
 [lints.rust]
