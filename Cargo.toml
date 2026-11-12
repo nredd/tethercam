@@ -9,7 +9,8 @@ repository = "https://github.com/nredd/tethercam"
 readme = "README.md"
 keywords = ["camera", "ptp", "onvif", "rtsp", "sony"]
 categories = ["multimedia::video", "hardware-support", "network-programming"]
-exclude = [".github/", "scripts/", "docs/"]
+# Repository policy tests require unpublished workflow/ruleset inputs, not crate functionality.
+exclude = [".github/", "scripts/", "docs/", "tests/repository_policy.rs"]
 
 [lib]
 name = "tethercam"
@@ -53,6 +54,8 @@ tempfile = "3.27.0"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 # Synthetic JPEG fixtures for tests and benches (any subsampling, any size).
 jpeg-encoder = { version = "0.7", default-features = false }
+serde_json = "1.0.154"
+serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
 
 [[bench]]
 name = "ptp_container"

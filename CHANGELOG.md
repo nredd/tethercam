@@ -24,6 +24,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - Deterministic scripted RTSP media source for tests and examples
+- Reproducible default-branch ruleset payload and workflow inventory tests, with native all-targets/all-features CI checks and staged administrator activation docs
 - Reject fully covered stale entries in `coverage-pending.txt` during `make coverage`
 - Deterministic coverage of the media pipeline, removing its files from `coverage-pending.txt`
 

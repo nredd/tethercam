@@ -1,0 +1,52 @@
+{
+  "name": "Main branch gates",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_approving_review_count": 0,
+        "required_review_thread_resolution": true
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          { "context": "fmt", "integration_id": 15368 },
+          { "context": "clippy (ubuntu-latest)", "integration_id": 15368 },
+          { "context": "clippy (macos-latest)", "integration_id": 15368 },
+          { "context": "native-check (ubuntu-latest)", "integration_id": 15368 },
+          { "context": "native-check (macos-latest)", "integration_id": 15368 },
+          { "context": "test (ubuntu-latest)", "integration_id": 15368 },
+          { "context": "test (ubuntu-24.04-arm)", "integration_id": 15368 },
+          { "context": "test (macos-latest)", "integration_id": 15368 },
+          { "context": "msrv", "integration_id": 15368 },
+          { "context": "rustdoc", "integration_id": 15368 },
+          { "context": "bench", "integration_id": 15368 },
+          { "context": "check (aarch64-unknown-linux-gnu)", "integration_id": 15368 },
+          { "context": "check (armv7-unknown-linux-gnueabihf)", "integration_id": 15368 },
+          { "context": "deny", "integration_id": 15368 },
+          { "context": "coverage", "integration_id": 15368 },
+          { "context": "policy", "integration_id": 15368 }
+        ]
+      }
+    }
+  ]
+}
