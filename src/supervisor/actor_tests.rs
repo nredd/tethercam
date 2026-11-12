@@ -5,24 +5,36 @@
 
 #[test]
 fn snapshots_accept_jpeg_but_never_label_raw_objects_as_jpeg() {
-    for (format, data) in [
-        (0x3801, vec![0xff, 0xd8, 0xff, 0xd9]),
-        (0x3000, vec![0xff, 0xd8]),
-        (0x3801, vec![1, 2, 3]),
-    ] {
-        let image = CapturedImage {
-            info: crate::ptp::ObjectInfo {
-                object_format: format,
-                ..crate::ptp::ObjectInfo::default()
-            },
-            data: data.clone(),
-        };
-        let result = snapshot_image(image);
-        assert_eq!(
-            result.is_ok(),
-            format == 0x3801 && data.starts_with(&[0xff, 0xd8])
-        );
-    }
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for (format, data) in [
+            (0x3801, vec![0xff, 0xd8, 0xff, 0xd9]),
+            (0x3000, vec![0xff, 0xd8]),
+            (0x3801, b"synthetic-snapshot-secret".to_vec()),
+        ] {
+            let image = CapturedImage {
+                info: crate::ptp::ObjectInfo {
+                    object_format: format,
+                    ..crate::ptp::ObjectInfo::default()
+                },
+                data: data.clone(),
+            };
+            let result = snapshot_image(image);
+            assert_eq!(
+                result.is_ok(),
+                format == 0x3801 && data.starts_with(&[0xff, 0xd8])
+            );
+        }
+    });
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(logs.matches("snapshot_format_rejected").count(), 2);
+    assert!(!logs.contains("[255, 216"));
+    assert!(!logs.contains("synthetic-snapshot-secret"));
 }
 
 proptest::proptest! {
@@ -234,6 +246,8 @@ fn snapshot_reply_timeout_does_not_cancel_the_queued_operation() {
     assert_eq!(control.request_snapshot(Duration::ZERO), Err(SnapshotError));
 }
 
+use tracing::instrument::WithSubscriber;
+
 use super::*;
 use crate::supervisor::testing::{Factory, camera};
 use crate::transport::sim::sony::{Shutter, SonySimConfig, sony_camera};
@@ -293,7 +307,14 @@ async fn stop_before_start_and_after_factory_open_never_open_sessions() {
 
 #[tokio::test(start_paused = true)]
 async fn reconnects_with_capped_backoff_and_closes_failed_handshakes() {
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
     let bad = sony_camera(SonySimConfig {
+        model: "synthetic-private-model".into(),
         advertise_sdio: false,
         ..SonySimConfig::default()
     });
@@ -309,7 +330,12 @@ async fn reconnects_with_capped_backoff_and_closes_failed_handshakes() {
         assert!(pauses.lock().unwrap().contains(&Duration::from_secs(5)));
         control.shutdown();
     };
-    let (factory, ()) = tokio::join!(Box::pin(actor.run()), work);
+    let (factory, ()) = tokio::join!(actor.run().with_subscriber(subscriber), work);
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(logs.matches("camera_open_failed").count(), 1);
+    assert!(logs.contains("reason=camera disconnected"));
+    assert_eq!(logs.matches("camera_disconnected").count(), 1);
+    assert!(!logs.contains("synthetic-private-model"));
     let cameras = factory.released.lock().unwrap();
     assert_eq!(cameras.len(), 2);
     for camera in cameras.iter() {

@@ -832,6 +832,18 @@ mod tests {
             &r("not a uri"),
             &ours
         ));
+        assert!(!scopes_match(
+            Dialect::Standard,
+            None,
+            &r("onvif://www.onvif.org/é"),
+            &ours
+        ));
+        assert!(!scopes_match(
+            Dialect::Standard,
+            None,
+            &r("onvif://www.onvif.org"),
+            &r("onvif://www.onvif.org/é")
+        ));
         assert!(scopes_match(
             Dialect::Standard,
             None,
