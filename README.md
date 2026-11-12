@@ -59,6 +59,15 @@ make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-co
 
 Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached. `make coverage` disables llvm-cov's implicit filename exclusions and validates exact line, function and region counts for every instrumented file under the actual `src/` root, including separately named test modules and nested test directories. Files with no executable code need no coverage; integration tests, examples, benchmarks and dependencies outside that root are not gated. Malformed reports, missing metrics and empty source inventories fail closed. `make coverage-report` writes unfiltered JSON, lcov and HTML artifacts under `coverage/`.
 
+Hosted Linux coverage and test jobs execute the actual `nusb` backend through a loopback-only
+USB/IP Sony simulator and VHCI, without a physical camera. Setup and cleanup use
+`scripts/usbip-ci.sh`; only the synthetic USB node gets runner permissions and cargo never
+runs as root. See [`docs/usb.md`](docs/usb.md). The sole local constraint is exactly
+`src/transport/usb/nusb_backend.rs`: when `CI` is unset and VHCI is absent, its threshold is
+loudly not enforced. The unfiltered report still contains it. `CI` set to *any* value disables
+this exception; all source files, including this thin native adapter, require 100% in CI.
+No other file is eligible, and the retired coverage-pending mechanism is not used.
+
 `make bench-check` smoke-runs each case once; `make bench` records full Criterion measurements.
 The RTSP fan-out benchmark keeps subscribers alive across bursts, measuring steady-state packet
 delivery rather than subscription churn. Its shared workload also runs for 100 consecutive bursts

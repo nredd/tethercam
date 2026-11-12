@@ -36,7 +36,7 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 | Module | Responsibility |
 |---|---|
 | `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, the session and transaction engine (`ptp::session`, generic over `Transport`: it does no I/O itself; callers explicitly close sessions; clear-halt then reset recovery) |
-| `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery; generic, not object-safe, so no boxed future per transfer). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb). `sim`: an in-memory simulated camera used by every test, extensible with a stateful `Responder` (`sim::sony` is a simulated Sony body of either protocol generation) |
+| `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery; generic, not object-safe, so no boxed future per transfer). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb; `UsbTransport` is generic over a small `Port` trait so timeouts, packet alignment, stall and reset recovery are tested against a fake, and only `usb::nusb_backend` touches `nusb`; setup in [`usb.md`](usb.md)). `sim`: an in-memory simulated camera used by every test, extensible with a stateful `Responder` (`sim::sony` is a simulated Sony body of either protocol generation) |
 | `sony` | Sony SDIO extension: connect handshake, extended device info, property table, set-property and control operations, live-view fetch, still capture and download, capability detection, model quirks |
 | `media` | Live-view frame source, constant-frame-rate pacing, JPEG decode, `Encoder` trait with a pure-Rust software H.264 backend. Hardware encoders are optional features. Contract: the `Pacer` is a pull-style state machine over an injected `Clock` (no sleeping, no threads); `JpegDecoder` yields limited-range BT.601 I420; `Encoder::encode` writes exactly one Annex B access unit per frame, each IDR prefixed with SPS and PPS; `sps()` / `pps()` are bare NAL units for SDP `sprop-parameter-sets`. Dependencies (`zune-jpeg`, `rusty_h264-encoder`) are pure Rust; the encoder's SIMD kernels use `unsafe` inside the dependency only, and its global-allocator feature is off |
 | `rtp` | RTP packetizers: H.264 (RFC 6184) and JPEG (RFC 2435). Frames in, packets out into a caller-owned reusable `PacketPool` (no per-packet allocation once warm). No I/O: `rtsp` sends what the pool holds |
@@ -157,7 +157,17 @@ Not yet established, tracked as issues:
 
 ## Testing
 
-- Every layer is tested without hardware against the simulated camera; `make coverage` enforces exact 100% line, function and region counts per instrumented file across the actual `src/` root. llvm-cov's default filename exclusions are explicitly disabled: separately named test modules and nested test directories count too. The former default report silently omitted seven such modules (#61). The JSON validator accepts logical and physical source-root aliases, rejects malformed/empty inventories, and ignores only files outside that root. Non-executable module declarations need no coverage. Scope/schema negative fixtures run before each fresh workspace coverage collection; unfiltered JSON, lcov and HTML reports remain available through `make coverage-report`
+- Every layer is tested without physical hardware against the simulated camera. Hosted Linux
+  test and coverage jobs also exercise the real `nusb` backend through VHCI and a test-only
+  pure-Rust USB/IP Sony export (`tests/usbip/`, bound only to loopback). No libusb or native
+  dependency is used. USB/IP network headers are big endian; USB setup/descriptors are little
+  endian. URBs, pending memory and timeouts are bounded; interrupted transfers support unlink.
+  An export-wide, non-refundable admission budget also bounds simulator histories and queued
+  replies. Class cancellation uses `SimCamera::cancel_transaction` to discard the matching
+  bulk transaction, preserve its session and resume at the next transaction id.
+  Setup and cleanup share `scripts/usbip-ci.sh`, with permissions changed only on the exact
+  synthetic VHCI device node. The sole local coverage constraint is the thin `nusb_backend.rs`
+  adapter when `CI` is unset and VHCI is absent; CI never exempts it; `make coverage` enforces exact 100% line, function and region counts per instrumented file across the actual `src/` root. llvm-cov's default filename exclusions are explicitly disabled: separately named test modules and nested test directories count too. The former default report silently omitted seven such modules (#61). The JSON validator accepts logical and physical source-root aliases, rejects malformed/empty inventories, and ignores only files outside that root. Non-executable module declarations need no coverage. Scope/schema negative fixtures run before each fresh workspace coverage collection; unfiltered JSON, lcov and HTML reports remain available through `make coverage-report`
 - ONVIF HTTP tests inject timeout-setting, listener-inspection, accept and thread-spawn
   failures through the same non-generic helpers used by the real sockets and threads. Loopback
   tests exercise request deadlines, pipelining, connection caps and wildcard shutdown; IPv4
@@ -172,6 +182,8 @@ Not yet established, tracked as issues:
 ## References
 
 - [PTP, ISO 15740](https://www.iso.org/standard/63602.html)
+- [Linux USB/IP wire protocol](https://docs.kernel.org/usb/usbip_protocol.html)
+- [USB 2.0 specification](https://www.usb.org/document-library/usb-20-specification)
 - [USB Still Image Capture Device class](https://www.usb.org/document-library/still-image-capture-device-definition-10-and-errata-16-mar-2007)
 - [RTSP 1.0, RFC 2326](https://www.rfc-editor.org/rfc/rfc2326)
 - [RTP payload for H.264, RFC 6184](https://www.rfc-editor.org/rfc/rfc6184)

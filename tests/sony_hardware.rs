@@ -9,6 +9,10 @@
 //!
 //! NOTE(redd): `hardware_transport` has no USB transport to open yet. Replace its body with the
 //! `transport::usb` open call once that module lands.
+//!
+//! References:
+//! - <https://github.com/nredd/tethercam/blob/main/docs/architecture.md#testing>
+//! - <https://github.com/nredd/tethercam/blob/main/src/ptp/session.rs>
 
 use std::io::Write;
 use std::time::{Duration, Instant};

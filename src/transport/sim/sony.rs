@@ -29,7 +29,7 @@
 use super::{Reply, Responder, SimCamera};
 use crate::ptp::session::code;
 use crate::ptp::{
-    DataType, DeviceInfo, EventCode, ObjectInfo, OperationCode, Reader, Value, Writer,
+    CodecError, DataType, DeviceInfo, EventCode, ObjectInfo, OperationCode, Reader, Value, Writer,
 };
 
 const SDIO_CONNECT: u16 = 0x9201;
@@ -218,12 +218,25 @@ pub fn sony_camera(config: SonySimConfig) -> SimCamera {
         .with_responder(SonyResponder::new(config))
 }
 
-/// Decodes exactly one value of `data_type`: a payload of the wrong width, too short or too
-/// long, is refused, as a strict body would.
-fn decode_exact(data_type: DataType, payload: &[u8]) -> Option<Value> {
+/// Why a host property value cannot be accepted by the simulated body.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum HostValueError {
+    /// Preserve the underlying malformed-value diagnostic.
+    #[error("invalid host property value: {0}")]
+    Decode(#[from] CodecError),
+    /// Exact values may not leave unused payload bytes.
+    #[error("host property value has '{0}' trailing bytes")]
+    TrailingBytes(usize),
+}
+
+/// Decodes exactly one value, preserving malformed and trailing-payload errors.
+fn decode_exact(data_type: DataType, payload: &[u8]) -> Result<Value, HostValueError> {
     let mut reader = Reader::new(payload);
-    let value = Value::decode(data_type, &mut reader).ok()?;
-    reader.is_empty().then_some(value)
+    let value = Value::decode(data_type, &mut reader)?;
+    if !reader.is_empty() {
+        return Err(HostValueError::TrailingBytes(reader.remaining()));
+    }
+    Ok(value)
 }
 
 fn put_bytes(writer: &mut Writer, bytes: &[u8]) {
@@ -573,8 +586,8 @@ impl SonyResponder {
         let mut reply = Reply::ok();
         for prop in self.props.iter_mut().filter(|p| p.code == code) {
             match decode_exact(prop.current.data_type(), payload) {
-                Some(value) => prop.current = value,
-                None => reply = Reply::with_code(code::INVALID_PARAMETER),
+                Ok(value) => prop.current = value,
+                Err(_) => reply = Reply::with_code(code::INVALID_PARAMETER),
             }
         }
         if reply.response == code::RESPONSE_OK {
@@ -627,7 +640,7 @@ impl Responder for SonyResponder {
         match operation {
             SDIO_SET_EXT_DEVICE_PROP_VALUE => Some(self.write_property(code, payload)),
             SDIO_CONTROL_DEVICE => Some(match decode_exact(DataType::UInt16, payload) {
-                Some(Value::UInt16(value)) => self.press(code, value),
+                Ok(Value::UInt16(value)) => self.press(code, value),
                 _ => Reply::with_code(code::INVALID_PARAMETER),
             }),
             _ => None,
@@ -657,8 +670,82 @@ impl Responder for SonyResponder {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use super::*;
     use crate::ptp::session::{Session, SessionConfig, SessionError};
+
+    proptest::proptest! {
+        #[test]
+        fn exact_host_values_never_panic_on_arbitrary_bytes(payload in proptest::collection::vec(proptest::num::u8::ANY, 0..512)) {
+            for code in (1..=10).chain(0x4001..=0x400a).chain([0xffff]) {
+                let data_type = DataType::try_from(code).unwrap();
+                let _ = decode_exact(data_type, &payload);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_host_values_reject_truncated_and_trailing_payloads_for_every_type() {
+        for value in [
+            Value::Int8(-1),
+            Value::UInt8(1),
+            Value::Int16(-1),
+            Value::UInt16(1),
+            Value::Int32(-1),
+            Value::UInt32(1),
+            Value::Int64(-1),
+            Value::UInt64(1),
+            Value::Int128(-1),
+            Value::UInt128(1),
+            Value::Int8Array(vec![-1]),
+            Value::UInt8Array(vec![1]),
+            Value::Int16Array(vec![-1]),
+            Value::UInt16Array(vec![1]),
+            Value::Int32Array(vec![-1]),
+            Value::UInt32Array(vec![1]),
+            Value::Int64Array(vec![-1]),
+            Value::UInt64Array(vec![1]),
+            Value::Int128Array(vec![-1]),
+            Value::UInt128Array(vec![1]),
+            Value::String("synthetic".into()),
+        ] {
+            let data_type = value.data_type();
+            let mut payload = value.to_bytes().unwrap();
+            assert_eq!(decode_exact(data_type, &payload).unwrap(), value);
+            for length in 0..payload.len() {
+                assert!(decode_exact(data_type, &payload[..length]).is_err());
+            }
+            payload.push(0);
+            assert_eq!(
+                decode_exact(data_type, &payload).unwrap_err(),
+                HostValueError::TrailingBytes(1)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_host_value_errors_preserve_decode_diagnostics_and_trailing_counts() {
+        let decode = decode_exact(DataType::UInt16, &[]).unwrap_err();
+        assert_eq!(
+            decode,
+            HostValueError::Decode(CodecError::Truncated {
+                needed: 2,
+                available: 0
+            })
+        );
+        assert_eq!(
+            decode.to_string(),
+            "invalid host property value: payload truncated: needed '2' more bytes, '0' available"
+        );
+        assert!(decode.source().is_some());
+        let trailing = decode_exact(DataType::UInt8, &[1, 2]).unwrap_err();
+        assert_eq!(
+            trailing.to_string(),
+            "host property value has '1' trailing bytes"
+        );
+        assert!(trailing.source().is_none());
+    }
 
     fn config(version: u16) -> SonySimConfig {
         SonySimConfig {

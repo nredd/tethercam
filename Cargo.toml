@@ -9,8 +9,8 @@ repository = "https://github.com/nredd/tethercam"
 readme = "README.md"
 keywords = ["camera", "ptp", "onvif", "rtsp", "sony"]
 categories = ["multimedia::video", "hardware-support", "network-programming"]
-# Repository policy tests require unpublished workflow/ruleset inputs, not crate functionality.
-exclude = [".github/", "scripts/", "docs/", "tests/repository_policy.rs"]
+# Repository-only tests require unpublished workflow/ruleset and hosted USB/IP setup inputs.
+exclude = [".github/", "scripts/", "docs/", "tests/repository_policy.rs", "tests/usb_emulated.rs", "tests/usbip/"]
 
 [lib]
 name = "tethercam"
@@ -23,8 +23,12 @@ path = "src/main.rs"
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 constant_time_eq = { version = "0.6.1", default-features = false }
+futures-core = { version = "0.3", default-features = false }
 getrandom = "0.4.3"
 md-5 = { version = "0.10", default-features = false }
+# Pure-Rust USB (usbfs on Linux, IOKit on macOS). No libusb. The `tokio` feature runs its blocking
+# syscalls (open, claim, control transfers) on the tokio blocking pool instead of panicking.
+nusb = { version = "0.2", features = ["tokio"] }
 roxmltree = { version = "0.21", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
@@ -118,4 +122,8 @@ debug = "line-tables-only"
 
 [[bench]]
 name = "rtp_packetize"
+harness = false
+
+[[bench]]
+name = "usb_transport"
 harness = false

@@ -96,4 +96,26 @@ fail missing-file
 # Legitimately non-executable files do not constitute uncovered executable code.
 jq '.data[0].files += [(.data[0].files[0] | .filename += "-empty" | .summary |= map_values({count: 0, covered: 0}))]' "$tmp/good.json" > "$tmp/case.json"
 pass non-executable-file
+# Only the exact thin adapter can be locally ungated, never a test module or sibling.
+jq '.data[0].files += [(.data[0].files[0] |
+    .filename |= sub("module.rs$"; "transport/usb/nusb_backend.rs") |
+    .summary.lines.covered = 0)]' "$tmp/good.json" > "$tmp/case.json"
+CI= fail ci-empty-no-exception
+CI=false fail ci-false-no-exception
+CI=0 fail ci-zero-no-exception
+CI=1 fail ci-true-no-exception
+if test ! -d /sys/devices/platform/vhci_hcd.0; then
+    cases=$((cases + 1))
+    (unset CI; "$script" "$tmp/case.json" "$logical") > "$tmp/out" 2>&1
+    grep -q 'LOCAL ONLY: src/transport/usb/nusb_backend.rs' "$tmp/out"
+fi
+jq '.data[0].files[1].summary.lines.covered = "invalid"' "$tmp/case.json" > "$tmp/invalid.json"
+cp "$tmp/invalid.json" "$tmp/case.json"
+fail local-exception-still-validates-schema
+for name in nusb_backend_tests.rs nusb_backend.rs/child.rs nusb_backend.rs.bak; do
+    jq --arg name "$name" '.data[0].files += [(.data[0].files[0] |
+        .filename |= sub("module.rs$"; "transport/usb/" + $name) |
+        .summary.lines.covered = 0)]' "$tmp/good.json" > "$tmp/case.json"
+    fail "$name not eligible"
+done
 printf 'coverage-check: %s fixtures passed\n' "$cases"
