@@ -62,13 +62,23 @@ pub(super) fn local_discovery(
     discovery(cfg, interfaces?)
 }
 
+/// Loopback and IPv4 link-local addresses never receive probes from a remote client. IPv6
+/// link-local entries are kept: `discovery::Config` retains them only for subnet matching next
+/// to a routable address on the same interface.
+fn unusable_by_default(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || matches!(ip, std::net::IpAddr::V4(a) if a.is_link_local())
+}
+
 pub(super) fn discovery(
     cfg: &Config, interfaces: Vec<if_addrs::Interface>,
 ) -> Result<discovery::Config, Error> {
+    // Naming an interface or a specific address is an explicit choice and is honored as given.
+    let skip_unusable = cfg.interface.is_none() && cfg.onvif_address.is_unspecified();
     let interfaces = interfaces
         .into_iter()
         .filter(|i| {
             i.is_oper_up()
+                && !(skip_unusable && unusable_by_default(i.ip()))
                 && cfg.interface.as_ref().is_none_or(|name| name == &i.name)
                 && (cfg.onvif_address.is_unspecified() || cfg.onvif_address == i.ip())
                 && cfg.onvif_address.is_ipv4() == i.ip().is_ipv4()

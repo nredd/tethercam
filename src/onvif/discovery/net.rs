@@ -50,10 +50,13 @@ pub trait Transport {
 }
 
 /// One UDP socket per interface, bound to the wildcard address on the discovery port and
-/// joined to the group on its interface.
+/// joined to the group on its interface. Interfaces that could not be set up are skipped; pass
+/// [`UdpTransport::usable`] to `Config::with_usable_interfaces` so the responder numbers
+/// interfaces like the sockets.
 #[derive(Debug)]
 pub struct UdpTransport {
     sockets: Vec<UdpSocket>,
+    usable: Vec<bool>,
     /// Socket polled first on the next receive; advances after every datagram so a flood on
     /// one interface cannot starve the others.
     next: usize,
@@ -62,9 +65,11 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// Bind to the discovery port and join the multicast group on every interface.
     ///
+    /// An interface that cannot be set up is skipped with a logged warning.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a socket cannot be created, bound or joined.
+    /// Returns the last setup error if `interfaces` is not empty and none of them is usable.
     pub fn bind(interfaces: &[Interface]) -> Result<Self, Error> {
         Self::bind_inner(interfaces, PORT, true)
     }
@@ -72,11 +77,38 @@ impl UdpTransport {
     /// `join: false` skips only the multicast join and egress setup, so tests exercise the
     /// production bind without touching a multicast group.
     fn bind_inner(interfaces: &[Interface], port: u16, join: bool) -> Result<Self, Error> {
-        let sockets = interfaces
-            .iter()
-            .map(|i| open(i, port, join))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(Self { sockets, next: 0 })
+        let mut last_error = None;
+        let mut sockets = Vec::new();
+        let mut usable = Vec::new();
+        for (n, i) in interfaces.iter().enumerate() {
+            let opened = open(i, port, join);
+            usable.push(opened.is_ok());
+            match opened {
+                Ok(socket) => sockets.push(socket),
+                Err(error) => {
+                    let (family, kind) = (if i.addr.is_ipv4() { 4 } else { 6 }, error.kind());
+                    let (slot, total, os_index) = (n + 1, interfaces.len(), i.index);
+                    log::warn!(
+                        "Skipping IPv{family} discovery interface {slot}/{total} (OS index {os_index}): {kind:?}"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        match last_error {
+            Some(error) if sockets.is_empty() => Err(error.into()),
+            _ => Ok(Self {
+                sockets,
+                usable,
+                next: 0,
+            }),
+        }
+    }
+
+    /// Per input interface, whether it bound; feed to `Config::with_usable_interfaces`.
+    #[must_use]
+    pub fn usable(&self) -> &[bool] {
+        &self.usable
     }
 }
 
@@ -303,6 +335,18 @@ impl Transport for UdpTransport {
 mod tests {
     use super::*;
 
+    fn sock(transport: &UdpTransport, index: usize) -> &UdpSocket {
+        &transport.sockets[index]
+    }
+
+    fn missing() -> Interface {
+        Interface {
+            addr: Ipv6Addr::LOCALHOST.into(),
+            prefix_len: 128,
+            index: u32::MAX,
+        }
+    }
+
     fn loopback() -> Interface {
         Interface {
             addr: Ipv4Addr::LOCALHOST.into(),
@@ -386,12 +430,55 @@ mod tests {
             )
             .is_err()
         );
-        let missing = Interface {
-            addr: Ipv6Addr::LOCALHOST.into(),
-            prefix_len: 128,
-            index: u32::MAX,
+        assert!(UdpTransport::bind_inner(&[missing()], 0, true).is_err());
+        assert!(UdpTransport::bind_inner(&[missing(), missing()], 0, true).is_err());
+    }
+
+    #[test]
+    fn one_unjoinable_interface_is_skipped_and_reported_in_the_mask() {
+        let mut t = UdpTransport::bind_inner(&[missing(), loopback()], 0, true).unwrap();
+        assert_eq!(t.usable(), [false, true]);
+        assert_eq!(t.sockets.len(), 1);
+        let dest = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        assert_eq!(
+            t.send(1, dest, b"x").unwrap_err().to_string(),
+            "no interface with index '1'"
+        );
+        t.send(0, dest, b"x").unwrap();
+        assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn the_skip_warning_names_family_position_index_and_kind_but_no_address() {
+        crate::onvif::discovery::test_log::install();
+        let v6 = Interface {
+            addr: "2001:db8:5eed::1".parse().unwrap(),
+            prefix_len: 64,
+            index: u32::MAX - 6,
         };
-        assert!(UdpTransport::bind_inner(&[missing], 0, true).is_err());
+        // The kind is whatever this OS reports for a join on a nonexistent interface.
+        let kind = open(&v6, 0, true).unwrap_err().kind();
+        UdpTransport::bind_inner(&[loopback(), v6], 0, true).unwrap();
+        let lines = crate::onvif::discovery::test_log::lines();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("OS index 4294967289"))
+            .unwrap();
+        assert_eq!(
+            line,
+            &format!("Skipping IPv6 discovery interface 2/2 (OS index 4294967289): {kind:?}")
+        );
+        assert!(!line.contains("2001") && !line.contains("127."));
+    }
+
+    #[test]
+    fn an_ipv4_interface_that_cannot_bind_is_skipped_too() {
+        // A plain socket without address sharing makes every later bind to the port fail.
+        let holder = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        assert!(UdpTransport::bind_inner(&[loopback()], port, false).is_err());
+        let t = UdpTransport::bind_inner(&[loopback(), missing()], port, false).unwrap();
+        assert_eq!(t.usable(), [false, true]);
     }
 
     #[test]
@@ -440,7 +527,7 @@ mod tests {
     #[test]
     fn unicast_round_trip_over_loopback() {
         let mut t = UdpTransport::bind_inner(&[loopback()], 0, false).unwrap();
-        let port = t.sockets[0].local_addr().unwrap().port();
+        let port = sock(&t, 0).local_addr().unwrap().port();
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         peer.send_to(b"ping", (Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -466,9 +553,9 @@ mod tests {
         let mut transport = UdpTransport::bind_inner(&[interface], 0, false).unwrap();
         let address = SocketAddr::from((
             Ipv6Addr::LOCALHOST,
-            transport.sockets[0].local_addr().unwrap().port(),
+            sock(&transport, 0).local_addr().unwrap().port(),
         ));
-        let socket = Socket::from(transport.sockets[0].try_clone().unwrap());
+        let socket = Socket::from(sock(&transport, 0).try_clone().unwrap());
         assert!(socket.only_v6().unwrap());
         let peer = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -496,8 +583,8 @@ mod tests {
     fn a_flooded_first_socket_does_not_starve_later_ones() {
         let mut t = UdpTransport::bind_inner(&[loopback(), loopback()], 0, false).unwrap();
         let (p0, p1) = (
-            t.sockets[0].local_addr().unwrap().port(),
-            t.sockets[1].local_addr().unwrap().port(),
+            sock(&t, 0).local_addr().unwrap().port(),
+            sock(&t, 1).local_addr().unwrap().port(),
         );
         assert_ne!(p0, p1);
         let flooder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -575,7 +662,7 @@ mod tests {
         )
         .unwrap();
         let transport = UdpTransport::bind_inner(&[loopback()], 0, false).unwrap();
-        let port = transport.sockets[0].local_addr().unwrap().port();
+        let port = sock(&transport, 0).local_addr().unwrap().port();
         let mut responder =
             Responder::new(config, SystemEntropy::default(), transport, SystemClock);
 

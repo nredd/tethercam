@@ -475,6 +475,16 @@ impl Config {
         self.limits
     }
 
+    /// Keep only the interfaces whose entry in `usable` is `true` (missing entries count as
+    /// unusable), so subnet matching and numbering follow the sockets that actually bound.
+    #[must_use]
+    pub fn with_usable_interfaces(mut self, usable: &[bool]) -> Self {
+        let mut flags = usable.iter();
+        self.interfaces
+            .retain(|_| flags.next().copied().unwrap_or(false));
+        self
+    }
+
     /// The interfaces served, in the order [`Transport`] sees them.
     #[must_use]
     pub fn interfaces(&self) -> &[Interface] {
@@ -930,5 +940,7 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     }
 }
 
+#[cfg(test)]
+mod test_log;
 #[cfg(test)]
 mod tests;
