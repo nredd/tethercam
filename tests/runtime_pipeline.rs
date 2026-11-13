@@ -517,6 +517,14 @@ mod suite {
             // A camera appears: profiles, SDP and video come from its first frame.
             queue.lock().unwrap().push_back(first);
             wait_for_state(&cfg, "ready").await;
+            // Status flips with the camera session; the streams publish a moment later.
+            timeout(WAIT, async {
+                while describe(&cfg, "/live/main").await.status != 200 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
             let profiles = soap(&cfg, "<trt:GetProfiles/>").await;
             assert!(profiles.contains("token=\"main\""));
             assert!(profiles.contains("Width>64<"));

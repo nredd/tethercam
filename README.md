@@ -119,7 +119,7 @@ http://192.0.2.10:8080/tethercam/status` (credentials in a `-K` file, not the co
 ```
 
 `waiting` covers a camera that is off, asleep, not in PC Remote mode or unplugged; the log's
-`camera_open_failed` reason says which. A camera that returns with a different live-view size
+`camera_open_failed` reason says which. (`stopped` appears only while shutting down.) A camera that returns with a different live-view size
 ends the run (restart picks up the new size) rather than being served under the old description.
 
 For an isolated hardware-free run:

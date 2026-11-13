@@ -29,7 +29,7 @@ Next release: `0.0.2`.
 ### Changed
 
 - Start RTSP and ONVIF HTTP without a camera: RTSP `DESCRIBE`/`SETUP` and the ONVIF Device and Media services answer `503` until the first live-view frame defines the stream size, then publish profiles and SDP from it; WS-Discovery announces once ready. No resolution is declared or guessed
-- Add the Digest-authenticated `GET /tethercam/status` (`waiting`/`ready`, battery percentage and power source, no device identity) and `camera_ready`/`runtime_listening` log events
+- Add the Digest-authenticated `GET /tethercam/status` (`waiting`/`ready`, plus `stopped` during shutdown; battery percentage and power source, no device identity) and `camera_ready`/`runtime_listening` log events
 - Check every live-view frame's JPEG header size against the described streams, even with no subscriber; a changed size now fails the run instead of waiting for the first `PLAY`
 - Give live-view snapshots a 10 s reply budget; only opt-in full-resolution stills keep 360 s
 - Print `Listening ... waiting for a camera.` first; `Serving authenticated RTSP and ONVIF` now follows the first frame

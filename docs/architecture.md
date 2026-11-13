@@ -260,11 +260,21 @@ verified against a real Protect deployment, tracked with issue #13.
 
 Transitions:
 
+- The status reads `ready` when the camera session reaches live view, a moment before the
+  runtime has published the streams and model from that frame; RTSP and ONVIF answer `503`
+  (retry) for that gap. `stopped` appears only during shutdown
 - Waiting to ready: the first frame builds the pipeline, publishes the RTSP streams and the ONVIF
-  model, writes the `Serving authenticated RTSP and ONVIF` line, then starts discovery
+  model, writes the `Serving authenticated RTSP and ONVIF` line, then starts discovery. The discovery
+  socket is bound at startup but not read until then, so a probe sent while waiting sits in the
+  socket buffer and is answered when the responder starts. That ordering (discovery only after the
+  publish) is by construction in `serve_live` and is not asserted by a network test
 - Ready to waiting (unplug, camera power-cycle): listeners stay up and the published format is
   kept. The frame slot is cleared, so snapshots fail at once (`503`), the status reads
-  `waiting`, streams carry no stale frames and RTSP clients keep their connection
+  `waiting`, streams carry no stale frames and RTSP clients keep their connection. ONVIF
+  Device and Media keep answering with the profiles and dimensions already described, which is
+  right because the resolution rule below ends the run on any other size. RTSP `DESCRIBE` keeps
+  returning the original SDP. Discovery keeps announcing and sends no `Bye`: the device is still
+  the same device, only without video
 - Waiting to ready again: the camera's new frame resumes the same streams, but only if it has the
   size the streams were described with. Every frame that reaches the pipeline has its JPEG
   header size checked, whether or not anyone is streaming. A different size is a
