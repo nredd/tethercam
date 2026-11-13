@@ -1,4 +1,7 @@
 //! Exercise Sony lifecycle through an independently implemented session boundary.
+//!
+//! References:
+//! - `docs/architecture.md`, Sony driver contract
 use std::time::{Duration, Instant};
 
 use tethercam::ptp::session::{Event, Outcome, PtpSession, Session, SessionConfig, SessionError};

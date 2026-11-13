@@ -19,6 +19,7 @@ Next release: `0.0.2`.
 
 ### Added
 
+- Protected-source, OIDC-only crates.io publishing with verified Cargo archives, staged immutable GitHub releases, release-tag integrity policy, and explicit owner bootstrap/recovery instructions
 - Off-by-default, importable `test-support` API with a generic USB/IP engine, Sony/SICDD and synthetic non-Sony personalities, fault/resource/deadline/re-import/cancellation verification and hosted native integration
 - Rust developer utilities for explicitly scoped VHCI provisioning, protected client inputs, bounded media-client termination with joined camera shutdown, source diagnostics/cadence and aggregate-only profiling; preserve default application install/run behavior
 - Typed public verification errors distinguish protocol/identity validation from I/O, model, deadline and task failures
@@ -63,8 +64,6 @@ Next release: `0.0.2`.
 - Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors
 
 ### Added
-
-- Protected-source, OIDC-only crates.io publishing with verified Cargo archives, staged immutable GitHub releases, release-tag integrity policy, and explicit owner bootstrap/recovery instructions
 
 - Explicit `service install|uninstall|status` for protected per-user launchd agents and Linux system/user systemd units, with persisted identity, dedicated system account, Sony USB udev access, native state diagnostics and unlimited graceful stop time
 
