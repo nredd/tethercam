@@ -67,6 +67,18 @@ impl<B> Native<B> {
 
 impl<B: Bus + Send> CameraFactory for Native<B> {
     type Camera = UsbTransport<<B::Device as RawDevice>::Port>;
+    type Session = crate::ptp::session::Session<Self::Camera>;
+
+    fn session(
+        &self, camera: Self::Camera, mut cfg: crate::ptp::session::SessionConfig,
+        clock: fn() -> std::time::Instant,
+    ) -> Self::Session {
+        cfg.max_packet_size = camera.bulk_max_packet_size();
+        Self::Session::new(camera, cfg).with_clock(clock)
+    }
+    fn recover(&self, session: Self::Session) -> Self::Camera {
+        session.into_transport()
+    }
 
     async fn connect(&mut self) -> Result<Option<Self::Camera>, OpenError> {
         let cameras = list_cameras(&self.bus).map_err(|error| sanitize(&error))?;
@@ -79,10 +91,6 @@ impl<B: Bus + Send> CameraFactory for Native<B> {
             .await
             .map(Some)
             .map_err(|error| sanitize(&error))
-    }
-
-    fn packet_size(&self, camera: &Self::Camera) -> Option<usize> {
-        Some(camera.bulk_max_packet_size())
     }
 
     fn release(&mut self, camera: Self::Camera) {

@@ -35,7 +35,7 @@ Bottom to top. Each is a module under `src/` and depends only on layers above it
 
 | Module | Responsibility |
 |---|---|
-| `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, the session and transaction engine (`ptp::session`, generic over `Transport`: it does no I/O itself; callers explicitly close sessions; clear-halt then reset recovery) |
+| `ptp` | PTP wire format: containers, data types, datasets, operation / response / event codes, and the `PtpSession` transaction contract. The raw `Session<T>` implements it over `Transport`; callers explicitly close sessions, with clear-halt then reset recovery |
 | `transport` | `Transport` trait (bulk out, bulk in, interrupt in, stall recovery; generic, not object-safe, so no boxed future per transfer). `usb` implementation on [`nusb`](https://docs.rs/nusb) (pure Rust, no libusb; `UsbTransport` is generic over a small `Port` trait so timeouts, packet alignment, stall and reset recovery are tested against a fake, and only `usb::nusb_backend` touches `nusb`; setup in [`usb.md`](usb.md)). `sim`: an in-memory simulated camera used by every test, extensible with a stateful `Responder` (`sim::sony` is a simulated Sony body of either protocol generation) |
 | `sony` | Sony SDIO extension: connect handshake, extended device info, property table, set-property and control operations, live-view fetch, still capture and download, capability detection, model quirks |
 | `media` | Live-view frame source, constant-frame-rate pacing, JPEG decode, `Encoder` trait with a pure-Rust software H.264 backend. Hardware encoders are optional features. Contract: the `Pacer` is a pull-style state machine over an injected `Clock` (no sleeping, no threads); `JpegDecoder` yields limited-range BT.601 I420; `Encoder::encode` writes exactly one Annex B access unit per frame, each IDR prefixed with SPS and PPS; `sps()` / `pps()` are bare NAL units for SDP `sprop-parameter-sets`. Dependencies (`zune-jpeg`, `rusty_h264-encoder`) are pure Rust; the encoder's SIMD kernels use `unsafe` inside the dependency only, and its global-allocator feature is off |
@@ -53,10 +53,21 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 - `DeviceInfo`, `ObjectInfo`, `DevicePropDesc`: dataset decode and encode. Decoders are total (typed `CodecError`, never a panic) and ignore trailing padding
 - `OperationCode`, `ResponseCode`, `EventCode`, `DevicePropCode`: `u16` newtypes with named constants. Vendor codes pass through; `Display` names standard codes and prints the rest as hex
 
+### Session API
+
+`PtpSession` exposes typed transactions, borrowed outgoing data, event polling, open/close state
+and the session's monotonic clock, with `Send` futures. `Session<T>` retains its concrete API.
+`SonyCamera` is generic over a session rather than its transport, and `CameraFactory` constructs
+its associated session with the supplied clock and recovers the acquired handle after cleanup.
+Raw USB factories retain the endpoint's actual packet size for framing. This changes external
+factory implementations and explicit `SonyCamera` type annotations; replace the former transport
+parameter with `Session<TransportType>` for the raw implementation. No backend selection or
+fallback is introduced.
+
 ### Proposed cooperative macOS acquisition
 
 [Cooperative macOS camera acquisition](macos-camera.md) specifies a future shared
-session/transaction seam for raw USB and ImageCaptureCore, not a shipped backend. ICC cannot
+ImageCaptureCore backend using the shared session/transaction seam, not a shipped backend. ICC cannot
 emulate USB pipes or recovery. Its caller deadlines do not cancel native work: one retained
 native operation must complete before close, and confirmed closure is required before reuse.
 Quarantine bounds admission but joined shutdown may remain unresolved indefinitely. The native

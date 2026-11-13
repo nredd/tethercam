@@ -341,7 +341,7 @@ mod tests {
             w.string(&"a".repeat(255)),
             Err(CodecError::StringTooLong(256))
         );
-        assert_eq!(w.as_bytes(), []);
+        assert_eq!(w.as_bytes(), [0_u8; 0]);
     }
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
             w.array(&items, write_zst),
             Err(CodecError::CollectionTooLong(len))
         );
-        assert_eq!(w.as_bytes(), []);
+        assert_eq!(w.as_bytes(), [0_u8; 0]);
         // The same writer still works for a short array.
         w.array(&[(), ()], write_zst).unwrap();
         assert_eq!(w.as_bytes(), [2, 0, 0, 0, 0, 0]);

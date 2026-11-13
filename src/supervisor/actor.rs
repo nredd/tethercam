@@ -15,9 +15,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
 use crate::onvif::service::{SnapshotError, SnapshotSource};
-use crate::ptp::session::{Session, SessionConfig};
+use crate::ptp::session::{PtpSession, SessionConfig};
 use crate::sony::{Battery, CapturedImage, SonyCamera, SonyConfig, SonyError};
-use crate::transport::Transport;
 
 /// Sanitized transport-factory failures. Each category is safe to log; device strings, USB
 /// serials and operating-system error text deliberately do not cross this boundary.
@@ -43,21 +42,18 @@ pub enum OpenError {
 /// A transport factory. Connecting must not open a PTP session; only the actor does that.
 /// `pause` is a cancellation-safe retry timer, injectable for deterministic reconnect tests.
 pub trait CameraFactory: Send {
-    /// Concrete transport, also used by protocol tests.
-    type Camera: Transport + Send;
+    /// Acquired handle, also used by protocol tests.
+    type Camera: Send;
+    /// Session constructed around the acquired handle.
+    type Session: PtpSession;
     /// Find and open the selected USB interface, or report that it is absent.
     fn connect(&mut self) -> impl Future<Output = Result<Option<Self::Camera>, OpenError>> + Send;
-    /// Actual bulk packet size when the transport reports it. `None` retains the caller's
-    /// geometry, e.g. a simulated transport configured by its test.
-    fn packet_size(&self, _camera: &Self::Camera) -> Option<usize> {
-        None
-    }
-    /// Construct an unopened session, preserving caller deadlines and limits while using the
-    /// real endpoint geometry. This keeps USB 3 short-packet/ZLP decisions correct too.
-    fn session(&self, camera: Self::Camera, mut cfg: SessionConfig) -> Session<Self::Camera> {
-        cfg.max_packet_size = self.packet_size(&camera).unwrap_or(cfg.max_packet_size);
-        Session::new(camera, cfg)
-    }
+    /// Construct an unopened session with the requested limits and monotonic clock.
+    fn session(
+        &self, camera: Self::Camera, cfg: SessionConfig, clock: fn() -> Instant,
+    ) -> Self::Session;
+    /// Recover the acquired handle after the session has been closed.
+    fn recover(&self, session: Self::Session) -> Self::Camera;
     /// Dispose of a closed/disconnected transport. Tests can inspect its command transcript.
     fn release(&mut self, camera: Self::Camera);
     /// Wait before another connection attempt.
@@ -220,8 +216,7 @@ impl<F: CameraFactory> Supervisor<F> {
             if let Ok(Some(camera)) = connected {
                 let mut session = self
                     .factory
-                    .session(camera, self.session.clone())
-                    .with_clock(self.clock);
+                    .session(camera, self.session.clone(), self.clock);
                 if !*self.stop.borrow() {
                     let mut was_ready = false;
                     let result = SonyCamera::run(&mut session, self.sony.clone(), async |camera| {
@@ -245,7 +240,8 @@ impl<F: CameraFactory> Supervisor<F> {
                         tracing::warn!(event = "camera_disconnected");
                     }
                 }
-                self.factory.release(session.into_transport());
+                let camera = self.factory.recover(session);
+                self.factory.release(camera);
             }
             self.frames.send_replace(None);
             self.status.send_replace(CameraStatus::Disconnected);
@@ -266,7 +262,9 @@ impl<F: CameraFactory> Supervisor<F> {
         self.factory
     }
 
-    async fn connected(&mut self, camera: &mut SonyCamera<'_, F::Camera>) -> Result<(), SonyError> {
+    async fn connected(
+        &mut self, camera: &mut SonyCamera<'_, F::Session>,
+    ) -> Result<(), SonyError> {
         let mut next_frame = tokio::time::Instant::now();
         let mut telemetry = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {

@@ -18,8 +18,8 @@ use super::camera::{SonyCamera, SonyEvent};
 use super::capability::Capability;
 use super::error::SonyError;
 use super::{handle, op, prop};
+use crate::ptp::session::PtpSession;
 use crate::ptp::{ObjectInfo, Value};
-use crate::transport::Transport;
 
 /// Value of `0xD215` from which an image waits in camera memory.
 const IMAGE_IN_MEMORY: i128 = 0x8000;
@@ -39,7 +39,7 @@ pub struct CapturedImage {
     pub data: Vec<u8>,
 }
 
-impl<T: Transport> SonyCamera<'_, T> {
+impl<T: PtpSession> SonyCamera<'_, T> {
     /// Captures a still and downloads it.
     ///
     /// Any image left in camera memory by an earlier capture is discarded first, since a

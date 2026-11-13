@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(container.code, 0x1002);
         assert_eq!(container.transaction_id, 0);
         assert_eq!(container.params().collect::<Vec<_>>(), [1]);
-        assert_eq!(rest, []);
+        assert_eq!(rest, [0_u8; 0]);
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
         assert_eq!(out[0], 0xEE);
         let (container, rest) = Container::decode(&out[1..]).unwrap();
         assert_eq!(container.payload, [1, 2]);
-        assert_eq!(rest, []);
+        assert_eq!(rest, [0_u8; 0]);
     }
 
     #[test]
