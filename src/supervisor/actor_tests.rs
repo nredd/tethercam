@@ -483,10 +483,9 @@ async fn a_snapshot_that_raced_the_slot_clearing_is_refused_at_the_next_attempt(
     let (actor, control) = actor(Factory::new(Vec::new()));
     let pauses = Arc::clone(&actor.factory.pauses);
     let work = async {
-        // The actor is now in its backoff; its session-end rejection already ran.
-        while pauses.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
+        // `join!` polls the actor first, and with no camera it runs straight into its backoff,
+        // so its session-end rejection has already happened.
+        assert_eq!(pauses.lock().unwrap().len(), 1);
         let (tx, rx) = blocking::sync_channel(1);
         control.snapshots.try_send(tx).unwrap();
         // A blocking task would inhibit the paused clock's auto-advance; step it by hand.
@@ -631,14 +630,9 @@ async fn snapshots_queued_when_a_session_ends_are_refused() {
     let (tx, rx) = blocking::sync_channel(1);
     control.snapshots.try_send(tx).unwrap();
     let work = async {
-        // A blocking task would inhibit the paused clock's auto-advance; step it by hand.
-        tokio::time::advance(Duration::from_millis(100)).await;
-        let reply = loop {
-            match rx.try_recv() {
-                Err(blocking::TryRecvError::Empty) => tokio::task::yield_now().await,
-                other => break other,
-            }
-        };
+        let reply = tokio::task::spawn_blocking(move || rx.recv())
+            .await
+            .unwrap();
         assert_eq!(reply.unwrap(), Err(SnapshotError));
         control.shutdown();
     };
