@@ -242,7 +242,7 @@ unpublished.
 `rust-toolchain.toml` is the single source of truth for the compiler. Every workflow installs that
 exact `channel` through `dtolnay/rust-toolchain` (never `stable`), including the release workflow,
 and repeats only the components and targets it needs. `tests/repository_policy.rs` fails when a
-workflow's `toolchain`, `components` or `targets` disagree with the file. `rust-version` in
+workflow's `toolchain` differs from the file, or names a component or target outside it. `rust-version` in
 `Cargo.toml` is the MSRV, not the pin. The `test.yml` `msrv` job installs it and sets
 `RUSTUP_TOOLCHAIN` to it, since rustup would otherwise let the file override the action's
 default; its log prints `rustc --version --verbose`.

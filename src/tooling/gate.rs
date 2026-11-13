@@ -177,7 +177,7 @@ fn report_failure(
     }
     writeln!(
         out,
-        "Region accounting differs between rustc releases and CI floats on `stable`: compare the TOOLCHAIN line with the CI log, `rustup update stable` if older"
+        "Region accounting differs between rustc releases: compare the TOOLCHAIN line with the CI log; use rustup so `rust-toolchain.toml` selects the same pinned compiler"
     )?;
     Ok(())
 }
@@ -392,14 +392,14 @@ mod tests {
         assert!(invoke(temp.path(), home, &tc, &text_ok, false, &mut output).is_err());
         let text = String::from_utf8(output).expect("text");
         assert!(text.contains("grep -n -B1 '\\^0' coverage/uncovered.txt"));
-        assert!(text.contains("CI floats on `stable`"));
+        assert!(text.contains("`rust-toolchain.toml`"));
         // Both native commands fail: only the toolchain hint is printed.
         let mut output = Vec::new();
         let false_cargo = OsString::from("/usr/bin/false");
         assert!(invoke(temp.path(), home, &tc, &false_cargo, false, &mut output).is_err());
         let text = String::from_utf8(output).expect("text");
         assert!(!text.contains("grep"));
-        assert!(text.contains("CI floats on `stable`"));
+        assert!(text.contains("`rust-toolchain.toml`"));
         // Operator output failures surface from each hint.
         assert!(
             invoke(

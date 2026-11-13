@@ -528,6 +528,12 @@ fn repository_only_test_is_excluded_from_publication() -> Result<(), Box<dyn Err
             .iter()
             .any(|path| path.as_str() == Some("tests/repository_policy.rs"))
     );
+    assert!(
+        excludes
+            .iter()
+            .any(|path| path.as_str() == Some("rust-toolchain.toml")),
+        "the development pin must not ship in the crate"
+    );
     for path in ["tests/usb_emulated.rs", "tests/usbip/", "src/test_support/"] {
         assert!(!excludes.iter().any(|value| value.as_str() == Some(path)));
     }
@@ -621,6 +627,27 @@ fn workflow_drift_and_skippable_checks_fail() -> Result<(), Box<dyn Error>> {
 
 const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@";
 
+/// Whether a step is the toolchain installer.
+fn is_toolchain_step(step: &Value) -> bool {
+    step["uses"]
+        .as_str()
+        .is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION))
+}
+
+/// JSON pointer to a job's toolchain step, so mutations survive step reordering.
+fn toolchain_pointer(workflows: &Workflows, file: &str, job: &str) -> Result<String, String> {
+    let (_, workflow) = workflows
+        .iter()
+        .find(|(n, _)| n == file)
+        .ok_or("workflow")?;
+    let steps = workflow["jobs"][job]["steps"].as_array().ok_or("steps")?;
+    let index = steps
+        .iter()
+        .position(is_toolchain_step)
+        .ok_or("toolchain step")?;
+    Ok(format!("/jobs/{job}/steps/{index}"))
+}
+
 /// Split a comma-separated action input into trimmed non-empty items.
 fn csv(value: &str) -> BTreeSet<String> {
     value
@@ -629,6 +656,39 @@ fn csv(value: &str) -> BTreeSet<String> {
         .filter(|item| !item.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// A job that builds must install the pin, must not pick a toolchain by hand, and must install
+/// the components its `make` gate needs.
+fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
+    let runs: Vec<&str> = steps.iter().filter_map(|s| s["run"].as_str()).collect();
+    let installs = steps.iter().any(is_toolchain_step);
+    let builds = runs
+        .iter()
+        .any(|r| r.contains("cargo ") || r.contains("make "));
+    require(
+        installs || !builds,
+        &format!("{at}: runs cargo without installing the pinned toolchain"),
+    )?;
+    require(
+        runs.iter()
+            .all(|r| !r.contains("cargo +") && !r.contains("rustup ")),
+        &format!("{at}: a run step selects a toolchain by hand"),
+    )?;
+    for (command, component) in [
+        ("make lint", "clippy"),
+        ("make fmt-check", "rustfmt"),
+        ("make test", "llvm-tools-preview"),
+        ("make coverage", "llvm-tools-preview"),
+    ] {
+        if runs.contains(&command) {
+            let installed = steps.iter().any(|s| {
+                csv(s["with"]["components"].as_str().unwrap_or_default()).contains(component)
+            });
+            require(installed, &format!("{at}: `{command}` needs `{component}`"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Every toolchain step must install the pin from `rust-toolchain.toml`, except the `msrv` job,
@@ -662,8 +722,10 @@ fn validate_toolchains(
     };
     let (components, targets) = (listed("components"), listed("targets"));
     let manifest: toml::Value = toml::from_str(manifest).map_err(|e| e.to_string())?;
-    let msrv = manifest["package"]["rust-version"]
-        .as_str()
+    let msrv = manifest
+        .get("package")
+        .and_then(|package| package.get("rust-version"))
+        .and_then(toml::Value::as_str)
         .ok_or("missing rust-version")?;
     require(
         channel != msrv && !channel.starts_with(&format!("{msrv}.")),
@@ -673,15 +735,13 @@ fn validate_toolchains(
     for (file, workflow) in workflows {
         for (id, job) in workflow["jobs"].as_object().ok_or("missing jobs")? {
             let steps = job["steps"].as_array().map_or(&[][..], Vec::as_slice);
+            check_job_hygiene(&format!("{file}/{id}"), steps)?;
+            let at = format!("{file}/{id}");
             for step in steps {
-                if !step["uses"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with(TOOLCHAIN_ACTION))
-                {
+                if !is_toolchain_step(step) {
                     continue;
                 }
                 seen += 1;
-                let at = format!("{file}/{id}");
                 let wanted = step["with"]["toolchain"]
                     .as_str()
                     .ok_or(format!("{at}: no toolchain"))?;
@@ -721,6 +781,14 @@ fn validate_toolchains(
             }
         }
     }
+    for (file, workflow) in workflows {
+        let overrides = workflow.to_string().matches("RUSTUP_TOOLCHAIN").count();
+        let allowed = usize::from(file == "test.yml");
+        require(
+            overrides == allowed,
+            &format!("{file}: RUSTUP_TOOLCHAIN is only for the msrv job"),
+        )?;
+    }
     require(seen > 0, "no toolchain steps found")
 }
 
@@ -741,45 +809,94 @@ fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
     let original = workflows()?;
     let channel = "1.100.0";
     assert!(file.contains(&format!("channel = \"{channel}\"")));
-    let mutations: [(&str, &str, Value); 5] = [
+    let mutations: [(&str, &str, &str, Value); 5] = [
         (
             "coverage.yml",
-            "/jobs/coverage/steps/1/with/toolchain",
+            "coverage",
+            "/with/toolchain",
             json!("stable"),
         ),
-        (
-            "release.yml",
-            "/jobs/gate/steps/2/with/toolchain",
-            json!("1.99.1"),
-        ),
-        (
-            "lint.yml",
-            "/jobs/clippy/steps/1/with/components",
-            json!("miri"),
-        ),
+        ("release.yml", "gate", "/with/toolchain", json!("1.99.1")),
+        ("lint.yml", "clippy", "/with/components", json!("miri")),
         (
             "cross.yml",
-            "/jobs/check/steps/1/with/targets",
+            "check",
+            "/with/targets",
             json!("wasm32-unknown-unknown"),
         ),
-        (
-            "test.yml",
-            "/jobs/msrv/env/RUSTUP_TOOLCHAIN",
-            json!("1.100.0"),
-        ),
+        ("fmt.yml", "fmt", "/with/components", json!("clippy")),
     ];
-    for (name, pointer, value) in mutations {
+    for (name, job, tail, value) in mutations {
         let mut workflows = original.clone();
+        let pointer = format!("{}{tail}", toolchain_pointer(&workflows, name, job)?);
         let (_, workflow) = workflows
             .iter_mut()
             .find(|(n, _)| n == name)
             .ok_or("workflow")?;
-        *workflow.pointer_mut(pointer).ok_or(pointer)? = value;
+        *workflow.pointer_mut(&pointer).ok_or(pointer.clone())? = value;
         assert!(
             validate_toolchains(&workflows, file, manifest).is_err(),
             "accepted {name} {pointer}"
         );
     }
+    let plain: [(&str, &str, Value); 6] = [
+        (
+            "test.yml",
+            "/jobs/msrv/env/RUSTUP_TOOLCHAIN",
+            json!("1.100.0"),
+        ),
+        ("test.yml", "/jobs/msrv/env", json!({})),
+        ("lint.yml", "/env/RUSTUP_TOOLCHAIN", json!("stable")),
+        (
+            "docs.yml",
+            "/jobs/rustdoc/env",
+            json!({"RUSTUP_TOOLCHAIN": "stable"}),
+        ),
+        (
+            "docs.yml",
+            "/jobs/rustdoc/steps/3/run",
+            json!("cargo +stable doc"),
+        ),
+        (
+            "bench.yml",
+            "/jobs/bench/steps/3/run",
+            json!("rustup default stable"),
+        ),
+    ];
+    for (name, pointer, value) in plain {
+        let mut workflows = original.clone();
+        let (_, workflow) = workflows
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .ok_or("workflow")?;
+        if let Some(slot) = workflow.pointer_mut(pointer) {
+            *slot = value;
+        } else {
+            let (parent, key) = pointer.rsplit_once('/').ok_or("pointer")?;
+            workflow
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .ok_or(pointer)?
+                .insert(key.to_owned(), value);
+        }
+        assert!(
+            validate_toolchains(&workflows, file, manifest).is_err(),
+            "accepted {name} {pointer}"
+        );
+    }
+    // A job that builds without installing the pin, and an MSRV job without its override.
+    let mut workflows = original.clone();
+    let pointer = toolchain_pointer(&workflows, "docs.yml", "rustdoc")?;
+    let (_, docs) = workflows
+        .iter_mut()
+        .find(|(n, _)| n == "docs.yml")
+        .ok_or("docs")?;
+    let index: usize = pointer.rsplit('/').next().ok_or("index")?.parse()?;
+    docs["jobs"]["rustdoc"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?
+        .remove(index);
+    assert!(validate_toolchains(&workflows, file, manifest).is_err());
     let moved = file.replace(channel, "1.100.1");
     assert!(validate_toolchains(&original, &moved, manifest).is_err());
     let floating = file.replace(channel, "stable");

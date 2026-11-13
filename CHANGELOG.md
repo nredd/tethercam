@@ -13,7 +13,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
-- Pin one Rust toolchain in `rust-toolchain.toml` for CI, the release workflow and local gates, enforce it in `tests/repository_policy.rs`, and keep the `msrv` job on `rust-version` with `RUSTUP_TOOLCHAIN`
+- Pin one Rust toolchain in `rust-toolchain.toml` for CI, the release workflow and local gates, enforce it in `tests/repository_policy.rs`, keep the `msrv` job on `rust-version` with `RUSTUP_TOOLCHAIN`, drop `rust-toolchain.toml` from the published crate, and stop the coverage failure hint claiming CI floats on `stable`
 - Make `make coverage` independent of where the toolchain keeps `rust-src`, print the rustc release, and on failure write a filtered text report (`coverage/uncovered.txt`) that locates uncovered regions
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
 - Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
