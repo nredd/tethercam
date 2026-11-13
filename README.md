@@ -92,8 +92,9 @@ Assistant poll snapshots on their own schedule, which is why the shutter is not 
 
 Set `streams.full_resolution_snapshot = true` to serve full sensor resolution stills instead
 (use JPEG capture mode, not RAW). Every snapshot then releases the shutter, writes to the card
-and pauses live-view transactions for the download. A failed still (focus miss, lens cap, RAW)
-answers that one request with an error and leaves the camera session and streams up. Configs
+and pauses live-view transactions for the download. A still that fails without leaving the
+shutter pressed (focus miss, lens cap, RAW) answers that one request with an error and leaves the
+camera session and streams up; any other still failure ends the session and reconnects. Configs
 without the key keep the default. A changed live-view resolution fails closed rather than
 advertising mismatched SDP/ONVIF metadata; restart to describe the new format.
 
@@ -122,8 +123,8 @@ the wrong interface on such networks.
 
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG
-is used for live view and stills; integration tests inject a larger independent still. `--no-discovery` suppresses
-multicast announcements without disabling authentication. Logs use `log_level` from the config
+is used for live view and stills; integration tests inject a larger independent still.
+`--no-discovery` suppresses multicast announcements without disabling authentication. Logs use `log_level` from the config
 and contain static lifecycle events and sanitized error categories, never credentials, URLs,
 request/response bodies or device serials.
 

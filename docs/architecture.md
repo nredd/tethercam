@@ -185,12 +185,15 @@ No local unsafe code, platform-number constants, or new license exception is nee
   snapshot request is its own demand for exactly one frame. A failed fetch is a live-view
   failure like any other: the request is refused and the session reconnects. The slot is empty
   exactly while no session is serving, so `Control::snapshot` fails immediately then, and the
-  actor refuses requests queued when a session ends instead of serving them after a reconnect.
+  actor refuses requests queued when a session ends, and again at the start of each connect
+  attempt (a request that raced the slot clearing), instead of serving them after a reconnect.
   Opt-in `streams.full_resolution_snapshot` (default off) instead captures/downloads a
   full-resolution still and validates the PTP JPEG object format/SOI before serving it. A failed
-  still or RAW object is refused for that request only; the driver releases both shutter stages
-  on every path and the session stays up (a dead transport fails the next live-view or telemetry
-  transaction anyway). A snapshot caller's 360 s reply budget never cancels the actor's
+  still is refused for that request only when it provably left the shutter released: capture
+  unsupported (nothing pressed), no image within the wait budget (the release succeeded, e.g. an
+  AF miss) or a RAW/malformed object after a clean capture. The driver only attempts both
+  releases, so any other still error (a failed press or release, a transport or download error)
+  ends the session as before, and the close cleans up. A snapshot caller's 360 s reply budget never cancels the actor's
   in-flight work. Shutdown drains queued replies as unavailable
 - `supervisor::serve` joins actor, media and network cleanup even after startup or media errors.
   A shutdown future requests a stop; callers must keep polling `serve` until completion rather

@@ -383,6 +383,13 @@ async fn failed_still_is_refused_and_the_stream_stays_up() {
         shutter: Shutter::NoControls,
         ..SonySimConfig::default()
     });
+    // The warning's enabled branch only runs, and is only covered, under a live subscriber.
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
     let (actor, control) = actor(Factory::new(vec![unsupported]));
     let actor = actor.with_still_snapshots(true);
     let released = Arc::clone(&actor.factory.released);
@@ -404,8 +411,96 @@ async fn failed_still_is_refused_and_the_stream_stays_up() {
         frames.changed().await.unwrap();
         control.shutdown();
     };
+    let (factory, ()) = tokio::join!(actor.run().with_subscriber(subscriber), work);
+    assert_eq!(factory.released.lock().unwrap().len(), 1);
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(logs.matches("snapshot_still_failed").count(), 1);
+}
+
+#[tokio::test]
+async fn a_still_that_times_out_after_a_clean_release_keeps_the_session() {
+    let no_image = sony_camera(SonySimConfig {
+        warmup_reads: 0,
+        shutter: Shutter::NoImage,
+        ..SonySimConfig::default()
+    });
+    let (mut actor, control) = actor(Factory::new(vec![no_image]));
+    actor.still_snapshots = true;
+    actor.sony.capture_timeout = Duration::from_millis(50);
+    actor.sony.poll_interval = Duration::from_millis(10);
+    let work = async {
+        ready(&control).await;
+        let snapshot_control = control.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || snapshot_control.snapshot("main"))
+                .await
+                .unwrap(),
+            Err(SnapshotError)
+        );
+        assert!(format!("{:?}", control.status()).contains("Ready"));
+        control.shutdown();
+    };
     let (factory, ()) = tokio::join!(Box::pin(actor.run()), work);
     assert_eq!(factory.released.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_refused_shutter_release_ends_the_session_instead_of_leaving_it_pressed() {
+    let refused = sony_camera(SonySimConfig {
+        warmup_reads: 0,
+        shutter: Shutter::ReleaseRefused,
+        ..SonySimConfig::default()
+    });
+    let (actor, control) = actor(Factory::new(vec![refused, camera()]));
+    let actor = actor.with_still_snapshots(true);
+    let work = async {
+        ready(&control).await;
+        let mut status = control.status.clone();
+        status.borrow_and_update();
+        let snapshot_control = control.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || snapshot_control.snapshot("main"))
+                .await
+                .unwrap(),
+            Err(SnapshotError)
+        );
+        status.changed().await.unwrap();
+        assert_eq!(*status.borrow(), CameraStatus::Disconnected);
+        ready(&control).await;
+        control.shutdown();
+    };
+    let (factory, ()) = tokio::join!(Box::pin(actor.run()), work);
+    let cameras = factory.released.lock().unwrap();
+    assert_eq!(cameras.len(), 2);
+    assert_eq!(
+        cameras[0].commands().last().unwrap().code,
+        crate::ptp::session::code::CLOSE_SESSION
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_that_raced_the_slot_clearing_is_refused_at_the_next_attempt() {
+    let (actor, control) = actor(Factory::new(Vec::new()));
+    let pauses = Arc::clone(&actor.factory.pauses);
+    let work = async {
+        // The actor is now in its backoff; its session-end rejection already ran.
+        while pauses.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let (tx, rx) = blocking::sync_channel(1);
+        control.snapshots.try_send(tx).unwrap();
+        // A blocking task would inhibit the paused clock's auto-advance; step it by hand.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let reply = loop {
+            match rx.try_recv() {
+                Err(blocking::TryRecvError::Empty) => tokio::task::yield_now().await,
+                other => break other,
+            }
+        };
+        assert_eq!(reply.unwrap(), Err(SnapshotError));
+        control.shutdown();
+    };
+    let (_, ()) = tokio::join!(Box::pin(actor.run()), work);
 }
 
 fn shutter_or_still_commands(camera: &crate::transport::sim::SimCamera) -> usize {
@@ -536,9 +631,14 @@ async fn snapshots_queued_when_a_session_ends_are_refused() {
     let (tx, rx) = blocking::sync_channel(1);
     control.snapshots.try_send(tx).unwrap();
     let work = async {
-        let reply = tokio::task::spawn_blocking(move || rx.recv())
-            .await
-            .unwrap();
+        // A blocking task would inhibit the paused clock's auto-advance; step it by hand.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let reply = loop {
+            match rx.try_recv() {
+                Err(blocking::TryRecvError::Empty) => tokio::task::yield_now().await,
+                other => break other,
+            }
+        };
         assert_eq!(reply.unwrap(), Err(SnapshotError));
         control.shutdown();
     };

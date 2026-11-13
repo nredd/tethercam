@@ -218,8 +218,9 @@ impl<F: CameraFactory> Supervisor<F> {
     }
 
     /// Serve snapshots as full-resolution stills (shutter release, card write, live view paused
-    /// for the download) instead of the newest live-view frame. A failed still is answered
-    /// with an error and leaves the session up.
+    /// for the download) instead of the newest live-view frame. A still that fails without
+    /// leaving the shutter pressed (unsupported, or no image in time) is answered with an
+    /// error and leaves the session up; any other still failure ends the session.
     #[must_use]
     pub fn with_still_snapshots(mut self, enabled: bool) -> Self {
         self.still_snapshots = enabled;
@@ -238,6 +239,9 @@ impl<F: CameraFactory> Supervisor<F> {
     pub async fn run(mut self) -> F {
         let mut delay = Duration::from_millis(100);
         while !*self.stop.borrow() && self.stop.has_changed().is_ok() {
+            // A request that passed `Control::snapshot`'s slot check just before the last
+            // session's slot was cleared lands here, after that session's rejection.
+            self.reject_snapshots();
             let connected = self.factory.connect().await;
             if let Err(error) = &connected {
                 tracing::warn!(event = "camera_open_failed", reason = %error);
@@ -307,7 +311,11 @@ impl<F: CameraFactory> Supervisor<F> {
                 reply = self.snapshots.recv() => {
                     let Some(reply) = reply else { return Ok(()); };
                     if self.still_snapshots {
-                        let _ = reply.send(Self::still(camera).await);
+                        let outcome = Self::still(camera).await;
+                        let outcome = outcome.inspect_err(|_| {
+                            let _ = reply.send(Err(SnapshotError));
+                        })?;
+                        let _ = reply.send(outcome);
                     } else if last_frame.elapsed() <= SNAPSHOT_MAX_AGE {
                         let _ = reply.send(self.latest_frame());
                     } else {
@@ -348,13 +356,22 @@ impl<F: CameraFactory> Supervisor<F> {
         slot.as_deref().map(<[u8]>::to_vec).ok_or(SnapshotError)
     }
 
-    /// A failed still never ends the session: the driver releases both shutter stages on every
-    /// path, and a dead transport fails the next live-view or telemetry transaction anyway.
-    async fn still(camera: &mut SonyCamera<'_, F::Session>) -> Result<Vec<u8>, SnapshotError> {
-        let captured = camera.capture_still().await.map_err(|_| {
-            tracing::warn!(event = "snapshot_still_failed");
-            SnapshotError
-        });
-        captured.and_then(snapshot_image)
+    /// Capture one still. Only failures that provably left the shutter released keep the
+    /// session: no remote capture support (nothing was pressed) and no image before the wait
+    /// budget (the release already succeeded, e.g. an AF miss). The driver only *attempts* both
+    /// releases, and `release_shutter` can fail with a healthy link, so every other error (a
+    /// press or release failure, a transport or download error) ends the session and its close
+    /// cleans up. A RAW or malformed object after a clean capture is refused for that request.
+    async fn still(
+        camera: &mut SonyCamera<'_, F::Session>,
+    ) -> Result<Result<Vec<u8>, SnapshotError>, SonyError> {
+        match camera.capture_still().await {
+            Ok(image) => Ok(snapshot_image(image)),
+            Err(SonyError::CaptureUnsupported | SonyError::CaptureTimeout { .. }) => {
+                tracing::warn!(event = "snapshot_still_failed");
+                Ok(Err(SnapshotError))
+            }
+            Err(error) => Err(error),
+        }
     }
 }

@@ -83,6 +83,8 @@ pub enum Shutter {
     NoImage,
     /// The image only appears once the full press is released.
     AfterRelease,
+    /// Presses work, but the body answers `DeviceBusy` to every release.
+    ReleaseRefused,
 }
 
 /// How the body answers a request for protocol version 3.00 in `SDIOGetExtDeviceInfo`.
@@ -593,8 +595,11 @@ impl SonyResponder {
         if value != 1 && value != 2 {
             return Reply::with_code(code::INVALID_PARAMETER);
         }
+        if self.config.shutter == Shutter::ReleaseRefused && value == 1 {
+            return Reply::with_code(code::DEVICE_BUSY);
+        }
         let fires = match self.config.shutter {
-            Shutter::Works => value == 2,
+            Shutter::Works | Shutter::ReleaseRefused => value == 2,
             Shutter::AfterRelease => value == 1,
             Shutter::NoControls | Shutter::NoImage => false,
         };

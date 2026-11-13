@@ -27,7 +27,7 @@ Next release: `0.0.2`.
 ### Changed
 
 - Serve the newest live-view JPEG as the ONVIF snapshot instead of firing the shutter for every request, fetching one frame when the last is over 2 s old and failing at once with no camera
-- Add opt-in `streams.full_resolution_snapshot` (default off) for full-resolution stills; a failed still no longer ends the camera session
+- Add opt-in `streams.full_resolution_snapshot` (default off) for full-resolution stills; a still that fails without leaving the shutter pressed (no image, unsupported) no longer ends the camera session
 - Generalize Sony execution over `PtpSession`; external `CameraFactory` implementations now supply and recover an associated session, and explicit `SonyCamera` type annotations use the session type instead of the transport type
 - Delegate SRC coverage enforcement/reporting to native `cargo-llvm-cov` zero-uncovered and fail-under-100 checks, including all source tests and optional verification/tooling code
 
