@@ -714,7 +714,7 @@ fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
         ("make all cross", "rustfmt"),
         ("make all cross", "llvm-tools-preview"),
     ] {
-        if runs.contains(&command) {
+        if runs.iter().any(|r| r.starts_with(command)) {
             let installed = steps.iter().any(|s| {
                 csv(s["with"]["components"].as_str().unwrap_or_default()).contains(component)
             });
@@ -849,8 +849,6 @@ fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
     let file = include_str!("../rust-toolchain.toml");
     let manifest = include_str!("../Cargo.toml");
     let original = workflows()?;
-    let channel = "1.100.0";
-    assert!(file.contains(&format!("channel = \"{channel}\"")));
     let mutations: [(&str, &str, &str, Value); 5] = [
         (
             "coverage.yml",
@@ -968,8 +966,11 @@ fn toolchain_file_drift_fails() -> Result<(), Box<dyn Error>> {
     let file = include_str!("../rust-toolchain.toml");
     let manifest = include_str!("../Cargo.toml");
     let original = workflows()?;
-    let channel = "1.100.0";
-    let moved = file.replace(channel, "1.100.1");
+    let channel = file
+        .lines()
+        .find_map(|line| line.strip_prefix("channel = \"")?.strip_suffix('"'))
+        .ok_or("channel")?;
+    let moved = file.replace(channel, "9.9.9");
     assert!(validate_toolchains(&original, &moved, manifest).is_err());
     let floating = file.replace(channel, "stable");
     assert!(validate_toolchains(&original, &floating, manifest).is_err());

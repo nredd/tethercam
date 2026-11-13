@@ -10,7 +10,8 @@ readme = "README.md"
 keywords = ["camera", "ptp", "onvif", "rtsp", "sony"]
 categories = ["multimedia::video", "hardware-support", "network-programming"]
 default-run = "tethercam"
-# Repository-policy tests require unpublished workflow/ruleset inputs.
+# Repository-policy tests require unpublished workflow/ruleset inputs; the toolchain pin is a
+# development-only gate input.
 exclude = [".github/", "docs/", "rust-toolchain.toml", "tests/repository_policy.rs"]
 
 [lib]
