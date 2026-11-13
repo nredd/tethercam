@@ -134,7 +134,7 @@ by a user install. User services normally stop on logout unless an administrator
 ## Shutdown and validation
 
 Stopping a service sends `SIGTERM` and waits for joined runtime cleanup. systemd uses
-`TimeoutStopSec=infinity`; launchd uses `ExitTimeOut=0` (unlimited). A healthy five-minute still
+`TimeoutStopSec=infinity`; launchd uses `ExitTimeOut=0` (unlimited). With full-resolution snapshots enabled, a healthy five-minute still
 download can finish, shutter buttons can be released, the PTP session can close, and network/CPU
 workers can join without a manager's short default timeout sending `SIGKILL`. This intentionally
 means a wedged process can delay stop, uninstall or host shutdown indefinitely. An operator may

@@ -650,21 +650,7 @@ fn scoped_link_local_senders_pick_the_interface_with_that_index() {
 
 #[test]
 fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
-    struct Capture(std::sync::Mutex<Vec<String>>);
-    impl log::Log for Capture {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            self.0.lock().unwrap().push(record.args().to_string());
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
-    log::set_logger(&CAPTURE).unwrap();
-    log::set_max_level(log::LevelFilter::Warn);
-    assert!(log::logger().enabled(&log::Metadata::builder().level(log::Level::Warn).build()));
-    log::logger().flush();
+    super::test_log::install();
     let link = Interface {
         addr: "fe80::10".parse().unwrap(),
         prefix_len: 64,
@@ -705,10 +691,7 @@ fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
     let cfg = config_with(vec![link, iface(10)]);
     assert_eq!(cfg.interfaces(), &[iface(10)]);
     assert!(
-        CAPTURE
-            .0
-            .lock()
-            .unwrap()
+        super::test_log::lines()
             .iter()
             .any(|s| s.contains("interface index '4'")
                 && s.contains("no non-link-local IPv6 address"))
@@ -910,6 +893,39 @@ fn shutdown_discards_queued_replies() {
     r.responder.step(POLL).unwrap();
     let wire = r.wire.0.borrow();
     assert_eq!(wire.sent.len(), 2, "only the Byes");
+}
+
+#[test]
+fn an_unbound_interface_does_not_claim_its_subnet() {
+    // Wired and wireless on one /24; the first one could not join the group.
+    let both = config_with(vec![iface(10), iface(11)]);
+    assert_eq!(both.interfaces().len(), 2);
+    let healthy = both.with_usable_interfaces(&[false, true]);
+    assert_eq!(healthy.interfaces()[0].addr, iface(11).addr);
+    let mut r = rig_with(healthy);
+    r.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((peer(20), PROBE_ONVIF.as_bytes().to_vec()));
+    r.responder.step(POLL).unwrap();
+    r.clock.advance(MAX_DELAY);
+    r.responder.step(POLL).unwrap();
+    let wire = r.wire.0.borrow();
+    assert_eq!(wire.sent.len(), 1);
+    assert_eq!(wire.sent[0].0, 0);
+    assert_eq!(wire.sent[0].1, peer(20));
+    let reply = String::from_utf8_lossy(&wire.sent[0].2);
+    assert!(reply.contains("ProbeMatches"));
+    assert!(reply.contains("192.0.2.11:8080"));
+    assert_eq!(r.responder.stats().send_errors, 0);
+}
+
+#[test]
+fn a_short_usable_mask_drops_the_unlisted_interfaces() {
+    let kept = config_with(vec![iface(10), iface(11)]).with_usable_interfaces(&[true]);
+    assert_eq!(kept.interfaces().len(), 1);
+    assert_eq!(kept.interfaces()[0].addr, iface(10).addr);
 }
 
 #[test]

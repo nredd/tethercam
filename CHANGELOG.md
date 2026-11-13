@@ -13,6 +13,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
+- Make `make coverage` independent of where the toolchain keeps `rust-src`, print the rustc release, and on failure write a filtered text report (`coverage/uncovered.txt`) that locates uncovered regions
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
 - Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
 - Preserve typed diagnostic-example error sources and property-test arbitrary USB/IP management/import inputs
@@ -27,6 +28,9 @@ Next release: `0.0.2`.
 
 ### Changed
 
+- Serve the newest live-view JPEG as the ONVIF snapshot instead of firing the shutter for every request, fetching one frame when the last is over 2 s old and failing at once with no camera
+- Add opt-in `streams.full_resolution_snapshot` (default off) for full-resolution stills; a still that fails without leaving the shutter pressed (no image, unsupported) no longer ends the camera session
+- Keep WS-Discovery running when one interface cannot bind or join: skip it with a warning and fail only when none is usable; skip loopback and IPv4 link-local addresses when neither `interface` nor a specific `onvif_address` is set, and keep a skipped interface from claiming its subnet in the responder
 - Generalize Sony execution over `PtpSession`; external `CameraFactory` implementations now supply and recover an associated session, and explicit `SonyCamera` type annotations use the session type instead of the transport type
 - Delegate SRC coverage enforcement/reporting to native `cargo-llvm-cov` zero-uncovered and fail-under-100 checks, including all source tests and optional verification/tooling code
 

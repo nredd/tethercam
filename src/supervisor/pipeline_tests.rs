@@ -33,6 +33,7 @@ fn rtp_identity_uses_system_entropy_without_identifier_collisions_or_fallbacks()
         bitrate: 100_000,
         h264: true,
         mjpeg: true,
+        full_resolution_snapshot: false,
     };
     assert!(
         Pipeline::prepare_with_streams(
@@ -173,6 +174,7 @@ fn prepared(h264: bool) -> (Pipeline, [Arc<RuntimeSource>; 2]) {
             bitrate: 100_000,
             h264,
             mjpeg: true,
+            full_resolution_snapshot: false,
         },
         control,
     )
@@ -263,6 +265,7 @@ async fn invalid_media_and_encoder_configuration_and_worker_failure_are_typed() 
         bitrate: 100_000,
         h264: true,
         mjpeg: true,
+        full_resolution_snapshot: false,
     };
     assert!(Pipeline::prepare(b"bad", &settings, control.clone()).is_err());
     settings.mjpeg = false;

@@ -129,6 +129,17 @@ source tests. The sole local constraint remains exactly `src/transport/usb/nusb_
 and only when `CI` is absent and VHCI is absent. It is announced loudly; any `CI` value disables
 that exception. Hosted Linux requires the adapter's full coverage too.
 
+Toolchain: use a rustup toolchain with `llvm-tools-preview`, and keep it current. CI floats on
+`stable`, and LLVM region accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0
+disagree on the inline arguments of a `log::warn!`), so a local run on an older rustc can pass
+where CI fails, or the reverse. The gate prints a `TOOLCHAIN:` line; compare it with the CI log
+and `rustup update stable` when it is older. A distro or Homebrew rustc has no
+`llvm-tools-preview` (cargo-llvm-cov fails early and says so) and is not a supported gate
+toolchain, though its sysroot `rust-src` sources are excluded like `/rustc/` ones. The native
+summary lists uncovered *lines* only, so a region-only failure names no file. On any failure the
+gate also writes the same filtered text report to `coverage/uncovered.txt` and prints
+`grep -n -B1 '\^0' coverage/uncovered.txt`; `^0` marks an unexecuted region.
+
 Acceptance tests run native instrumented fixture crates: uncovered ordinary source, test support
 and nested source tests fail; empty/cleaned/stale data cannot silently reuse success; malformed
 profiles fail merging. All-feature `make test`, including extracted-package tests, therefore needs

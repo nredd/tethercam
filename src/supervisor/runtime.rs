@@ -145,6 +145,7 @@ async fn serve_until<F: CameraFactory>(
         SessionConfig::default(),
         interval,
     )?;
+    let actor = actor.with_still_snapshots(cfg.streams.full_resolution_snapshot);
     cfg.validate()?;
     tracing::info!(event = "waiting_camera");
     let network = async {
@@ -298,6 +299,8 @@ async fn serve_started(
         .map(|cfg| {
             discovery::UdpTransport::bind(cfg.interfaces())
                 .map(|transport| {
+                    // Interfaces that failed to bind must not claim a subnet in the responder.
+                    let cfg = cfg.with_usable_interfaces(transport.usable());
                     Responder::new(
                         cfg,
                         discovery::SystemEntropy::default(),
