@@ -87,23 +87,23 @@ ONVIF advertises only enabled profiles and the corresponding stream and snapshot
 is the newest live-view JPEG: no shutter release, no card write, no pause in streaming. While
 streaming it is at most one frame old. With nobody streaming, a frame older than 2 s is replaced
 by one live-view fetch first, so a snapshot is never staler than that. With no camera connected
-it fails at once (HTTP 5xx) rather than waiting. Clients such as UniFi Protect and Home Assistant
-poll snapshots on their own schedule, which is why the shutter is not used by default.
+it fails at once (HTTP 503) rather than waiting. Clients such as UniFi Protect and Home
+Assistant poll snapshots on their own schedule, which is why the shutter is not used by default.
 
-Set `streams.full_resolution_snapshot = true` to serve full sensor resolution stills instead (use
-JPEG capture mode, not RAW). Every snapshot then releases the shutter, writes to the card and
-pauses live-view transactions for the download. A failed still (focus miss, lens cap, RAW) answers
-that one request with an error and leaves the camera session and streams up. Configs without the
-key keep the default. A changed live-view resolution fails
-closed rather than advertising mismatched SDP/ONVIF metadata; restart to describe the new format.
+Set `streams.full_resolution_snapshot = true` to serve full sensor resolution stills instead
+(use JPEG capture mode, not RAW). Every snapshot then releases the shutter, writes to the card
+and pauses live-view transactions for the download. A failed still (focus miss, lens cap, RAW)
+answers that one request with an error and leaves the camera session and streams up. Configs
+without the key keep the default. A changed live-view resolution fails closed rather than
+advertising mismatched SDP/ONVIF metadata; restart to describe the new format.
 
 The actor waits for a camera and reconnects with capped backoff after unplug. One initial JPEG
 establishes actual stream dimensions before listeners start. Continuous capture and encoding begin
 only after the first authenticated `PLAY`, and stop after the last subscriber leaves. `SIGINT` or
 `SIGTERM` waits for in-flight camera work, releases shutter buttons, closes the PTP session, sends
-WS-Discovery `Bye` when enabled, and joins network/CPU workers. With full-resolution snapshots enabled, a long still download can delay
-shutdown; force-killing the process skips this hygiene. A snapshot reply can time out independently
-without interrupting the camera operation.
+WS-Discovery `Bye` when enabled, and joins network/CPU workers. With full-resolution snapshots
+enabled, a long still download can delay shutdown; force-killing the process skips this hygiene.
+A snapshot reply can time out independently without interrupting the camera operation.
 
 For an isolated hardware-free run:
 

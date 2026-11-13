@@ -311,20 +311,16 @@ impl<F: CameraFactory> Supervisor<F> {
                     } else if last_frame.elapsed() <= SNAPSHOT_MAX_AGE {
                         let _ = reply.send(self.latest_frame());
                     } else {
-                        let fetched = camera.next_live_view_frame().await;
-                        let frame = fetched.inspect_err(|_| {
+                        let refreshed = self.refresh(camera, &mut last_frame).await;
+                        refreshed.inspect_err(|_| {
                             let _ = reply.send(Err(SnapshotError));
                         })?;
-                        self.frames.send_replace(Some(Arc::from(frame)));
-                        last_frame = tokio::time::Instant::now();
                         let _ = reply.send(self.latest_frame());
                     }
                 },
                 _ = self.demand.changed() => {},
                 () = tokio::time::sleep_until(next_frame), if active => {
-                    let frame = camera.next_live_view_frame().await?;
-                    self.frames.send_replace(Some(Arc::from(frame)));
-                    last_frame = tokio::time::Instant::now();
+                    self.refresh(camera, &mut last_frame).await?;
                     next_frame = tokio::time::Instant::now() + self.frame_interval;
                 },
                 () = tokio::time::sleep_until(telemetry) => {
@@ -335,6 +331,16 @@ impl<F: CameraFactory> Supervisor<F> {
                 },
             }
         }
+    }
+
+    /// Fetch one live-view frame into the slot and note when.
+    async fn refresh(
+        &self, camera: &mut SonyCamera<'_, F::Session>, last_frame: &mut tokio::time::Instant,
+    ) -> Result<(), SonyError> {
+        let frame = camera.next_live_view_frame().await?;
+        self.frames.send_replace(Some(Arc::from(frame)));
+        *last_frame = tokio::time::Instant::now();
+        Ok(())
     }
 
     fn latest_frame(&self) -> Result<Vec<u8>, SnapshotError> {
