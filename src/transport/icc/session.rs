@@ -12,8 +12,9 @@
 //!
 //! Lifecycle: `Closed -> Opening -> Open -> Closed`, with the failure states
 //! - `Opening`: an `open` is pending or was cancelled, so the owner may still complete it and
-//!   hold a lease. `open` is refused, `close` resolves it with confirmation, and a close that
-//!   finds no lease means the open never produced one
+//!   hold a lease. `open` is refused and `close` resolves it with confirmation. A close that
+//!   finds no lease only means this owner holds none: a late native success is closed by the
+//!   native owner, and a replacement `open` stays [`IccError::Busy`] until that settles
 //! - `Faulted`: no more transactions, but the lease remains and `close` confirms closure
 //! - `Retired`: the lease was given up; native cleanup settles it. Reuse is only probed
 //!   through `open`, which the native owner refuses while cleanup is unresolved
@@ -83,7 +84,9 @@ impl IccSession {
         self.config.transaction_timeout = timeout;
     }
 
-    /// Give the bridge handle back, for reuse after `close` or by a factory's `recover`.
+    /// Give the bridge handle back, for reuse after a confirmed `close` or by a factory's
+    /// `recover`. From any other state the owner may still hold a lease, and a new session on
+    /// the handle then reports [`IccError::Busy`] until the handle is dropped.
     #[must_use]
     pub fn into_handle(self) -> IccHandle {
         self.handle

@@ -15,8 +15,9 @@
 //! - `native` (macOS only): the thin delegation to the `image-capture` crate, plus `run` for
 //!   its main-thread entry point
 //!
-//! Status: AI-assisted independent source review of the native crate (not a certification) and
-//! one short real-camera sample. No production support claim. See `docs/macos-camera.md`.
+//! Status: an AI-assisted independent source review of the native crate (not a certification)
+//! and one short real-camera sample of that crate. This adapter has not been run on hardware.
+//! No production support claim. See `docs/macos-camera.md`.
 //!
 //! References:
 //! - `docs/macos-camera.md`

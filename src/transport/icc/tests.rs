@@ -90,6 +90,24 @@ fn ptp_event(code: u16, params: &[u32]) -> Vec<u8> {
 /// after ten seconds instead of hanging it.
 const SETTLE_ATTEMPTS: usize = 10_000;
 
+/// Show that `call` is refused as `busy` while abandoned native work runs, `release` that work,
+/// then repeat `call` until it is no longer refused. The refused first call guarantees the
+/// polling path always runs, so no result depends on how fast the owner finishes.
+async fn settle_after<T: PartialEq + std::fmt::Debug>(
+    busy: T, release: impl FnOnce(), mut call: impl AsyncFnMut() -> T,
+) -> T {
+    let mut last = call().await;
+    assert_eq!(last, busy, "the abandoned work is still running");
+    release();
+    let mut attempts = 0;
+    while last == busy && attempts < SETTLE_ATTEMPTS {
+        std::thread::sleep(Duration::from_millis(1));
+        last = call().await;
+        attempts += 1;
+    }
+    last
+}
+
 fn calls(shared: &Shared) -> Vec<Call> {
     script(shared).calls.clone()
 }
@@ -258,15 +276,12 @@ fn a_cancelled_caller_neither_backlogs_nor_overlaps_native_work() {
                     handle.transact(0x1001, vec![], vec![], t()).await,
                     handle.close(t()).await,
                 );
-                release_tx.send(()).expect("release");
-                let mut settled = Err(IccError::Busy);
-                for _ in 0..SETTLE_ATTEMPTS {
-                    settled = handle.transact(0x1001, vec![], vec![], t()).await;
-                    if settled != Err(IccError::Busy) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let settled = settle_after(
+                    Err(IccError::Busy),
+                    || release_tx.send(()).expect("release"),
+                    async || handle.transact(0x1001, vec![], vec![], t()).await,
+                )
+                .await;
                 // The lease survived the abandoned call, and exactly one op ran per request.
                 (during, settled)
             })
@@ -339,18 +354,14 @@ fn an_owner_that_dies_while_a_caller_is_gone_still_reports_disconnect() {
                 entered_rx
                     .recv_timeout(HOLD_LIMIT)
                     .expect("native work started");
-                release_tx.send(()).expect("release");
                 // Nobody is waiting for the answer the dead owner never gives, so the gate
                 // alone must not strand the handle: the owner's end releases it.
-                let mut after = Err(IccError::Busy);
-                for _ in 0..SETTLE_ATTEMPTS {
-                    after = handle.poll_event().await;
-                    if after != Err(IccError::Busy) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                after
+                settle_after(
+                    Err(IccError::Busy),
+                    || release_tx.send(()).expect("release"),
+                    async || handle.poll_event().await,
+                )
+                .await
             });
             *seen_ref.lock().expect("seen") = Some(after);
         })
@@ -814,15 +825,12 @@ fn a_gate_busy_close_can_be_retried_once_the_abandoned_work_settles() {
                 assert!(slow.is_err());
                 entered_rx.recv_timeout(HOLD_LIMIT).expect("started");
                 let busy = s.close().await;
-                release_tx.send(()).expect("release");
-                let mut closed = Err(icc(IccError::Busy));
-                for _ in 0..SETTLE_ATTEMPTS {
-                    closed = s.close().await;
-                    if closed != Err(icc(IccError::Busy)) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let closed = settle_after(
+                    Err(icc(IccError::Busy)),
+                    || release_tx.send(()).expect("release"),
+                    async || s.close().await,
+                )
+                .await;
                 (busy, closed)
             })
         },
@@ -1019,15 +1027,12 @@ fn a_cancelled_open_leaves_the_session_unresolved_until_close_confirms() {
                     s.transaction(0x1009, &[], None).await.map(|_| ()),
                     s.close().await,
                 );
-                release_tx.send(()).expect("release");
-                let mut closed = Err(icc(IccError::Busy));
-                for _ in 0..SETTLE_ATTEMPTS {
-                    closed = s.close().await;
-                    if closed != Err(icc(IccError::Busy)) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let closed = settle_after(
+                    Err(icc(IccError::Busy)),
+                    || release_tx.send(()).expect("release"),
+                    async || s.close().await,
+                )
+                .await;
                 // Confirmed closed, so the same session can open again.
                 let reopened = s.open().await;
                 (during, closed, reopened)
@@ -1065,15 +1070,12 @@ fn a_cancelled_open_that_never_opened_closes_as_a_no_op() {
                 let slow = tokio::time::timeout(Duration::from_millis(50), s.open()).await;
                 assert!(slow.is_err());
                 entered_rx.recv_timeout(HOLD_LIMIT).expect("open started");
-                release_tx.send(()).expect("release");
-                let mut closed = Err(icc(IccError::Busy));
-                for _ in 0..SETTLE_ATTEMPTS {
-                    closed = s.close().await;
-                    if closed != Err(icc(IccError::Busy)) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                let closed = settle_after(
+                    Err(icc(IccError::Busy)),
+                    || release_tx.send(()).expect("release"),
+                    async || s.close().await,
+                )
+                .await;
                 (closed, s.open().await)
             })
         },

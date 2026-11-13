@@ -21,7 +21,7 @@ use crate::ptp::{Container, ContainerKind, MAX_PARAMS};
 
 const TAG_SELECTED_REMOVED: u8 = 5;
 const TAG_NATIVE_ERROR: u8 = 6;
-const TAG_ACCESS_ENABLED: u8 = 10;
+const TAG_ACCESS_RESTRICTED: u8 = 10;
 const TAG_PTP: u8 = 11;
 const TAG_OVERSIZED: u8 = 12;
 /// Benign observations: browser add/remove, delegate open/close, capability change, catalog
@@ -50,7 +50,7 @@ pub fn classify(bytes: &[u8]) -> Result<Notice, IccError> {
     match *tag {
         TAG_SELECTED_REMOVED => Err(IccError::Removed),
         TAG_NATIVE_ERROR => Err(IccError::NativeFailure),
-        TAG_ACCESS_ENABLED => Err(IccError::Permission),
+        TAG_ACCESS_RESTRICTED => Err(IccError::Permission),
         TAG_OVERSIZED => Err(IccError::EventOverflow),
         TAG_PTP => ptp_event(payload).map(Notice::Ptp),
         tag if ADVISORY.contains(&tag) => Ok(Notice::Advisory),
