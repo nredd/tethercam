@@ -13,6 +13,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
+- Make runtime and actor log-capture tests deterministic when the lib tests share one process (tracing callsite interest was cached as disabled by a concurrent thread)
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
 - Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
 - Preserve typed diagnostic-example error sources and property-test arbitrary USB/IP management/import inputs

@@ -4,17 +4,62 @@
 //! - `docs/architecture.md`, CLI and supervisor contract
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use tokio::sync::watch;
+use tracing::Dispatch;
+use tracing::subscriber::NoSubscriber;
 
 use super::{CameraFactory, OpenError};
 use crate::transport::sim::{
     SimCamera,
     sony::{SonySimConfig, sony_camera},
 };
+
+/// Two process-lifetime dispatchers. `tracing-core` only consults every registered dispatcher
+/// when callsite interest is computed while at least two exist; with exactly one, a callsite
+/// first reached on a thread without a scoped default caches "never" and silences the scoped
+/// capture of a concurrently running test. Keeping two alive makes capture independent of
+/// test scheduling.
+static ANCHORS: OnceLock<[Dispatch; 2]> = OnceLock::new();
+
+/// Scoped capture of `tracing` output for one test, safe next to concurrently running tests.
+pub(crate) struct LogCapture {
+    file: tempfile::NamedTempFile,
+    dispatch: Dispatch,
+}
+
+impl LogCapture {
+    pub(crate) fn new() -> Self {
+        ANCHORS.get_or_init(|| {
+            [
+                Dispatch::new(NoSubscriber::default()),
+                Dispatch::new(NoSubscriber::default()),
+            ]
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let dispatch = Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(file.reopen().unwrap())
+                .finish(),
+        );
+        Self { file, dispatch }
+    }
+
+    /// Dispatcher to install with `with_subscriber` or `tracing::dispatcher::with_default`.
+    pub(crate) fn dispatch(&self) -> Dispatch {
+        self.dispatch.clone()
+    }
+
+    /// Everything captured so far.
+    pub(crate) fn text(&self) -> String {
+        std::fs::read_to_string(self.file.path()).unwrap()
+    }
+}
 
 pub(crate) fn jpeg(width: u16, height: u16) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -85,5 +130,24 @@ impl CameraFactory for Factory {
     fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send {
         self.pauses.lock().unwrap().push(delay);
         tokio::time::sleep(delay)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogCapture;
+
+    fn emit() {
+        tracing::info!(event = "capture_probe");
+    }
+
+    /// A callsite first reached on a thread with no scoped dispatcher must still be captured.
+    /// Run alone (e.g. under nextest) this is red without the process-lifetime anchors.
+    #[test]
+    fn capture_survives_a_callsite_first_registered_on_another_thread() {
+        let logs = LogCapture::new();
+        std::thread::spawn(emit).join().unwrap();
+        tracing::dispatcher::with_default(&logs.dispatch(), emit);
+        assert_eq!(logs.text().matches("capture_probe").count(), 1);
     }
 }

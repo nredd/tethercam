@@ -5,12 +5,7 @@
 
 #[tokio::test]
 async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
-    let logs = tempfile::NamedTempFile::new().unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(logs.reopen().unwrap())
-        .finish();
+    let logs = LogCapture::new();
     let cfg = cfg();
     let (ready, ready_rx) = oneshot::channel();
     let mut out = Ready(Some(ready));
@@ -23,10 +18,10 @@ async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
         },
         &mut out,
     )
-    .with_subscriber(subscriber)
+    .with_subscriber(logs.dispatch())
     .await
     .unwrap();
-    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    let logs = logs.text();
     assert!(logs.contains("waiting_camera"));
     assert!(logs.contains("runtime_ready"));
     assert_eq!(logs.matches("runtime_stopped").count(), 1);
@@ -93,12 +88,7 @@ impl Write for FlushFailure {
 
 #[tokio::test]
 async fn ready_output_flush_failure_closes_started_listeners_and_session() {
-    let logs = tempfile::NamedTempFile::new().unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(logs.reopen().unwrap())
-        .finish();
+    let logs = LogCapture::new();
     let cfg = cfg();
     let factory = Factory::new(vec![camera()]);
     let released = Arc::clone(&factory.released);
@@ -110,11 +100,11 @@ async fn ready_output_flush_failure_closes_started_listeners_and_session() {
             std::future::pending(),
             &mut FlushFailure
         )
-        .with_subscriber(subscriber)
+        .with_subscriber(logs.dispatch())
         .await
         .is_err()
     );
-    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    let logs = logs.text();
     assert_eq!(logs.matches("runtime_failed").count(), 1);
     assert!(!logs.contains("runtime_stopped"));
     assert!(!logs.contains("synthetic flush failure"));
@@ -138,7 +128,7 @@ mod client;
 
 use super::*;
 use crate::config::Secret;
-use crate::supervisor::testing::{Factory, camera, jpeg};
+use crate::supervisor::testing::{Factory, LogCapture, camera, jpeg};
 use crate::transport::sim::sony::{SonySimConfig, sony_camera};
 use tokio::sync::oneshot;
 use tracing::instrument::WithSubscriber;
