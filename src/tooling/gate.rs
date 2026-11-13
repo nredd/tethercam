@@ -5,7 +5,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::Error;
@@ -25,19 +25,28 @@ fn escape(path: &Path) -> Result<String, Error> {
     Ok(escaped)
 }
 
+/// Filtered text report written when the native gate fails.
+const TEXT_REPORT: &str = "coverage/uncovered.txt";
+
 /// Only top-level non-source trees and toolchain sources are outside the SRC contract.
-fn arguments(root: &Path, cargo_home: &Path, local: bool) -> Result<Vec<OsString>, Error> {
+/// Standard-library sources live under `/rustc/<hash>/` unless the toolchain ships `rust-src`,
+/// in which case rustc maps them into the sysroot, so both locations are excluded.
+fn ignore(root: &Path, cargo_home: &Path, sysroot: &Path, local: bool) -> Result<String, Error> {
     let root = escape(root)?;
     let cargo_home = escape(cargo_home)?;
+    let sysroot = escape(sysroot)?;
     let outside = format!(
-        "^{root}/(tests|examples|benches)/|^{root}/src/[^/]+/\\.\\./\\.\\./(tests|examples|benches)/|^/rustc/|^{cargo_home}/registry/"
+        "^{root}/(tests|examples|benches)/|^{root}/src/[^/]+/\\.\\./\\.\\./(tests|examples|benches)/|^/rustc/|^{sysroot}/lib/rustlib/src/|^{cargo_home}/registry/"
     );
-    let ignore = if local {
+    Ok(if local {
         format!("{outside}|^{root}/src/transport/usb/nusb_backend\\.rs$")
     } else {
         outside
-    };
-    Ok([
+    })
+}
+
+fn arguments(ignore: &str) -> Vec<OsString> {
+    [
         "llvm-cov",
         "report",
         "--no-default-ignore-filename-regex",
@@ -60,10 +69,54 @@ fn arguments(root: &Path, cargo_home: &Path, local: bool) -> Result<Vec<OsString
         "--output-path",
         "coverage/coverage.json",
         "--ignore-filename-regex",
-        &ignore,
+        ignore,
     ]
     .map(OsString::from)
-    .to_vec())
+    .to_vec()
+}
+
+/// The same filter as a text report, where `^0` under a line marks an unexecuted region.
+fn text_arguments(ignore: &str) -> Vec<OsString> {
+    [
+        "llvm-cov",
+        "report",
+        "--no-default-ignore-filename-regex",
+        "--text",
+        "--output-path",
+        TEXT_REPORT,
+        "--ignore-filename-regex",
+        ignore,
+    ]
+    .map(OsString::from)
+    .to_vec()
+}
+
+/// The compiler that instrumented the tests. Region accounting changes between rustc releases.
+struct Toolchain {
+    release: String,
+    sysroot: PathBuf,
+}
+
+fn rustc_output(rustc: &OsString, args: [&str; 2]) -> Result<String, Error> {
+    let output = Command::new(rustc).args(args).output()?;
+    if !output.status.success() {
+        return Err(Error::Invalid("cannot query the Rust toolchain"));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Invalid("non-UTF-8 Rust toolchain output"))?;
+    let text = text.trim_end();
+    if text.is_empty() {
+        return Err(Error::Invalid("empty Rust toolchain output"));
+    }
+    Ok(text.to_owned())
+}
+
+fn toolchain(rustc: &OsString) -> Result<Toolchain, Error> {
+    let version = rustc_output(rustc, ["--version", "--verbose"])?;
+    let release = version.lines().next().unwrap_or_default().to_owned();
+    // Not canonicalized: llvm-cov matches the path strings rustc itself recorded.
+    let sysroot = PathBuf::from(rustc_output(rustc, ["--print", "sysroot"])?);
+    Ok(Toolchain { release, sysroot })
 }
 
 fn local(ci_present: bool, vhci: bool) -> bool {
@@ -81,7 +134,8 @@ fn cargo_home(
 }
 
 fn invoke(
-    root: &Path, cargo_home: &Path, cargo: &OsString, local: bool, out: &mut dyn Write,
+    root: &Path, cargo_home: &Path, toolchain: &Toolchain, cargo: &OsString, local: bool,
+    out: &mut dyn Write,
 ) -> Result<(), Error> {
     if local {
         writeln!(
@@ -89,22 +143,52 @@ fn invoke(
             "LOCAL ONLY: src/transport/usb/nusb_backend.rs threshold is not enforced (no VHCI)"
         )?;
     }
+    writeln!(out, "TOOLCHAIN: {}", toolchain.release)?;
     std::fs::create_dir_all(root.join("coverage"))?;
-    let args = arguments(root, cargo_home, local)?;
-    let status = Command::new(cargo).args(args).current_dir(root).status()?;
+    match std::fs::remove_file(root.join(TEXT_REPORT)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
+    let ignore = ignore(root, cargo_home, &toolchain.sysroot, local)?;
+    let status = Command::new(cargo)
+        .args(arguments(&ignore))
+        .current_dir(root)
+        .status()?;
     if !status.success() {
+        report_failure(root, cargo, &ignore, out)?;
         return Err(Error::Invalid("native coverage gate failed"));
     }
     Ok(())
 }
 
+/// The native summary lists uncovered lines only, so a region-only failure shows no location.
+fn report_failure(
+    root: &Path, cargo: &OsString, ignore: &str, out: &mut dyn Write,
+) -> Result<(), Error> {
+    let text = Command::new(cargo)
+        .args(text_arguments(ignore))
+        .current_dir(root)
+        .status();
+    if text.is_ok_and(|status| status.success()) {
+        writeln!(
+            out,
+            "Only lines are listed above. Regions and functions: grep -n -B1 '\\^0' {TEXT_REPORT}"
+        )?;
+    }
+    writeln!(
+        out,
+        "Region accounting differs between rustc releases and CI floats on `stable`: compare the TOOLCHAIN line with the CI log, `rustup update stable` if older"
+    )?;
+    Ok(())
+}
+
 fn environment(
     root: std::io::Result<std::path::PathBuf>, home: Result<std::path::PathBuf, Error>,
-    cargo: &OsString, local: bool, out: &mut dyn Write,
+    toolchain: Result<Toolchain, Error>, cargo: &OsString, local: bool, out: &mut dyn Write,
 ) -> Result<(), Error> {
     let root = root?.canonicalize()?;
     let home = home?.canonicalize()?;
-    invoke(&root, &home, cargo, local, out)
+    invoke(&root, &home, &toolchain?, cargo, local, out)
 }
 
 pub(super) fn check(out: &mut dyn Write) -> Result<(), Error> {
@@ -119,6 +203,7 @@ pub(super) fn check(out: &mut dyn Write) -> Result<(), Error> {
     environment(
         std::env::current_dir(),
         cargo_home(std::env::var_os("CARGO_HOME"), std::env::var_os("HOME")),
+        toolchain(&std::env::var_os("RUSTC").unwrap_or(OsString::from("rustc"))),
         &std::env::var_os("CARGO").unwrap_or(OsString::from("cargo")),
         local,
         out,
@@ -129,15 +214,56 @@ pub(super) fn check(out: &mut dyn Write) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn fake_toolchain() -> Toolchain {
+        Toolchain {
+            release: "rustc 0.0.0 (synthetic)".into(),
+            sysroot: "/synthetic/sysroot".into(),
+        }
+    }
+
+    /// Accepts this many complete lines, then fails.
+    #[cfg(unix)]
+    struct FailAfterLines(usize);
+    #[cfg(unix)]
+    impl Write for FailAfterLines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::other("synthetic output failure"));
+            }
+            self.0 -= usize::from(bytes.contains(&b'\n'));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn script(dir: &Path, name: &str, body: &str) -> OsString {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        path.into()
+    }
+
     #[test]
     fn filters_are_root_anchored_and_never_exclude_source_test_names() {
         for local in [false, true] {
-            let args = arguments(
+            let filter = ignore(
                 Path::new("/synthetic/repo.with[chars]"),
                 Path::new("/synthetic/cargo"),
+                Path::new("/synthetic/sys.root"),
                 local,
             )
-            .expect("args");
+            .expect("filter");
+            assert!(
+                filter.starts_with("^/synthetic/repo\\.with\\[chars\\]/(tests|examples|benches)/")
+            );
+            assert!(filter.contains("|^/rustc/|^/synthetic/sys\\.root/lib/rustlib/src/|"));
+            assert_eq!(filter.contains("nusb_backend"), local);
+            assert!(!filter.contains("tests\\.rs"));
+            let args = arguments(&filter);
             let args: Vec<_> = args.iter().map(|s| s.to_str().expect("utf8")).collect();
             assert!(args.contains(&"--no-default-ignore-filename-regex"));
             for flag in [
@@ -148,28 +274,24 @@ mod tests {
                 let position = args.iter().position(|s| *s == flag).expect("flag");
                 assert_eq!(args.get(position + 1), Some(&"0"));
             }
-            let filter = args.last().expect("filter");
-            assert!(
-                filter.starts_with("^/synthetic/repo\\.with\\[chars\\]/(tests|examples|benches)/")
-            );
-            assert_eq!(filter.contains("nusb_backend"), local);
-            assert!(!filter.contains("tests\\.rs"));
+            assert_eq!(args.last(), Some(&filter.as_str()));
+            let text = text_arguments(&filter);
+            assert!(text.contains(&OsString::from("--text")));
+            assert_eq!(text.last(), Some(&OsString::from(&filter)));
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            assert!(
-                arguments(
-                    Path::new(std::ffi::OsStr::from_bytes(&[255])),
-                    Path::new("/synthetic/cargo"),
-                    false
-                )
-                .is_err()
-            );
+            let bad = Path::new(std::ffi::OsStr::from_bytes(&[255]));
+            let good = Path::new("/synthetic");
+            assert!(ignore(bad, good, good, false).is_err());
+            assert!(ignore(good, bad, good, false).is_err());
+            assert!(ignore(good, good, bad, false).is_err());
         }
     }
+
     #[test]
-    fn local_exemption_is_exact_and_native_commands_control_the_result() {
+    fn local_exemption_is_exact() {
         assert!(local(false, false));
         assert!(!local(false, true));
         assert!(!local(true, false));
@@ -183,135 +305,222 @@ mod tests {
             Path::new("/home/.cargo")
         );
         assert!(cargo_home(None, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn toolchain_reports_release_and_sysroot_or_fails() {
+        let temp = tempfile::tempdir().expect("temp");
+        let sysroot = temp.path().canonicalize().expect("canonical");
+        let rustc = script(
+            temp.path(),
+            "rustc",
+            &format!(
+                "case \"$1\" in --print) echo '{}';; *) echo 'rustc 1.2.3 (synthetic)'; echo 'host: x';; esac",
+                sysroot.display()
+            ),
+        );
+        let found = toolchain(&rustc).expect("toolchain");
+        assert_eq!(found.release, "rustc 1.2.3 (synthetic)");
+        assert_eq!(found.sysroot, sysroot);
+        // Symlinked sysroots are reported as rustc spells them.
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&sysroot, &link).expect("symlink");
+        let linked = script(
+            temp.path(),
+            "linked",
+            &format!(
+                "case \"$1\" in --print) echo '{}';; *) echo 'rustc 1.2.3';; esac",
+                link.display()
+            ),
+        );
+        assert_eq!(toolchain(&linked).expect("linked").sysroot, link);
+        let invalid = script(temp.path(), "invalid", "printf '\\377'");
+        assert!(toolchain(&invalid).is_err());
+        let no_sysroot = script(
+            temp.path(),
+            "no-sysroot",
+            "case \"$1\" in --print) exit 1;; *) echo 'rustc 1.2.3';; esac",
+        );
+        assert!(toolchain(&no_sysroot).is_err());
+        assert!(toolchain(&"/usr/bin/false".into()).is_err());
+        assert!(toolchain(&"/missing-fixture".into()).is_err());
+        // Silent output is not a toolchain.
+        assert!(toolchain(&"/usr/bin/true".into()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_commands_control_the_result_and_failures_name_regions_and_toolchain() {
+        use std::os::unix::ffi::OsStrExt;
         let temp = tempfile::tempdir().expect("temp");
         let home = Path::new("/synthetic/cargo");
+        let tc = fake_toolchain();
         let mut output = Vec::new();
         invoke(
             temp.path(),
             home,
+            &tc,
             &"/usr/bin/true".into(),
             true,
             &mut output,
         )
         .expect("native result");
-        assert!(
-            String::from_utf8(output)
-                .expect("text")
-                .contains("LOCAL ONLY")
+        let text = String::from_utf8(output).expect("text");
+        assert!(text.contains("LOCAL ONLY"));
+        assert!(text.contains("TOOLCHAIN: rustc 0.0.0 (synthetic)"));
+        for local in [true, false] {
+            assert!(
+                invoke(
+                    temp.path(),
+                    home,
+                    &tc,
+                    &"/usr/bin/true".into(),
+                    local,
+                    &mut crate::tests::Broken
+                )
+                .is_err()
+            );
+        }
+        // The gate fails and the text report succeeds: both hints, in order.
+        let text_ok = script(
+            temp.path(),
+            "cargo-text-ok",
+            "case \"$*\" in *--fail-under-lines*) exit 1;; *) exit 0;; esac",
         );
+        let mut output = Vec::new();
+        assert!(invoke(temp.path(), home, &tc, &text_ok, false, &mut output).is_err());
+        let text = String::from_utf8(output).expect("text");
+        assert!(text.contains("grep -n -B1 '\\^0' coverage/uncovered.txt"));
+        assert!(text.contains("CI floats on `stable`"));
+        // Both native commands fail: only the toolchain hint is printed.
+        let mut output = Vec::new();
+        let false_cargo = OsString::from("/usr/bin/false");
+        assert!(invoke(temp.path(), home, &tc, &false_cargo, false, &mut output).is_err());
+        let text = String::from_utf8(output).expect("text");
+        assert!(!text.contains("grep"));
+        assert!(text.contains("CI floats on `stable`"));
+        // Operator output failures surface from each hint.
         assert!(
             invoke(
                 temp.path(),
                 home,
-                &"/usr/bin/true".into(),
-                true,
-                &mut crate::tests::Broken
-            )
-            .is_err()
-        );
-        assert!(
-            invoke(
-                temp.path(),
-                home,
-                &"/usr/bin/false".into(),
+                &tc,
+                &text_ok,
                 false,
-                &mut Vec::new()
+                &mut FailAfterLines(1)
             )
             .is_err()
+        );
+        FailAfterLines(0).flush().expect("flush");
+        let ignore = "x";
+        assert!(report_failure(temp.path(), &text_ok, ignore, &mut crate::tests::Broken).is_err());
+        assert!(
+            report_failure(temp.path(), &false_cargo, ignore, &mut crate::tests::Broken).is_err()
         );
         assert!(
             invoke(
                 temp.path(),
                 home,
+                &tc,
                 &"/missing-fixture".into(),
                 false,
                 &mut Vec::new()
             )
             .is_err()
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            assert!(
-                arguments(
-                    temp.path(),
-                    Path::new(std::ffi::OsStr::from_bytes(&[255])),
-                    false
-                )
-                .is_err()
-            );
-        }
+        assert!(
+            invoke(
+                temp.path(),
+                Path::new(std::ffi::OsStr::from_bytes(&[255])),
+                &tc,
+                &"/usr/bin/true".into(),
+                false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
     }
+
     #[test]
     fn filesystem_and_environment_failures_fail_before_native_reporting() {
         let temp = tempfile::tempdir().expect("temp");
         let cargo = OsString::from("/usr/bin/true");
         let error = || Error::Invalid("injected");
+        let run = |root, home, toolchain| {
+            environment(root, home, toolchain, &cargo, false, &mut Vec::new())
+        };
         assert!(
-            environment(
+            run(
                 Err(std::io::Error::other("cwd")),
                 Err(error()),
-                &cargo,
-                false,
-                &mut Vec::new()
+                Ok(fake_toolchain())
             )
             .is_err()
         );
         assert!(
-            environment(
+            run(
                 Ok(temp.path().join("missing")),
                 Err(error()),
-                &cargo,
-                false,
-                &mut Vec::new()
+                Ok(fake_toolchain())
             )
             .is_err()
         );
+        assert!(run(Ok(temp.path().into()), Err(error()), Ok(fake_toolchain())).is_err());
         assert!(
-            environment(
-                Ok(temp.path().into()),
-                Err(error()),
-                &cargo,
-                false,
-                &mut Vec::new()
-            )
-            .is_err()
-        );
-        assert!(
-            environment(
+            run(
                 Ok(temp.path().into()),
                 Ok(temp.path().join("missing")),
-                &cargo,
-                false,
-                &mut Vec::new()
+                Ok(fake_toolchain())
             )
             .is_err()
         );
-        environment(
+        assert!(run(Ok(temp.path().into()), Ok(temp.path().into()), Err(error())).is_err());
+        run(
             Ok(temp.path().into()),
             Ok(temp.path().into()),
-            &cargo,
-            false,
-            &mut Vec::new(),
+            Ok(fake_toolchain()),
         )
         .expect("native");
         std::fs::remove_dir(temp.path().join("coverage")).expect("remove directory");
         std::fs::write(temp.path().join("coverage"), b"not a directory").expect("file");
-        assert!(invoke(temp.path(), temp.path(), &cargo, false, &mut Vec::new()).is_err());
+        assert!(
+            invoke(
+                temp.path(),
+                temp.path(),
+                &fake_toolchain(),
+                &cargo,
+                false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
         std::fs::remove_file(temp.path().join("coverage")).expect("remove file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            assert!(
-                invoke(
-                    temp.path(),
-                    Path::new(std::ffi::OsStr::from_bytes(&[255])),
-                    &cargo,
-                    false,
-                    &mut Vec::new()
-                )
-                .is_err()
-            );
-        }
+        // A stale report is replaced; one that cannot be removed fails before native work.
+        std::fs::create_dir_all(temp.path().join(TEXT_REPORT)).expect("report directory");
+        std::fs::write(temp.path().join(TEXT_REPORT).join("keep"), b"x").expect("occupied");
+        assert!(
+            invoke(
+                temp.path(),
+                temp.path(),
+                &fake_toolchain(),
+                &cargo,
+                false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(temp.path().join(TEXT_REPORT)).expect("clear");
+        std::fs::write(temp.path().join(TEXT_REPORT), b"stale").expect("stale");
+        invoke(
+            temp.path(),
+            temp.path(),
+            &fake_toolchain(),
+            &cargo,
+            false,
+            &mut Vec::new(),
+        )
+        .expect("stale report removed");
+        assert!(!temp.path().join(TEXT_REPORT).exists());
     }
 }

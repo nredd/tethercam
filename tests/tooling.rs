@@ -130,7 +130,14 @@ fn native_gate_rejects_uncovered_nested_tests_support_empty_and_stale_profiles()
         fs::write(root.join("src/tests/mod.rs"), "#[test] fn exercised() { assert_eq!(crate::used(), 1); }\n").expect("reset tests");
         fs::write(root.join(path), content).expect("mutation");
         collect();
-        assert!(!gate(root).expect("gate process").status.success(), "accepted uncovered {path}");
+        let output = gate(root).expect("gate process");
+        assert!(!output.status.success(), "accepted uncovered {path}");
+        // Failures name the toolchain and leave a text report where `^0` marks unexecuted regions.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("TOOLCHAIN: rustc "), "{stdout}");
+        assert!(stdout.contains("coverage/uncovered.txt"), "{stdout}");
+        let report = fs::read_to_string(root.join("coverage/uncovered.txt")).expect("text report");
+        assert!(report.contains("^0") || report.contains("|      0|"), "{report}");
     }
     // Cleaning removes old green profiles. An empty collection cannot reuse their success.
     assert!(
