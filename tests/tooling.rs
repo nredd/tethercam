@@ -1,4 +1,7 @@
 //! Actual utility boundaries and native coverage acceptance. No report validator fixtures.
+//!
+//! References:
+//! - <https://github.com/taiki-e/cargo-llvm-cov#command-line-interface>
 #![cfg(feature = "repo-tools")]
 
 use std::fs;

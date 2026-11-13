@@ -1,4 +1,7 @@
 //! Synthetic subprocess fixture for verifier lifecycle tests, never a network client.
+//!
+//! References:
+//! - <https://ffmpeg.org/ffmpeg.html>
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
