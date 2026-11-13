@@ -298,6 +298,8 @@ async fn serve_started(
         .map(|cfg| {
             discovery::UdpTransport::bind(cfg.interfaces())
                 .map(|transport| {
+                    // Interfaces that failed to bind must not claim a subnet in the responder.
+                    let cfg = cfg.with_usable_interfaces(transport.usable());
                     Responder::new(
                         cfg,
                         discovery::SystemEntropy::default(),
