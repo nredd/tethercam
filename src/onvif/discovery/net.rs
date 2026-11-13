@@ -50,10 +50,11 @@ pub trait Transport {
 }
 
 /// One UDP socket per interface, bound to the wildcard address on the discovery port and
-/// joined to the group on its interface.
+/// joined to the group on its interface. An interface that could not be set up keeps its slot,
+/// empty, so interface numbers stay aligned with the responder's configuration.
 #[derive(Debug)]
 pub struct UdpTransport {
-    sockets: Vec<UdpSocket>,
+    sockets: Vec<Option<UdpSocket>>,
     /// Socket polled first on the next receive; advances after every datagram so a flood on
     /// one interface cannot starve the others.
     next: usize,
@@ -62,9 +63,11 @@ pub struct UdpTransport {
 impl UdpTransport {
     /// Bind to the discovery port and join the multicast group on every interface.
     ///
+    /// An interface that cannot be set up is skipped with a logged warning.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a socket cannot be created, bound or joined.
+    /// Returns the last setup error if `interfaces` is not empty and none of them is usable.
     pub fn bind(interfaces: &[Interface]) -> Result<Self, Error> {
         Self::bind_inner(interfaces, PORT, true)
     }
@@ -72,11 +75,25 @@ impl UdpTransport {
     /// `join: false` skips only the multicast join and egress setup, so tests exercise the
     /// production bind without touching a multicast group.
     fn bind_inner(interfaces: &[Interface], port: u16, join: bool) -> Result<Self, Error> {
-        let sockets = interfaces
+        let mut last_error = None;
+        let sockets: Vec<_> = interfaces
             .iter()
-            .map(|i| open(i, port, join))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(Self { sockets, next: 0 })
+            .enumerate()
+            .map(|(n, i)| match open(i, port, join) {
+                Ok(socket) => Some(socket),
+                Err(error) => {
+                    let (family, kind) = (if i.addr.is_ipv4() { 4 } else { 6 }, error.kind());
+                    let (slot, total) = (n + 1, interfaces.len());
+                    log::warn!("Skipping IPv{family} discovery interface {slot}/{total}: {kind:?}");
+                    last_error = Some(error);
+                    None
+                }
+            })
+            .collect();
+        match last_error {
+            Some(error) if sockets.iter().all(Option::is_none) => Err(error.into()),
+            _ => Ok(Self { sockets, next: 0 }),
+        }
     }
 }
 
@@ -267,6 +284,7 @@ impl UdpTransport {
                 .cycle()
                 .skip(self.next)
                 .take(count)
+                .filter_map(|(index, socket)| Some((index, socket.as_ref()?)))
             {
                 if let Some(datagram) = received(receive(socket, buf))? {
                     self.next = (index + 1) % count;
@@ -291,6 +309,7 @@ impl Transport for UdpTransport {
         let socket = self
             .sockets
             .get(interface)
+            .and_then(Option::as_ref)
             .ok_or(Error::NoSuchInterface(interface))?;
         socket
             .send_to(payload, dest)
@@ -302,6 +321,18 @@ impl Transport for UdpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sock(transport: &UdpTransport, index: usize) -> &UdpSocket {
+        transport.sockets[index].as_ref().unwrap()
+    }
+
+    fn missing() -> Interface {
+        Interface {
+            addr: Ipv6Addr::LOCALHOST.into(),
+            prefix_len: 128,
+            index: u32::MAX,
+        }
+    }
 
     fn loopback() -> Interface {
         Interface {
@@ -386,12 +417,22 @@ mod tests {
             )
             .is_err()
         );
-        let missing = Interface {
-            addr: Ipv6Addr::LOCALHOST.into(),
-            prefix_len: 128,
-            index: u32::MAX,
-        };
-        assert!(UdpTransport::bind_inner(&[missing], 0, true).is_err());
+        assert!(UdpTransport::bind_inner(&[missing()], 0, true).is_err());
+        assert!(UdpTransport::bind_inner(&[missing(), missing()], 0, true).is_err());
+    }
+
+    #[test]
+    fn one_unjoinable_interface_is_skipped_and_numbering_is_preserved() {
+        let mut t = UdpTransport::bind_inner(&[missing(), loopback()], 0, true).unwrap();
+        assert!(t.sockets[0].is_none());
+        assert!(t.sockets[1].is_some());
+        let dest = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        assert!(matches!(
+            t.send(0, dest, b"x"),
+            Err(Error::NoSuchInterface(0))
+        ));
+        t.send(1, dest, b"x").unwrap();
+        assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
     }
 
     #[test]
@@ -440,7 +481,7 @@ mod tests {
     #[test]
     fn unicast_round_trip_over_loopback() {
         let mut t = UdpTransport::bind_inner(&[loopback()], 0, false).unwrap();
-        let port = t.sockets[0].local_addr().unwrap().port();
+        let port = sock(&t, 0).local_addr().unwrap().port();
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         peer.send_to(b"ping", (Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -466,9 +507,9 @@ mod tests {
         let mut transport = UdpTransport::bind_inner(&[interface], 0, false).unwrap();
         let address = SocketAddr::from((
             Ipv6Addr::LOCALHOST,
-            transport.sockets[0].local_addr().unwrap().port(),
+            sock(&transport, 0).local_addr().unwrap().port(),
         ));
-        let socket = Socket::from(transport.sockets[0].try_clone().unwrap());
+        let socket = Socket::from(sock(&transport, 0).try_clone().unwrap());
         assert!(socket.only_v6().unwrap());
         let peer = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -496,8 +537,8 @@ mod tests {
     fn a_flooded_first_socket_does_not_starve_later_ones() {
         let mut t = UdpTransport::bind_inner(&[loopback(), loopback()], 0, false).unwrap();
         let (p0, p1) = (
-            t.sockets[0].local_addr().unwrap().port(),
-            t.sockets[1].local_addr().unwrap().port(),
+            sock(&t, 0).local_addr().unwrap().port(),
+            sock(&t, 1).local_addr().unwrap().port(),
         );
         assert_ne!(p0, p1);
         let flooder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -510,7 +551,7 @@ mod tests {
         quiet.send_to(b"one", (Ipv4Addr::LOCALHOST, p1)).unwrap();
         let quiet_addr = quiet.local_addr().unwrap();
         // Make sure both queues are populated before receiving, whatever the host's timing.
-        for socket in &t.sockets {
+        for socket in t.sockets.iter().flatten() {
             socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -575,7 +616,7 @@ mod tests {
         )
         .unwrap();
         let transport = UdpTransport::bind_inner(&[loopback()], 0, false).unwrap();
-        let port = transport.sockets[0].local_addr().unwrap().port();
+        let port = sock(&transport, 0).local_addr().unwrap().port();
         let mut responder =
             Responder::new(config, SystemEntropy::default(), transport, SystemClock);
 
