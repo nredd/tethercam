@@ -123,12 +123,12 @@ pub enum Defect {
     BadLiveViewAfterFirst,
 }
 
-/// Whether the synthetic body advertises optional diagnostic resolution controls.
+/// Whether the synthetic body advertises optional diagnostic still-image size controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolutionControls {
     /// Do not advertise optional controls.
     Absent,
-    /// Advertise size, drive mode and autofocus status.
+    /// Advertise still-image size, drive mode and autofocus status.
     Present,
 }
 
@@ -164,7 +164,7 @@ pub struct SonySimConfig {
     pub emit_object_added: bool,
     /// Whether an image already waits in memory when the body powers up.
     pub stale_image: bool,
-    /// Advertise resolution, single-drive and autofocus status diagnostic controls.
+    /// Advertise still-image size, single-drive and autofocus status diagnostic controls.
     pub resolution_controls: ResolutionControls,
     /// The JPEG served as live view.
     pub live_view_jpeg: Vec<u8>,

@@ -1,6 +1,7 @@
 //! Synthetic, credential-free metrics including PRFT side-data hashes.
 
 use super::*;
+use std::fmt::Write as _;
 
 fn hashes() -> String {
     format!(
@@ -280,6 +281,155 @@ fn final_output_newline_failure_is_not_discarded() {
     let mut quota = Budget(output.len() - 1);
     assert!(check(paths, &mut quota).is_err());
     quota.flush().expect("flush");
+}
+
+/// An effectively growing stream: the reader, not a stale metadata length, must stop it.
+struct Growing(usize);
+impl std::io::Read for Growing {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        // Finite even if a regression forgets Take: a red test must not exhaust host memory.
+        let count = bytes.len().min(32 - self.0);
+        bytes
+            .get_mut(..count)
+            .expect("bounded fixture chunk")
+            .fill(b'a');
+        self.0 += count;
+        Ok(count)
+    }
+}
+
+struct BrokenInput;
+impl std::io::Read for BrokenInput {
+    fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("injected read failure"))
+    }
+}
+
+#[test]
+fn opened_regular_inputs_are_bounded_even_after_metadata_or_path_changes() {
+    let temp = tempfile::tempdir().expect("generated inputs");
+    let path = temp.path().join("aggregate");
+    fs::write(&path, b"original").expect("file");
+    assert_eq!(aggregate(&path).expect("regular input"), b"original");
+    let mut handle = open_aggregate(&path).expect("owned regular handle");
+    fs::remove_file(&path).expect("replace path after open");
+    fs::create_dir(&path).expect("path now points to nonregular input");
+    assert_eq!(
+        opened(&mut handle, File::metadata).expect("same opened regular handle"),
+        b"original"
+    );
+    assert!(aggregate(&path).is_err());
+    assert!(
+        opened(&mut handle, |_| Err(std::io::Error::other(
+            "metadata syscall"
+        )))
+        .is_err()
+    );
+
+    let growing_path = temp.path().join("growing");
+    let mut file = File::options()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&growing_path)
+        .expect("growing file");
+    assert!(
+        opened(&mut file, |file| {
+            let metadata = file.metadata().expect("native fixture metadata");
+            file.set_len(INPUT_BYTES + 1).expect("grow generated file");
+            Ok(metadata)
+        })
+        .is_err()
+    );
+    assert!(aggregate(&growing_path).is_err());
+
+    let mut growing = Growing(0);
+    assert!(bounded(&mut growing, 8).is_err());
+    assert_eq!(growing.0, 9, "must not consume beyond one sentinel byte");
+    assert_eq!(
+        bounded(&mut Growing(0), 32)
+            .expect("complete growing fixture")
+            .len(),
+        32
+    );
+    assert_eq!(
+        bounded(&mut b"12345678".as_slice(), 8).expect("exact byte limit"),
+        b"12345678"
+    );
+    assert!(bounded(&mut BrokenInput, 8).is_err());
+    assert!(records(&"a".repeat(16 * 1024 + 1)).is_err());
+    let oversized = vec![b'a'; usize::try_from(INPUT_BYTES + 1).expect("small limit")];
+    assert!(packets(&oversized).is_err());
+    assert!(records(std::str::from_utf8(&oversized).expect("ASCII")).is_err());
+    assert!(fields(&["1"; 64].join(",")).is_ok());
+    assert_eq!(
+        records(&"\n".repeat(MAX_RECORDS))
+            .expect("exact line limit")
+            .count(),
+        MAX_RECORDS
+    );
+}
+
+#[test]
+fn every_aggregate_path_rejects_oversize_regular_files_before_parsing() {
+    let temp = tempfile::tempdir().expect("temp");
+    let files =
+        ["frames", "packets", "metrics", "source", "video"].map(|name| temp.path().join(name));
+    let contents = [
+        hashes().into_bytes(),
+        PACKETS.to_vec(),
+        METRICS.as_bytes().to_vec(),
+        SOURCE.as_bytes().to_vec(),
+        vec![0],
+    ];
+    for (path, bytes) in files.iter().zip(&contents) {
+        fs::write(path, bytes).expect("generated input");
+    }
+    let paths = files.each_ref().map(std::path::PathBuf::as_path);
+    for (path, bytes) in files.iter().zip(&contents).take(4) {
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("file")
+            .set_len(INPUT_BYTES + 1)
+            .expect("sparse oversize");
+        assert!(check(paths, &mut Vec::new()).is_err());
+        fs::write(path, bytes).expect("restore");
+    }
+    #[cfg(unix)]
+    {
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&files[0], &link).expect("synthetic symlink");
+        assert!(aggregate(&link).is_err());
+    }
+}
+
+#[test]
+fn parser_collections_have_explicit_record_line_and_column_limits() {
+    assert!(fields(&["1"; 65].join(",")).is_err());
+    assert!(fields(&"a".repeat(16 * 1024 + 1)).is_err());
+    assert!(stats(vec![1.0; 100_001]).is_err());
+    let text = format!("{}{}", "ignored\n".repeat(100_001), METRICS);
+    assert!(timing(&text).is_err());
+    let source_csv = format!("fetch_s\n{}", "1\n".repeat(100_001));
+    assert!(source(&source_csv).is_err());
+    let mut complete = String::from("elapsed_s,jpeg_bytes,fingerprint\n");
+    let mut framehash = String::from("#tb 0: 1/1\n");
+    let hash = "a".repeat(64);
+    for n in 1..=100_001 {
+        writeln!(complete, "{n},1,a").expect("source record");
+        writeln!(framehash, "0,{n},{n},1,1,{hash}").expect("frame record");
+    }
+    assert!(acquisition(&complete).is_err());
+    assert!(frames(&framehash).is_err());
+    let packet_json = format!(
+        "{{\"packets\":[{}]}}",
+        (0..100_001)
+            .map(|n| format!("{{\"pts_time\":\"{n}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert!(packets(packet_json.as_bytes()).is_err());
 }
 
 #[test]

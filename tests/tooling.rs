@@ -148,6 +148,74 @@ fn native_gate_rejects_uncovered_nested_tests_support_empty_and_stale_profiles()
 }
 
 #[test]
+#[cfg(unix)]
+fn aggregate_fifos_and_directories_fail_promptly_on_every_input_path() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let temp = tempfile::tempdir().expect("synthetic inputs");
+    let files =
+        ["frames", "packets", "metrics", "source", "media"].map(|name| temp.path().join(name));
+    let contents = [
+        format!("#tb 0: 1/1\n0,0,0,1,1,{}\n", "a".repeat(64)).into_bytes(),
+        br#"{"packets":[{"pts_time":"0"},{"pts_time":"1"}]}"#.to_vec(),
+        b"real 1\nuser 0\nsys 0\n1 maximum resident set size\n".to_vec(),
+        b"fetch_s\n1\n".to_vec(),
+        vec![0],
+    ];
+    for (path, bytes) in files.iter().zip(&contents) {
+        fs::write(path, bytes).expect("synthetic file");
+    }
+    for path in files.iter().take(4) {
+        for fifo in [true, false] {
+            fs::remove_file(path).expect("replace input");
+            if fifo {
+                assert!(
+                    Command::new("/usr/bin/mkfifo")
+                        .arg(path)
+                        .status()
+                        .expect("owned synthetic FIFO")
+                        .success()
+                );
+            } else {
+                fs::create_dir(path).expect("nonregular input");
+            }
+            let mut child = tool()
+                .arg("profile-summary")
+                .args(&files)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("utility");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut expired = false;
+            while child.try_wait().expect("poll").is_none() {
+                if Instant::now() >= deadline {
+                    expired = true;
+                    child.kill().expect("stop exact blocked utility");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().expect("join owned utility");
+            assert!(!expired, "aggregate input blocked on open/read");
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(output.stdout, [] as [u8; 0]);
+            assert_eq!(output.stderr, b"invalid or empty profiling measurements\n");
+            if fifo {
+                fs::remove_file(path).expect("remove FIFO");
+            } else {
+                fs::remove_dir(path).expect("remove directory");
+            }
+            let original = files
+                .iter()
+                .position(|file| file == path)
+                .expect("input index");
+            fs::write(path, contents.get(original).expect("original input")).expect("restore");
+        }
+    }
+}
+
+#[test]
 fn actual_verifier_uses_pipe_owned_server_and_never_opens_a_camera() {
     let temp = tempfile::tempdir().expect("temp");
     let program = temp.path().join("verification-fixture");

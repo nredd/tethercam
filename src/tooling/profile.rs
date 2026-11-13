@@ -4,14 +4,21 @@
 //! - <https://ffmpeg.org/ffmpeg-formats.html#framehash-1>
 //! - <https://ffmpeg.org/ffprobe.html>
 //! - <https://man.freebsd.org/cgi/man.cgi?query=time&sektion=1>
+//! - <https://docs.rs/rustix/latest/rustix/fs/fn.open.html>
 
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, Metadata};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use serde_json::{Value, json};
 
 use super::Error;
+
+// About 55 minutes at 30 fps, with room for native ffprobe metadata and PRFT side data.
+const INPUT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RECORDS: usize = 100_000;
+const LINE_BYTES: usize = 16 * 1024;
+const MAX_COLUMNS: usize = 64;
 
 fn invalid() -> Error {
     Error::Invalid("invalid or empty profiling measurements")
@@ -27,10 +34,21 @@ fn number(text: &str) -> Result<f64, Error> {
 
 /// Profiling CSV uses simple scalar fields; quoted/nested CSV is rejected, never guessed.
 fn fields(line: &str) -> Result<Vec<&str>, Error> {
-    if line.contains('"') || line.chars().any(|c| c.is_control() && c != '\t') {
+    if line.len() > LINE_BYTES
+        || line.contains('"')
+        || line.chars().any(|c| c.is_control() && c != '\t')
+    {
         return Err(invalid());
     }
-    Ok(line.split(',').map(str::trim).collect())
+    let columns: Vec<_> = line
+        .split(',')
+        .take(MAX_COLUMNS + 1)
+        .map(str::trim)
+        .collect();
+    if columns.len() > MAX_COLUMNS {
+        return Err(invalid());
+    }
+    Ok(columns)
 }
 
 struct Frames {
@@ -49,7 +67,7 @@ fn frames(input: &str) -> Result<Frames, Error> {
     let mut distinct = 0.0;
     let mut bytes = 0.0;
     let mut previous = None;
-    for line in input.lines() {
+    for line in records(input)? {
         if let Some(value) = line.strip_prefix("#tb 0:") {
             if timebase.is_some() {
                 return Err(invalid());
@@ -107,7 +125,10 @@ fn frames(input: &str) -> Result<Frames, Error> {
 
 /// Nearest-rank-style percentiles match the existing offline summaries.
 fn stats(mut values: Vec<f64>) -> Result<Value, Error> {
-    if values.is_empty() || values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+    if values.is_empty()
+        || values.len() > MAX_RECORDS
+        || values.iter().any(|v| !v.is_finite() || *v < 0.0)
+    {
         return Err(invalid());
     }
     values.sort_by(f64::total_cmp);
@@ -132,11 +153,17 @@ fn stats(mut values: Vec<f64>) -> Result<Value, Error> {
 }
 
 fn packets(input: &[u8]) -> Result<Value, Error> {
+    if input.len() as u64 > INPUT_BYTES {
+        return Err(invalid());
+    }
     let value: Value = serde_json::from_slice(input)?;
     let rows = value
         .get("packets")
         .and_then(Value::as_array)
         .ok_or_else(invalid)?;
+    if rows.len() > MAX_RECORDS {
+        return Err(invalid());
+    }
     let mut intervals = Vec::new();
     let mut previous = None;
     for row in rows {
@@ -157,7 +184,7 @@ fn packets(input: &[u8]) -> Result<Value, Error> {
 }
 
 fn source(input: &str) -> Result<Value, Error> {
-    let mut lines = input.lines();
+    let mut lines = records(input)?;
     let header = fields(lines.next().ok_or_else(invalid)?)?;
     let columns: Vec<_> = header
         .iter()
@@ -185,7 +212,7 @@ fn source(input: &str) -> Result<Value, Error> {
 
 /// Retain source-only cadence/bandwidth measurements when the complete acquisition CSV is present.
 fn acquisition(input: &str) -> Result<Option<Value>, Error> {
-    let mut lines = input.lines();
+    let mut lines = records(input)?;
     let header = fields(lines.next().ok_or_else(invalid)?)?;
     let mut columns = Vec::new();
     for name in ["elapsed_s", "jpeg_bytes", "fingerprint"] {
@@ -258,7 +285,7 @@ fn acquisition(input: &str) -> Result<Option<Value>, Error> {
 fn timing(input: &str) -> Result<(f64, f64, f64), Error> {
     let mut times = std::collections::BTreeMap::new();
     let mut rss = None;
-    for line in input.lines() {
+    for line in records(input)? {
         let words: Vec<_> = line.split_whitespace().collect();
         match words.as_slice() {
             [name @ ("real" | "user" | "sys"), value] => {
@@ -342,8 +369,8 @@ pub(super) fn check(paths: [&Path; 5], out: &mut dyn Write) -> Result<(), Error>
         return Err(invalid());
     }
     let summary = summarize(
-        &fs::read_to_string(framehash)?,
-        &fs::read(packets)?,
+        &text(framehash)?,
+        &aggregate(packets)?,
         optional(metrics)?.as_deref(),
         optional(source)?.as_deref(),
         media.len(),
@@ -357,7 +384,74 @@ fn optional(path: &Path) -> Result<Option<String>, Error> {
     if path == Path::new("-") {
         return Ok(None);
     }
-    Ok(Some(fs::read_to_string(path)?))
+    Ok(Some(text(path)?))
+}
+
+/// Bound text records before allocating per-row columns or statistics.
+fn records(input: &str) -> Result<std::str::Lines<'_>, Error> {
+    if input.len() as u64 > INPUT_BYTES
+        || input
+            .lines()
+            .enumerate()
+            .any(|(row, line)| row >= MAX_RECORDS || line.len() > LINE_BYTES)
+    {
+        return Err(invalid());
+    }
+    Ok(input.lines())
+}
+
+/// Native nonblocking open prevents a regular-file-to-FIFO swap from hanging before validation.
+fn open_aggregate(path: &Path) -> Result<File, Error> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+        Ok(open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?
+        .into())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::Invalid(
+            "nonblocking aggregate file reads are unsupported on this platform",
+        ))
+    }
+}
+
+/// Read only a validated opened regular handle, never trust a path metadata preflight.
+fn aggregate(path: &Path) -> Result<Vec<u8>, Error> {
+    opened(&mut open_aggregate(path)?, File::metadata)
+}
+
+/// The metadata syscall seam lets failure tests retain an actual owned file handle.
+fn opened(
+    file: &mut File, metadata: fn(&File) -> std::io::Result<Metadata>,
+) -> Result<Vec<u8>, Error> {
+    let metadata = metadata(file)?;
+    if !metadata.is_file() || metadata.len() > INPUT_BYTES {
+        return Err(invalid());
+    }
+    bounded(file, INPUT_BYTES)
+}
+
+/// Cap bytes while reading, including files that grow after handle metadata was inspected.
+fn bounded(reader: &mut dyn Read, limit: u64) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+fn text(path: &Path) -> Result<String, Error> {
+    String::from_utf8(aggregate(path)?).map_err(|_| invalid())
 }
 
 #[cfg(test)]

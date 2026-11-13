@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 Next release: `0.0.2`.
 
+### Fixed
+
+- Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
+- Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
+
 ### Added
 
 - Off-by-default, importable `test-support` API with a generic USB/IP engine, Sony/SICDD and synthetic non-Sony personalities, fault/resource/deadline/re-import/cancellation verification and hosted native integration

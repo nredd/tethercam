@@ -142,8 +142,9 @@ Python or shell implementations. `Makefile` and workflow YAML only wire commands
 
 The public `test_support::diagnostics` API accepts a caller-owned `Session<T: Transport>` and
 returns artifacts only after `SonyCamera::run` cleanup. It supports read-only advertised-property
-inspection, bounded live-view acquisition CSV with SHA-256 fingerprints, explicit size/drive/
-JPEG-quality changes, and one/two-still focus/capture cadence. Capture failures still release
+inspection, bounded live-view acquisition CSV with SHA-256 fingerprints, explicit still-image
+size/drive/JPEG-quality changes, and one/two-still focus/capture cadence. Sony property `0xD203`
+selects still-image size, not live-view resolution; no live-view-resolution control is established. Capture failures still release
 both shutter stages and close the session. Still artifacts use `.bin`, not an assumed JPEG
 format; numerical output includes the actual PTP object format. Nothing enumerates USB inside
 this reusable API. `Operation::validate` allows bounds checking before transport acquisition.
@@ -198,8 +199,17 @@ consecutive FPS, repeated-frame percentage, payload rates, nearest-rank-style pe
 population jitter and optional CPU/RSS/source-fetch measurements. Complete acquisition CSV also
 retains source-only duration, FPS, distinct-consecutive FPS and JPEG byte/payload rates. Missing optional inputs use
 `-` and produce `null`, not invented measurements. It validates finite scalars, monotonic times,
-nonempty records and typed CSV/JSON structure. The H.264 input is inspected for **file metadata
-length only**, never opened/read as media. Absolute glass-to-glass latency is explicitly not
+nonempty records and typed CSV/JSON structure. Each aggregate input must be a regular file,
+not a FIFO, device, directory or final-component symlink. On Linux/macOS it opens with native
+nonblocking/no-follow flags and validates the opened handle, not a path preflight; unsupported
+platforms fail closed rather than risk a blocking special-file open. A 32 MiB cap per aggregate
+input is enforced during reading, including file growth after metadata inspection. Text inputs
+also allow at most 100,000 lines (including headers/comments), 16 KiB per line and 64 CSV columns;
+packet JSON and statistics allow at most 100,000 records. These generous bounds cover roughly
+55 minutes at 30 FPS; ordinary 30-second profiles are far smaller. Tests include real FIFOs on
+every aggregate path, opened-handle/path replacement, growing inputs and exact/over-limit cases.
+The H.264 input is inspected for **file metadata length only**, never opened/read as media; the
+aggregate read limits do not cause media payload access. Absolute glass-to-glass latency is explicitly not
 measured. Keep all generated configuration, client inputs, measurements and media private.
 
 ## Package verification

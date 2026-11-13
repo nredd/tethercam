@@ -19,7 +19,7 @@ use crate::transport::Transport;
 /// Requested diagnostic. Writes are explicit, never inferred from a measured result.
 #[derive(Debug, Clone, Copy)]
 pub enum Operation {
-    /// Read advertised resolution/focus properties without changes.
+    /// Read advertised still-image size/focus properties without changes.
     Properties,
     /// Fetch a bounded number of live-view frames and emit acquisition CSV.
     Source {
@@ -28,7 +28,7 @@ pub enum Operation {
     },
     /// Configure only these explicitly requested advertised properties.
     Configure {
-        /// Live-view size selector, one through three.
+        /// Still-image size selector (`0xD203`), one through three; not live-view resolution.
         size: u8,
         /// Also select single capture drive mode.
         single_drive: bool,
