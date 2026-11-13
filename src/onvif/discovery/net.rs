@@ -436,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv4_interface_that_cannot_bind_is_skipped_too() {
+        // A plain socket without address sharing makes every later bind to the port fail.
+        let holder = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        assert!(UdpTransport::bind_inner(&[loopback()], port, false).is_err());
+        let t = UdpTransport::bind_inner(&[loopback(), missing()], port, false).unwrap();
+        assert!(t.sockets[0].is_none());
+        assert!(t.sockets[1].is_some());
+    }
+
+    #[test]
     fn fixed_ports_are_shared_but_ephemeral_ports_are_exclusive() {
         // Reserve an exclusive OS-assigned port before enabling sharing. No bind to port
         // zero uses `SO_REUSEPORT`, even in this test, and there is no close/rebind race.
