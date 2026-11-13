@@ -33,7 +33,8 @@ Live-view resolution is set by the camera, not by this software. On the a7 III i
 
 ## Install
 
-Requires a Rust toolchain, 1.90 or newer ([rustup.rs](https://rustup.rs)).
+Requires a Rust toolchain, 1.90 or newer ([rustup.rs](https://rustup.rs)). That is the MSRV for
+users; development gates use the exact toolchain pinned in `rust-toolchain.toml`.
 
 ```sh
 cargo install tethercam
@@ -146,9 +147,11 @@ make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-co
 ```
 
 Tools: `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` 0.9.1 or newer (with the
-`llvm-tools-preview` rustup component). Put the rustup toolchain's `cargo` first on `PATH` and keep
-it current (`rustup update stable`): CI floats on `stable` and coverage regions differ between rustc
-releases.
+`llvm-tools-preview` rustup component). The compiler is pinned by `rust-toolchain.toml`, which CI,
+the release workflow and rustup (it installs the pin, its components and cross targets on first
+use) all honor, so local and CI results compare. Put rustup's `cargo` first on `PATH`; a
+non-rustup Rust install (Homebrew, distro) ignores the file and is unsupported for the gates. See
+`docs/verification.md` for bumping the pin.
 `make coverage` cleans profiles and uses cargo-llvm-cov's native zero-uncovered line/function/
 region checks plus fail-under-100 guards, with implicit filename exclusions disabled. Actual
 `src/` includes named/nested source tests, developer tools and optional test-support implementation.

@@ -1,0 +1,8 @@
+# Single source of truth for the compiler every gate and the release build use.
+# Workflows repeat `channel` (tests/repository_policy.rs fails on any mismatch).
+# `rust-version` in Cargo.toml is the MSRV, not this pin. Bump: docs/verification.md.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+targets = ["aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"]

@@ -91,6 +91,7 @@ its existing restrictions; see [branch-ruleset.md](branch-ruleset.md).
    provisions the synthetic USB/IP fixture on the disposable Linux runner, runs `make all cross`,
    detaches the fixture even after failure, and verifies Cargo packaging and publication dry-run.
    Privileged CI fixture setup never runs in publication jobs or on a maintainer's host.
+   Both jobs install the compiler pinned in `rust-toolchain.toml`, the same one CI uses.
 4. `publish` waits for environment admission, checks out the same SHA, downloads the gate's
    same-run archive, repeats package verification, compares its bytes, authenticates via OIDC,
    and executes `cargo publish --locked`. It never overwrites or silently skips a registry version.

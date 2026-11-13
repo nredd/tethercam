@@ -91,4 +91,4 @@ and trailing-byte diagnostics, with arbitrary-byte tests for every supported dat
 deterministic truncation/trailing-byte rejection tests. The native mid-transfer disconnect
 scenario waits for a confirmed pending bulk-IN URB before detaching the serial-verified VHCI
 port, then checks both transfer failure and the removal event. `usb::factory` separately covers enumeration failure, exact-address
-selection and open errors with one concrete test source. The engine, fixtures and scenarios ship with the crate behind their documented feature gates. Only repository-policy tests are excluded because their workflow/ruleset inputs are unpublished. Physical-camera tests are unrelated and remain ignored.
+selection and open errors with one concrete test source. The engine, fixtures and scenarios ship with the crate behind their documented feature gates. Only repository-policy tests and the development `rust-toolchain.toml` pin are excluded; their workflow/ruleset inputs are unpublished. Physical-camera tests are unrelated and remain ignored.

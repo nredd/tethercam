@@ -129,13 +129,15 @@ source tests. The sole local constraint remains exactly `src/transport/usb/nusb_
 and only when `CI` is absent and VHCI is absent. It is announced loudly; any `CI` value disables
 that exception. Hosted Linux requires the adapter's full coverage too.
 
-Toolchain: use a rustup toolchain with `llvm-tools-preview`, and keep it current. CI floats on
-`stable`, and LLVM region accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0
-disagree on the inline arguments of a `log::warn!`), so a local run on an older rustc can pass
-where CI fails, or the reverse. The gate prints a `TOOLCHAIN:` line; compare it with the CI log
-and `rustup update stable` when it is older. A distro or Homebrew rustc has no
-`llvm-tools-preview` (cargo-llvm-cov fails early and says so) and is not a supported gate
-toolchain, though its sysroot `rust-src` sources are excluded like `/rustc/` ones. The native
+Toolchain: `rust-toolchain.toml` pins one exact stable release (plus the `clippy`, `rustfmt` and
+`llvm-tools-preview` components and the two cross targets) for every gate, and LLVM region
+accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0 disagree on the inline
+arguments of a `log::warn!`), so an unpinned local run can pass where CI fails, or the reverse.
+Use rustup, which honors the file and installs the pin on first use; there is nothing to
+`rustup update`. The gate prints a `TOOLCHAIN:` line; it must match the CI log. A non-rustup
+install (distro, Homebrew) ignores the file, has no `llvm-tools-preview` (cargo-llvm-cov fails
+early and says so) and is unsupported for the gates, though its sysroot `rust-src` sources are
+excluded like `/rustc/` ones. The native
 summary lists uncovered *lines* only, so a region-only failure names no file. On any failure the
 gate also writes the same filtered text report to `coverage/uncovered.txt` and prints
 `grep -n -B1 '\^0' coverage/uncovered.txt`; `^0` marks an unexecuted region.
@@ -232,5 +234,26 @@ Changes to packaging/features must validate a real extracted `cargo package` arc
 repository metadata: normal default application selection/build, all-feature sources/tests, and
 a separate downstream crate importing `test_support` with that feature enabled. The package
 includes the reusable engine, personalities, scenarios and synthetic fixture sources. Only the
-repository-policy test remains excluded because its workflow/ruleset inputs are intentionally
-unpublished.
+repository-policy test and the development `rust-toolchain.toml` pin are excluded; their
+workflow/ruleset inputs are intentionally unpublished.
+
+## Toolchain pin
+
+`rust-toolchain.toml` is the single source of truth for the compiler. Every workflow job that
+runs cargo, including `deny` and the release workflow, installs that exact `channel` through its one
+`dtolnay/rust-toolchain` step (never `stable`). With the file present, rustup would fetch any
+listed component or cross target missing from the job on its first `cargo` call (seen in the `fmt`
+job log as a second "downloading 4 components"), so each step lists exactly the file's
+`components` and `targets`. That costs a few extra downloads in jobs that need less, and makes
+every job fetch the same set up front. `tests/repository_policy.rs` fails when a step's
+`toolchain`, `components` or `targets` differ from the file, when a job has a second toolchain
+setup action, or when a workflow step or Makefile recipe selects a toolchain by hand
+(`cargo +x`, `rustup`, `RUSTUP_TOOLCHAIN`). `rust-version` in `Cargo.toml` is the MSRV, not the
+pin. The `test.yml` `msrv` job installs it, installs no extra components, and sets
+`RUSTUP_TOOLCHAIN` to it, since rustup would otherwise let the file override the action's
+default; its log prints `rustc --version --verbose`.
+
+To bump the pin, open a deliberate PR that changes `channel` in `rust-toolchain.toml` and the
+`toolchain:` value in each workflow (plus any changed `components` or `targets`) in the same commit, runs the full gate (`make all`) and
+reads the Linux `coverage` job: region accounting can change and expose gaps that need tests, not
+exclusions. The `release.yml` pin is unexecuted until a tag runs it.

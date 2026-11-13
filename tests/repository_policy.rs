@@ -364,7 +364,10 @@ fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<()
             .as_array()
             .ok_or("missing native acceptance steps")?;
         assert!(steps.iter().any(|step| {
-            step["with"]["components"] == "llvm-tools-preview" && step.get("if").is_none()
+            step["with"]["components"]
+                .as_str()
+                .is_some_and(|c| c.contains("llvm-tools-preview"))
+                && step.get("if").is_none()
         }));
         assert!(steps.iter().any(|step| {
             step["with"]["tool"] == "cargo-llvm-cov,cargo-nextest" && step.get("if").is_none()
@@ -404,7 +407,7 @@ fn release_gate_prepares_and_cleans_up_native_usbip() -> Result<(), Box<dyn Erro
     }
     assert_eq!(steps[cleanup]["if"], "always()");
     assert!(steps.iter().any(|step| {
-        step["with"]["components"] == "rustfmt, clippy, llvm-tools-preview"
+        step["with"]["components"] == "clippy, rustfmt, llvm-tools-preview"
             && step.get("if").is_none()
     }));
     assert!(steps.iter().any(|step| {
@@ -447,6 +450,7 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
         ("docs.yml", "rustdoc", "make doc", None),
         ("bench.yml", "bench", "make bench-check", None),
         ("coverage.yml", "coverage", "make coverage", None),
+        ("deny.yml", "deny", "make deny", None),
         (
             "cross.yml",
             "check",
@@ -492,24 +496,6 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
             "gate step must not tolerate failure"
         );
     }
-    let (_, deny) = workflows
-        .iter()
-        .find(|(name, _)| name == "deny.yml")
-        .ok_or("missing deny")?;
-    assert!(
-        deny["jobs"]["deny"]["steps"]
-            .as_array()
-            .ok_or("missing deny steps")?
-            .iter()
-            .any(|step| {
-                step["uses"]
-                    .as_str()
-                    .is_some_and(|s| s.starts_with("EmbarkStudios/cargo-deny-action@"))
-                    && step["with"]["command"] == "check"
-                    && step.get("if").is_none()
-                    && step.get("continue-on-error").is_none()
-            })
-    );
     let makefile = include_str!("../Makefile");
     assert!(makefile.lines().any(|line| {
         line.starts_with("all: fmt-check lint check test doc bench-check deny coverage ")
@@ -527,6 +513,12 @@ fn repository_only_test_is_excluded_from_publication() -> Result<(), Box<dyn Err
         excludes
             .iter()
             .any(|path| path.as_str() == Some("tests/repository_policy.rs"))
+    );
+    assert!(
+        excludes
+            .iter()
+            .any(|path| path.as_str() == Some("rust-toolchain.toml")),
+        "the development pin must not ship in the crate"
     );
     for path in ["tests/usb_emulated.rs", "tests/usbip/", "src/test_support/"] {
         assert!(!excludes.iter().any(|value| value.as_str() == Some(path)));
@@ -616,5 +608,510 @@ fn workflow_drift_and_skippable_checks_fail() -> Result<(), Box<dyn Error>> {
         .ok_or("lint")?;
     lint["jobs"]["clippy"]["strategy"]["matrix"]["os"][0] = json!("ubuntu-renamed");
     assert!(validate(&policy()?, &workflows).is_err());
+    Ok(())
+}
+
+const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@";
+
+/// Whether a step is the toolchain installer.
+fn is_toolchain_step(step: &Value) -> bool {
+    step["uses"]
+        .as_str()
+        .is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION))
+}
+
+/// JSON pointer to a job's `run` step containing `needle`.
+fn run_pointer(
+    workflows: &Workflows, file: &str, job: &str, needle: &str,
+) -> Result<String, String> {
+    let (_, workflow) = workflows
+        .iter()
+        .find(|(n, _)| n == file)
+        .ok_or("workflow")?;
+    let steps = workflow["jobs"][job]["steps"].as_array().ok_or("steps")?;
+    let index = steps
+        .iter()
+        .position(|s| s["run"].as_str().is_some_and(|r| r.contains(needle)))
+        .ok_or("run step")?;
+    Ok(format!("/jobs/{job}/steps/{index}/run"))
+}
+
+/// JSON pointer to a job's toolchain step, so mutations survive step reordering.
+fn toolchain_pointer(workflows: &Workflows, file: &str, job: &str) -> Result<String, String> {
+    let (_, workflow) = workflows
+        .iter()
+        .find(|(n, _)| n == file)
+        .ok_or("workflow")?;
+    let steps = workflow["jobs"][job]["steps"].as_array().ok_or("steps")?;
+    let index = steps
+        .iter()
+        .position(is_toolchain_step)
+        .ok_or("toolchain step")?;
+    Ok(format!("/jobs/{job}/steps/{index}"))
+}
+
+/// Split a comma-separated action input into trimmed non-empty items.
+fn csv(value: &str) -> BTreeSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Words of a shell script, split on whitespace and the usual command separators.
+fn shell_words(script: &str) -> Vec<&str> {
+    script
+        .split(|c: char| c.is_whitespace() || ";&|()`".contains(c))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Whether a script runs `rustup` (by any path), sets `RUSTUP_TOOLCHAIN`, or passes a
+/// `+toolchain` override to `cargo`/`rustc`. Not a shell parser; it catches the plausible drift.
+fn selects_toolchain(script: &str) -> bool {
+    let words = shell_words(script);
+    let base = |word: &str| word.rsplit('/').next().unwrap_or(word).to_owned();
+    words
+        .iter()
+        .any(|w| base(w) == "rustup" || w.starts_with("RUSTUP_TOOLCHAIN="))
+        || words.windows(2).any(|w| {
+            matches!(base(w[0]).as_str(), "cargo" | "rustc" | "rustdoc") && w[1].starts_with('+')
+        })
+}
+
+/// Reject toolchain selection inside any Makefile recipe line.
+fn validate_recipes(makefile: &str) -> Result<(), String> {
+    for line in makefile.lines().filter(|line| line.starts_with('\t')) {
+        require(
+            !selects_toolchain(line.trim_start().trim_start_matches(['@', '-', '+'])),
+            &format!(
+                "Makefile recipe selects a toolchain by hand: {}",
+                line.trim()
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Actions whose names suggest they set up a Rust toolchain.
+fn is_other_toolchain_setup(step: &Value) -> bool {
+    step["uses"].as_str().is_some_and(|uses| {
+        let uses = uses.to_ascii_lowercase();
+        !is_toolchain_step(step)
+            && ["toolchain", "rustup", "setup-rust", "rust-install"]
+                .iter()
+                .any(|hint| uses.contains(hint))
+    })
+}
+
+/// A job that builds must install the pin exactly once, with no other setup action and no
+/// hand-picked toolchain.
+fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
+    let runs: Vec<&str> = steps.iter().filter_map(|s| s["run"].as_str()).collect();
+    let installs = steps.iter().filter(|s| is_toolchain_step(s)).count();
+    let builds = runs
+        .iter()
+        .any(|r| r.contains("cargo ") || r.contains("make "));
+    require(
+        installs > 0 || !builds,
+        &format!("{at}: runs cargo without installing the pinned toolchain"),
+    )?;
+    require(
+        installs <= 1,
+        &format!("{at}: more than one toolchain setup step"),
+    )?;
+    require(
+        !steps.iter().any(is_other_toolchain_setup),
+        &format!("{at}: a different toolchain setup action"),
+    )?;
+    require(
+        runs.iter().all(|run| !selects_toolchain(run)),
+        &format!("{at}: a run step selects a toolchain by hand"),
+    )?;
+    require(
+        steps
+            .iter()
+            .all(|s| s["with"].get("component").is_none() && s["with"].get("target").is_none()),
+        &format!("{at}: use the plural `components`/`targets` inputs"),
+    )
+}
+
+/// The pin from `rust-toolchain.toml` plus the MSRV from `Cargo.toml`.
+struct Pin {
+    channel: String,
+    msrv: String,
+    components: BTreeSet<String>,
+    targets: BTreeSet<String>,
+}
+
+/// Parse and sanity-check the pin: an exact release that is not the MSRV.
+fn parse_pin(toolchain_file: &str, manifest: &str) -> Result<Pin, String> {
+    let file: toml::Value = toml::from_str(toolchain_file).map_err(|e| e.to_string())?;
+    let table = file.get("toolchain").ok_or("missing [toolchain]")?;
+    let channel = table
+        .get("channel")
+        .and_then(toml::Value::as_str)
+        .ok_or("missing channel")?;
+    let is_version =
+        |v: &str| v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u32>().is_ok());
+    require(
+        is_version(channel),
+        "channel must be an exact x.y.z release",
+    )?;
+    let listed = |key: &str| -> BTreeSet<String> {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let manifest: toml::Value = toml::from_str(manifest).map_err(|e| e.to_string())?;
+    let msrv = manifest
+        .get("package")
+        .and_then(|package| package.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .ok_or("missing rust-version")?;
+    require(
+        channel != msrv && !channel.starts_with(&format!("{msrv}.")),
+        "the pin must not be the MSRV",
+    )?;
+    Ok(Pin {
+        channel: channel.to_owned(),
+        msrv: msrv.to_owned(),
+        components: listed("components"),
+        targets: listed("targets"),
+    })
+}
+
+/// One toolchain step. Components and targets must equal the file's lists exactly so rustup
+/// never fetches anything lazily on the first `cargo` call.
+fn check_toolchain_step(at: &str, job: &Value, step: &Value, pin: &Pin) -> Result<(), String> {
+    let wanted = step["with"]["toolchain"]
+        .as_str()
+        .ok_or(format!("{at}: no toolchain"))?;
+    if at == "test.yml/msrv" {
+        require(wanted == pin.msrv, "msrv job must install rust-version")?;
+        return require(
+            job["env"]["RUSTUP_TOOLCHAIN"].as_str() == Some(&pin.msrv),
+            "msrv job must set RUSTUP_TOOLCHAIN to rust-version",
+        );
+    }
+    require(
+        wanted == pin.channel,
+        &format!("{at}: toolchain {wanted} != pin {}", pin.channel),
+    )?;
+    require(
+        csv(step["with"]["components"].as_str().unwrap_or_default()) == pin.components,
+        &format!("{at}: components differ from rust-toolchain.toml"),
+    )?;
+    require(
+        csv(step["with"]["targets"].as_str().unwrap_or_default()) == pin.targets,
+        &format!("{at}: targets differ from rust-toolchain.toml"),
+    )
+}
+
+/// Every toolchain step must install the pin from `rust-toolchain.toml`, except the `msrv` job,
+/// which installs `rust-version` and must also override rustup with `RUSTUP_TOOLCHAIN`.
+fn validate_toolchains(
+    workflows: &Workflows, toolchain_file: &str, manifest: &str,
+) -> Result<(), String> {
+    let pin = parse_pin(toolchain_file, manifest)?;
+    let mut seen = 0;
+    for (file, workflow) in workflows {
+        for (id, job) in workflow["jobs"].as_object().ok_or("missing jobs")? {
+            let steps = job["steps"].as_array().map_or(&[][..], Vec::as_slice);
+            let at = format!("{file}/{id}");
+            check_job_hygiene(&at, steps)?;
+            for step in steps.iter().filter(|step| is_toolchain_step(step)) {
+                seen += 1;
+                check_toolchain_step(&at, job, step, &pin)?;
+            }
+        }
+        let overrides = workflow.to_string().matches("RUSTUP_TOOLCHAIN").count();
+        require(
+            overrides == usize::from(file == "test.yml"),
+            &format!("{file}: RUSTUP_TOOLCHAIN is only for the msrv job"),
+        )?;
+    }
+    require(seen > 0, "no toolchain steps found")
+}
+
+#[test]
+fn workflow_toolchains_match_rust_toolchain_file() -> Result<(), Box<dyn Error>> {
+    validate_toolchains(
+        &workflows()?,
+        include_str!("../rust-toolchain.toml"),
+        include_str!("../Cargo.toml"),
+    )?;
+    validate_recipes(include_str!("../Makefile"))?;
+    Ok(())
+}
+
+#[test]
+fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let mutations: [(&str, &str, &str, Value); 5] = [
+        (
+            "coverage.yml",
+            "coverage",
+            "/with/toolchain",
+            json!("stable"),
+        ),
+        ("release.yml", "gate", "/with/toolchain", json!("1.99.1")),
+        ("lint.yml", "clippy", "/with/components", json!("miri")),
+        (
+            "cross.yml",
+            "check",
+            "/with/targets",
+            json!("wasm32-unknown-unknown"),
+        ),
+        ("fmt.yml", "fmt", "/with/components", json!("clippy")),
+    ];
+    for (name, job, tail, value) in mutations {
+        let mut workflows = original.clone();
+        let pointer = format!("{}{tail}", toolchain_pointer(&workflows, name, job)?);
+        let (_, workflow) = workflows
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .ok_or("workflow")?;
+        *workflow.pointer_mut(&pointer).ok_or(pointer.clone())? = value;
+        assert!(
+            validate_toolchains(&workflows, file, manifest).is_err(),
+            "accepted {name} {pointer}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn toolchain_overrides_and_missing_installs_fail() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let plain: [(&str, String, Value); 8] = [
+        (
+            "test.yml",
+            "/jobs/msrv/env/RUSTUP_TOOLCHAIN".into(),
+            json!("1.100.0"),
+        ),
+        ("test.yml", "/jobs/msrv/env".into(), json!({})),
+        ("lint.yml", "/env/RUSTUP_TOOLCHAIN".into(), json!("stable")),
+        (
+            "docs.yml",
+            "/jobs/rustdoc/env".into(),
+            json!({"RUSTUP_TOOLCHAIN": "stable"}),
+        ),
+        (
+            "docs.yml",
+            run_pointer(&original, "docs.yml", "rustdoc", "make doc")?,
+            json!("cargo +stable doc"),
+        ),
+        (
+            "bench.yml",
+            run_pointer(&original, "bench.yml", "bench", "make bench-check")?,
+            json!("rustup default stable"),
+        ),
+        (
+            "check.yml",
+            run_pointer(&original, "check.yml", "native-check", "make check")?,
+            json!("cargo  +nightly check"),
+        ),
+        (
+            "release.yml",
+            format!(
+                "{}/with/targets",
+                toolchain_pointer(&original, "release.yml", "gate")?
+            ),
+            json!(""),
+        ),
+    ];
+    for (name, pointer, value) in plain {
+        let mut workflows = original.clone();
+        let (_, workflow) = workflows
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .ok_or("workflow")?;
+        if let Some(slot) = workflow.pointer_mut(&pointer) {
+            *slot = value;
+        } else {
+            let (parent, key) = pointer.rsplit_once('/').ok_or("pointer")?;
+            workflow
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .ok_or(pointer.clone())?
+                .insert(key.to_owned(), value);
+        }
+        assert!(
+            validate_toolchains(&workflows, file, manifest).is_err(),
+            "accepted {name} {pointer}"
+        );
+    }
+    // A job that builds without installing the pin, and an MSRV job without its override.
+    let mut workflows = original.clone();
+    let pointer = toolchain_pointer(&workflows, "docs.yml", "rustdoc")?;
+    let (_, docs) = workflows
+        .iter_mut()
+        .find(|(n, _)| n == "docs.yml")
+        .ok_or("docs")?;
+    let index: usize = pointer.rsplit('/').next().ok_or("index")?.parse()?;
+    docs["jobs"]["rustdoc"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?
+        .remove(index);
+    assert!(validate_toolchains(&workflows, file, manifest).is_err());
+    Ok(())
+}
+
+/// Point every non-msrv toolchain step at `channel`, as a consistent bump would.
+fn retarget(workflows: &mut Workflows, channel: &str) {
+    for (_, workflow) in workflows.iter_mut() {
+        let Some(jobs) = workflow["jobs"].as_object_mut() else {
+            continue;
+        };
+        for job in jobs.values_mut() {
+            if job["env"].get("RUSTUP_TOOLCHAIN").is_some() {
+                continue;
+            }
+            for step in job["steps"].as_array_mut().into_iter().flatten() {
+                if is_toolchain_step(step) {
+                    step["with"]["toolchain"] = json!(channel);
+                }
+            }
+        }
+    }
+}
+
+/// Assert that validation fails with a message containing `expected`.
+fn assert_rejected(result: Result<(), String>, expected: &str) {
+    match result {
+        Err(message) => assert!(message.contains(expected), "wrong error: {message}"),
+        Ok(()) => panic!("accepted, wanted: {expected}"),
+    }
+}
+
+#[test]
+fn toolchain_file_drift_fails() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let channel = file
+        .lines()
+        .find_map(|line| line.strip_prefix("channel = \"")?.strip_suffix('"'))
+        .ok_or("channel")?;
+    let msrv = toml::from_str::<toml::Value>(manifest)?["package"]["rust-version"]
+        .as_str()
+        .ok_or("rust-version")?
+        .to_owned();
+    // The file moves alone: workflows still name the old pin.
+    let moved = file.replace(channel, "9.9.9");
+    assert_rejected(
+        validate_toolchains(&original, &moved, manifest),
+        "!= pin 9.9.9",
+    );
+    // The file and every workflow move together, so only the pin guards can reject it.
+    for (bad, expected) in [
+        ("stable", "channel must be an exact x.y.z release"),
+        (&format!("{msrv}.0"), "the pin must not be the MSRV"),
+    ] {
+        let mut workflows = original.clone();
+        retarget(&mut workflows, bad);
+        assert_rejected(
+            validate_toolchains(&workflows, &file.replace(channel, bad), manifest),
+            expected,
+        );
+    }
+    Ok(())
+}
+
+/// Append `step` to a job of a workflow.
+fn push_step(workflows: &mut Workflows, name: &str, job: &str, step: Value) -> Result<(), String> {
+    let (_, workflow) = workflows
+        .iter_mut()
+        .find(|(n, _)| n == name)
+        .ok_or("workflow")?;
+    workflow["jobs"][job]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?
+        .push(step);
+    Ok(())
+}
+
+#[test]
+fn hand_selected_and_extra_toolchain_setup_fails() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let steps = [
+        (
+            "lint.yml",
+            "clippy",
+            json!({"run": "x;rustup default stable"}),
+        ),
+        (
+            "lint.yml",
+            "clippy",
+            json!({"run": "$HOME/.cargo/bin/rustup default stable"}),
+        ),
+        ("fmt.yml", "fmt", json!({"run": "(cargo +nightly fmt)"})),
+        (
+            "fmt.yml",
+            "fmt",
+            json!({"run": "RUSTUP_TOOLCHAIN=stable cargo fmt"}),
+        ),
+        (
+            "docs.yml",
+            "rustdoc",
+            json!({"uses": "actions-rs/toolchain@v1", "with": {"toolchain": "stable"}}),
+        ),
+        (
+            "docs.yml",
+            "rustdoc",
+            json!({"uses": "moonrepo/setup-rust@v1"}),
+        ),
+    ];
+    for (name, job, step) in steps {
+        let mut workflows = original.clone();
+        push_step(&mut workflows, name, job, step.clone())?;
+        assert!(
+            validate_toolchains(&workflows, file, manifest).is_err(),
+            "accepted {step}"
+        );
+    }
+    // A second copy of the pinned installer is still a second setup step.
+    let mut workflows = original.clone();
+    let pointer = toolchain_pointer(&workflows, "fmt.yml", "fmt")?;
+    let installer = original
+        .iter()
+        .find(|(n, _)| n == "fmt.yml")
+        .and_then(|(_, w)| w.pointer(&pointer))
+        .ok_or("installer")?
+        .clone();
+    push_step(&mut workflows, "fmt.yml", "fmt", installer)?;
+    assert_rejected(
+        validate_toolchains(&workflows, file, manifest),
+        "more than one toolchain setup step",
+    );
+    // Makefile recipes are scanned too.
+    let makefile = include_str!("../Makefile");
+    validate_recipes(makefile)?;
+    for bad in [
+        "\tcargo +nightly check",
+        "\t@rustup default stable",
+        "\t-/usr/bin/rustup run stable cargo check",
+    ] {
+        assert!(
+            validate_recipes(&format!("{makefile}\n{bad}\n")).is_err(),
+            "accepted {bad}"
+        );
+    }
     Ok(())
 }
