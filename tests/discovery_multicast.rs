@@ -1,4 +1,7 @@
 //! Real WS-Discovery multicast on the loopback interface only.
+//!
+//! References:
+//! - [WS-Discovery 1.1](https://docs.oasis-open.org/ws-dd/discovery/1.1/os/wsdd-discovery-1.1-spec-os.html)
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{self, Write};
