@@ -22,7 +22,7 @@ pub(crate) async fn roundtrip(
     server: &Server, address: &DeviceAddress,
 ) -> Result<(), Box<dyn std::error::Error>> {
     {
-        let mut state = server.state.lock().await;
+        let mut state = server.model.lock().await;
         let camera = std::mem::take(&mut state.camera);
         state.camera = camera
             .with_operation(0x9990, Reply::data(vec![0x5a; 1524]))
@@ -55,7 +55,7 @@ pub(crate) async fn roundtrip(
     result?;
     closed?;
     assert!(!session.is_open());
-    assert!(!server.state.lock().await.camera.session_open());
+    assert!(!server.model.lock().await.camera.session_open());
     Ok(())
 }
 
@@ -82,7 +82,7 @@ pub(crate) async fn raw_port(
     assert_eq!(port.bulk_out(&[]).await?, 0);
     let mut bytes = vec![0; 2048];
     server
-        .state
+        .model
         .lock()
         .await
         .camera
@@ -90,14 +90,14 @@ pub(crate) async fn raw_port(
     assert_eq!(port.bulk_in(&mut bytes).await?, 1024);
     assert_eq!(bytes.get(..1024), Some(vec![0x42; 1024].as_slice()));
     server
-        .state
+        .model
         .lock()
         .await
         .camera
         .push_raw_bulk_in(Vec::new());
     assert_eq!(port.bulk_in(&mut bytes).await?, 0);
     server
-        .state
+        .model
         .lock()
         .await
         .camera
@@ -105,7 +105,7 @@ pub(crate) async fn raw_port(
     assert_eq!(port.bulk_in(&mut bytes).await, Err(PortError::Stall));
     port.clear_halt(Endpoint::BulkIn).await?;
     server
-        .state
+        .model
         .lock()
         .await
         .camera
@@ -119,7 +119,7 @@ pub(crate) async fn raw_port(
     );
     // Drop left a pending bulk URB; read must cancel and drain it before queuing another.
     server
-        .state
+        .model
         .lock()
         .await
         .camera
@@ -143,9 +143,9 @@ pub(crate) async fn raw_port(
     assert_eq!(port.class_out(0x64, LIMIT).await, Err(PortError::Stall));
     port.class_out(0x66, LIMIT).await?;
     assert_eq!(port.class_in(0x67, 4, LIMIT).await?, [4, 0, 1, 0x20]);
-    server.state.lock().await.status = 0x2019;
+    server.model.lock().await.status = 0x2019;
     assert_eq!(port.class_in(0x67, 4, LIMIT).await?, [4, 0, 0x19, 0x20]);
-    server.state.lock().await.status = 0x2001;
+    server.model.lock().await.status = 0x2001;
     assert_eq!(port.class_in(0xff, 4, LIMIT).await, Err(PortError::Stall));
     assert_eq!(port.class_out(0xff, LIMIT).await, Err(PortError::Stall));
     drop(port);
@@ -162,7 +162,7 @@ async fn pending_event(
                 tokio::task::yield_now().await;
             }
             server
-                .state
+                .model
                 .lock()
                 .await
                 .camera
@@ -277,8 +277,32 @@ pub(crate) async fn resets(
     let port = device.claim(&endpoints).await?;
     let mut transport = usb::UsbTransport::new(port);
     transport.reset(LIMIT).await?;
-    server.state.lock().await.class_stall = true;
+    server.model.lock().await.class_stall = true;
     assert!(transport.reset(LIMIT).await.is_err());
-    server.state.lock().await.class_stall = false;
+    server.model.lock().await.class_stall = false;
+    Ok(())
+}
+
+/// Prove the reusable export is not coupled to the Sony camera classifier or endpoint map.
+pub(crate) async fn generic_native() -> Result<(), Box<dyn std::error::Error>> {
+    use nusb::transfer::{Buffer, Bulk, In, Out};
+    let device = nusb::list_devices()
+        .await?
+        .find(|info| {
+            info.vendor_id() == 0xffff
+                && info.product_id() == 1
+                && info.serial_number() == Some("TETHERCAM-ECHO-0001")
+        })
+        .ok_or("generic synthetic device absent")?;
+    let device = device.open().await?;
+    let interface = device.detach_and_claim_interface(0).await?;
+    let mut out = interface.endpoint::<Bulk, Out>(4)?;
+    let mut input = interface.endpoint::<Bulk, In>(0x85)?;
+    out.submit(Buffer::from(vec![7, 8, 9]));
+    timeout(LIMIT, out.next_complete()).await?.status?;
+    input.submit(Buffer::new(512));
+    let completed = timeout(LIMIT, input.next_complete()).await?;
+    completed.status?;
+    assert_eq!(completed.buffer.to_vec(), vec![7, 8, 9]);
     Ok(())
 }
