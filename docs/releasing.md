@@ -10,66 +10,34 @@ This workflow must not be activated until that implementation is integrated and 
 exact-commit gate is green. `--all-features` enables the off-by-default verification tooling,
 including `test-support`; this is not normal camera runtime.
 
-## Initial name ownership and authentication
+## Initial publication and authentication
 
-Crate names are first-come-first-served. An available-name check is NOT reservation. Only a
-legitimate initial publication establishes ownership; never upload a placeholder to squat a name.
-The version in `Cargo.toml` is not evidence that anything exists on crates.io.
+The legitimate `0.0.1` crate was published from protected-main commit
+`214e0abc5f52a2a129822466fcac247dabe8ccfe`. Its downloaded registry archive matched the admitted
+package with SHA256 `6d6a88c21f1f9885384f975c962909650f083fee5c3dcbaf874055ad801900ac`.
+The one-time bootstrap token has been revoked and the local Cargo login removed. No GitHub tag,
+release or asset was created for that publication.
 
-As of the official documentation checked on 2026-11-12, the crate must already exist before
-adding a trusted publisher. There is no documented pending-publisher bootstrap for an unpublished
-name. The first legitimate release needs a short-lived API token:
+Crates.io requires an existing crate before configuring a trusted publisher. The configured
+publisher identifies repository `nredd/tethercam`, workflow filename `release.yml` and environment
+`crates-io`; **Require trusted publishing** is enabled. Future publication is OIDC-only, with no
+API-token fallback. Retain a direct individual owner with verified email and a linked GitHub account;
+the trusted-publisher configuration endpoint checks direct user ownership. Do not add an Actions
+bot as an owner.
 
-1. Log in at [crates.io](https://crates.io/) with the intended GitHub owner account. In
-   [Profile](https://crates.io/settings/profile), supply an email and follow the emailed
-   verification link. Verified email is required to publish and configure trusted publishing.
-   Enable GitHub 2FA and satisfy any account-specific login challenges. The current Cargo/crates.io
-   publishing documentation does not specify a separate universal crates.io 2FA enrollment.
-2. In [API Tokens](https://crates.io/settings/tokens), generate a token named, for example,
-   `tethercam-first-publish`. Select **only `publish-new`** (Publish new crates), removing the
-   default `publish-update` selection. Do not grant `change-owners`, `trusted-publishing` or
-   `yank`. Under Crates, **Add pattern** with exact `tethercam`, not `*` or `tethercam*`.
-   Choose Custom expiration for the shortest practical publication window, or the shortest UI
-   preset (currently seven days), and revoke immediately after publishing. Exact name patterns
-   are accepted for unpublished crates; no unrestricted token is necessary.
-3. Keep the token in a private local environment, exposed only as `CARGO_REGISTRY_TOKEN` for the
-   admitted `cargo publish --locked` process. Never send it in chat, place it in command arguments,
-   write it to the repository/history/logs, or run `cargo login` to persist it in Cargo's plaintext
-   credential store. The release workflow has no bootstrap-token fallback.
-4. Before initial publication, a maintainer must admit the exact reviewed commit, its version and
-   package contents. On that frozen clean commit run `make all cross`, `cargo package --locked`
-   and `cargo publish --dry-run --locked`. Linux CI must exercise USB/IP with full coverage; local
-   tests do not substitute for that run. Audit `cargo package --list --locked` for private files.
-   Publish **once**, only after final approval and secure token injection. Revoke the token.
-5. The publishing account becomes the initial crate owner. Verify `cargo owner --list tethercam`.
-   Retain a direct individual owner with verified email and a linked GitHub account: the current
-   trusted-publisher configuration endpoint checks direct user ownership. Do not add an Actions
-   bot as an owner. Optional individual co-owners receive full ownership powers. Optional real
-   organization teams use `github:ORG:TEAM`, publish/yank rights only; no team is needed here.
-6. In the new crate's **Settings -> Trusted Publishing -> Add -> GitHub**, set:
-   - Repository owner: `nredd`
-   - Repository name: `tethercam`
-   - Workflow filename: `release.yml`, not `.github/workflows/release.yml`
-   - Environment: `crates-io`, not blank
-
-Configure the deployment environment before any release tags. For this manually bootstrapped
-first version, do not push a tag expecting a second successful Cargo publication: it would fail
-closed on the existing version. After initial publication, create its tag only at the admitted
-commit and use the recovery procedure below to stage its GitHub release. Subsequent versions use
-OIDC end to end. If the owner publishes the already-reviewed current `0.0.1` before #65/#66
-merge, its tag MUST point to that original admitted commit, not the later helper/release code.
-Bump the later code to `0.0.2` (or another unused version) before its first automated release.
-Never retag/reuse `0.0.1` or skip publication of different bytes because its version already
-exists. Name ownership is only established after crates.io accepts the real first release.
+The existing `0.0.1` cannot be published again by this workflow. Its tag must point to the
+original admitted commit, never later helper or release code. Use the exact-artifact recovery
+procedure below if creating its GitHub release. Bump changed code to `0.0.2` or another unused
+version before its first automated release. Never retag or reuse `0.0.1`, or skip publication
+of different bytes because its version already exists.
 
 ## GitHub setup, by a repository administrator
 
-In **Settings -> Environments**, create `crates-io` before creating tags. Add trusted required
-reviewer(s), disable administrator bypass, and enable Prevent self-review when a separate approver
-is available. With only one maintainer, GitHub cannot provide independent human approval: choose
-an explicit reviewer arrangement rather than silently bypassing it. Under **Deployment branches
-and tags**, choose **Selected branches and tags** and add a **Tag** rule `v*` only, no branch rule.
-Review and save these controls; referencing a missing environment can create an unprotected one.
+The `crates-io` environment is configured with required reviewer `nredd`, administrator bypass
+disabled, and a `v*` tag-only deployment rule. Self-review is deliberately allowed for the sole
+maintainer, so this is not independent human approval. Enable Prevent self-review if a separate
+approver becomes available. Verify these controls before creating tags; referencing a missing
+environment can create an unprotected one.
 No environment secret is required. Approve only the displayed admitted tag/commit after inspecting
 the successful gate and artifact. Both the registry and GitHub release jobs use this environment.
 
