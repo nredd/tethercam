@@ -234,8 +234,8 @@ Changes to packaging/features must validate a real extracted `cargo package` arc
 repository metadata: normal default application selection/build, all-feature sources/tests, and
 a separate downstream crate importing `test_support` with that feature enabled. The package
 includes the reusable engine, personalities, scenarios and synthetic fixture sources. Only the
-repository-policy test remains excluded because its workflow/ruleset inputs are intentionally
-unpublished.
+repository-policy test and the development `rust-toolchain.toml` pin are excluded; their
+workflow/ruleset inputs are intentionally unpublished.
 
 ## Toolchain pin
 

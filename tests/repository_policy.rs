@@ -634,6 +634,22 @@ fn is_toolchain_step(step: &Value) -> bool {
         .is_some_and(|uses| uses.starts_with(TOOLCHAIN_ACTION))
 }
 
+/// JSON pointer to a job's `run` step containing `needle`.
+fn run_pointer(
+    workflows: &Workflows, file: &str, job: &str, needle: &str,
+) -> Result<String, String> {
+    let (_, workflow) = workflows
+        .iter()
+        .find(|(n, _)| n == file)
+        .ok_or("workflow")?;
+    let steps = workflow["jobs"][job]["steps"].as_array().ok_or("steps")?;
+    let index = steps
+        .iter()
+        .position(|s| s["run"].as_str().is_some_and(|r| r.contains(needle)))
+        .ok_or("run step")?;
+    Ok(format!("/jobs/{job}/steps/{index}/run"))
+}
+
 /// JSON pointer to a job's toolchain step, so mutations survive step reordering.
 fn toolchain_pointer(workflows: &Workflows, file: &str, job: &str) -> Result<String, String> {
     let (_, workflow) = workflows
@@ -658,6 +674,15 @@ fn csv(value: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Whether a shell script runs `rustup` or passes a `+toolchain` override to `cargo`/`rustc`.
+fn selects_toolchain(run: &str) -> bool {
+    let words: Vec<&str> = run.split_whitespace().collect();
+    words.contains(&"rustup")
+        || words
+            .windows(2)
+            .any(|w| matches!(w[0], "cargo" | "rustc" | "rustdoc") && w[1].starts_with('+'))
+}
+
 /// A job that builds must install the pin, must not pick a toolchain by hand, and must install
 /// the components its `make` gate needs.
 fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
@@ -671,15 +696,23 @@ fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
         &format!("{at}: runs cargo without installing the pinned toolchain"),
     )?;
     require(
-        runs.iter()
-            .all(|r| !r.contains("cargo +") && !r.contains("rustup ")),
+        runs.iter().all(|run| !selects_toolchain(run)),
         &format!("{at}: a run step selects a toolchain by hand"),
+    )?;
+    require(
+        steps
+            .iter()
+            .all(|s| s["with"].get("component").is_none() && s["with"].get("target").is_none()),
+        &format!("{at}: use the plural `components`/`targets` inputs"),
     )?;
     for (command, component) in [
         ("make lint", "clippy"),
         ("make fmt-check", "rustfmt"),
         ("make test", "llvm-tools-preview"),
         ("make coverage", "llvm-tools-preview"),
+        ("make all cross", "clippy"),
+        ("make all cross", "rustfmt"),
+        ("make all cross", "llvm-tools-preview"),
     ] {
         if runs.contains(&command) {
             let installed = steps.iter().any(|s| {
@@ -687,6 +720,15 @@ fn check_job_hygiene(at: &str, steps: &[Value]) -> Result<(), String> {
             });
             require(installed, &format!("{at}: `{command}` needs `{component}`"))?;
         }
+    }
+    if runs
+        .iter()
+        .any(|r| r.contains("make all cross") || (r.contains("cargo ") && r.contains("--target ")))
+    {
+        let has_targets = steps
+            .iter()
+            .any(|s| !csv(s["with"]["targets"].as_str().unwrap_or_default()).is_empty());
+        require(has_targets, &format!("{at}: cross builds need `targets`"))?;
     }
     Ok(())
 }
@@ -839,28 +881,49 @@ fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
             "accepted {name} {pointer}"
         );
     }
-    let plain: [(&str, &str, Value); 6] = [
+    Ok(())
+}
+
+#[test]
+fn toolchain_overrides_and_missing_installs_fail() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let plain: [(&str, String, Value); 8] = [
         (
             "test.yml",
-            "/jobs/msrv/env/RUSTUP_TOOLCHAIN",
+            "/jobs/msrv/env/RUSTUP_TOOLCHAIN".into(),
             json!("1.100.0"),
         ),
-        ("test.yml", "/jobs/msrv/env", json!({})),
-        ("lint.yml", "/env/RUSTUP_TOOLCHAIN", json!("stable")),
+        ("test.yml", "/jobs/msrv/env".into(), json!({})),
+        ("lint.yml", "/env/RUSTUP_TOOLCHAIN".into(), json!("stable")),
         (
             "docs.yml",
-            "/jobs/rustdoc/env",
+            "/jobs/rustdoc/env".into(),
             json!({"RUSTUP_TOOLCHAIN": "stable"}),
         ),
         (
             "docs.yml",
-            "/jobs/rustdoc/steps/3/run",
+            run_pointer(&original, "docs.yml", "rustdoc", "make doc")?,
             json!("cargo +stable doc"),
         ),
         (
             "bench.yml",
-            "/jobs/bench/steps/3/run",
+            run_pointer(&original, "bench.yml", "bench", "make bench-check")?,
             json!("rustup default stable"),
+        ),
+        (
+            "check.yml",
+            run_pointer(&original, "check.yml", "native-check", "make check")?,
+            json!("cargo  +nightly check"),
+        ),
+        (
+            "release.yml",
+            format!(
+                "{}/with/targets",
+                toolchain_pointer(&original, "release.yml", "gate")?
+            ),
+            json!(""),
         ),
     ];
     for (name, pointer, value) in plain {
@@ -869,14 +932,14 @@ fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
             .iter_mut()
             .find(|(n, _)| n == name)
             .ok_or("workflow")?;
-        if let Some(slot) = workflow.pointer_mut(pointer) {
+        if let Some(slot) = workflow.pointer_mut(&pointer) {
             *slot = value;
         } else {
             let (parent, key) = pointer.rsplit_once('/').ok_or("pointer")?;
             workflow
                 .pointer_mut(parent)
                 .and_then(Value::as_object_mut)
-                .ok_or(pointer)?
+                .ok_or(pointer.clone())?
                 .insert(key.to_owned(), value);
         }
         assert!(
@@ -897,6 +960,15 @@ fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
         .ok_or("steps")?
         .remove(index);
     assert!(validate_toolchains(&workflows, file, manifest).is_err());
+    Ok(())
+}
+
+#[test]
+fn toolchain_file_drift_fails() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let channel = "1.100.0";
     let moved = file.replace(channel, "1.100.1");
     assert!(validate_toolchains(&original, &moved, manifest).is_err());
     let floating = file.replace(channel, "stable");
