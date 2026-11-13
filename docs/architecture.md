@@ -177,10 +177,23 @@ No local unsafe code, platform-number constants, or new license exception is nee
   rejected, not silently sent under stale SDP. Enabled JPEG is validated against RFC 2435
   before opening listeners; unsupported layouts are not silently omitted. Bridge identity
   comes from the persisted UUID, including a stable locally administered logical MAC, not a fabricated physical-host MAC
-- Authenticated snapshot requests use a four-entry bounded actor channel. They execute between
-  complete live-view transactions, capture/download a full-resolution still and validate the
-  PTP JPEG object format/SOI before serving it. RAW objects are refused without discarding an
-  otherwise usable session. A snapshot caller's 360 s reply budget never cancels the actor's
+- Authenticated snapshot requests use a four-entry bounded actor channel and execute between
+  complete live-view transactions. Default: the reply is the newest live-view frame from the
+  `frames` slot, with no shutter and no card write. Streaming keeps the slot at most one frame
+  interval old. The actor remembers when it last fetched a frame; if that is over 2 s ago (nobody
+  streaming, so live view is demand-driven and idle) it fetches one live-view frame first, so a
+  snapshot request is its own demand for exactly one frame. A failed fetch is a live-view
+  failure like any other: the request is refused and the session reconnects. The slot is empty
+  exactly while no session is serving, so `Control::snapshot` fails immediately then, and the
+  actor refuses requests queued when a session ends, and again at the start of each connect
+  attempt (a request that raced the slot clearing), instead of serving them after a reconnect.
+  Opt-in `streams.full_resolution_snapshot` (default off) instead captures/downloads a
+  full-resolution still and validates the PTP JPEG object format/SOI before serving it. A failed
+  still is refused for that request only when it provably left the shutter released: capture
+  unsupported (nothing pressed), no image within the wait budget (the release succeeded, e.g. an
+  AF miss) or a RAW/malformed object after a clean capture. The driver only attempts both
+  releases, so any other still error (a failed press or release, a transport or download error)
+  ends the session as before, and the close cleans up. A snapshot caller's 360 s reply budget never cancels the actor's
   in-flight work. Shutdown drains queued replies as unavailable
 - `supervisor::serve` joins actor, media and network cleanup even after startup or media errors.
   A shutdown future requests a stop; callers must keep polling `serve` until completion rather
@@ -209,7 +222,8 @@ The camera produces two things over USB:
 
 - **Live view**: JPEG frames, roughly 1024x680 at about 15 fps on an a7 III. This is the
   only motion video available over USB on bodies without a UVC streaming mode
-- **Stills**: full sensor resolution, on demand
+- **Stills**: full sensor resolution, on demand. Used for ONVIF snapshots only when
+  `streams.full_resolution_snapshot` is enabled
 
 They map to:
 
@@ -217,8 +231,9 @@ They map to:
   NVR records
 - **MJPEG RTSP stream**: live-view JPEGs passed through untouched (RFC 2435). Zero transcode
   cost, for clients that accept it and for low-power boards
-- **ONVIF snapshot**: a full-resolution still. The camera allows one PTP session, so a still
-  briefly pauses live view; the supervisor serializes the two
+- **ONVIF snapshot**: the newest live-view JPEG by default, so polling NVRs never fire the
+  shutter. Optionally (`streams.full_resolution_snapshot`) a full-resolution still. The camera
+  allows one PTP session, so a still briefly pauses live view; the supervisor serializes the two
 
 ## Security model
 
@@ -232,7 +247,7 @@ They map to:
   cache contents are redacted. WS-Security `UsernameToken` uses password digest (plaintext refused),
   nonce replay cache and a bounded clock-skew window. HTTP Digest is the alternative. Only
   `GetSystemDateAndTime`, `GetCapabilities` and `GetServices` are pre-auth
-- Discovery reveals only what ONVIF requires: at most one unicast reply per accepted probe (each at most 1400 bytes), on-link sources only, `MessageID` de-duplicated, a per-source token bucket and one global bucket (burst 20, 10 per second) charged before parsing, so reflected traffic is bounded by `refill * reply cap` (14000 bytes per second by default) regardless of the number of sources. IPv6 link-local subnets are served only when the same interface has a non-link-local IPv6 address to advertise; otherwise they are omitted and a warning is emitted through the `log` facade (applications must configure a logger to display it)
+- Discovery reveals only what ONVIF requires: at most one unicast reply per accepted probe (each at most 1400 bytes), on-link sources only, `MessageID` de-duplicated, a per-source token bucket and one global bucket (burst 20, 10 per second) charged before parsing, so reflected traffic is bounded by `refill * reply cap` (14000 bytes per second by default) regardless of the number of sources. IPv6 link-local subnets are served only when the same interface has a non-link-local IPv6 address to advertise; otherwise they are omitted and a warning is emitted through the `log` facade (applications must configure a logger to display it). A per-interface bind or multicast-join failure is likewise a warning; the responder's interface set is rebuilt from the sockets that actually bound (`UdpTransport::usable`, `Config::with_usable_interfaces`) so a skipped interface never claims a subnet, and discovery fails only when no interface is usable
 - Credentials: random, generated at first run, stored in a config file created with owner-only
   permissions. Compared in constant time. Never logged
 - The `config` layer loads an explicit path or resolves the platform default. On first run it

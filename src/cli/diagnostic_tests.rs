@@ -108,11 +108,59 @@ fn interface(name: &str, ip: &str, up: bool) -> if_addrs::Interface {
 }
 
 #[test]
+fn unnamed_discovery_skips_loopback_and_ipv4_link_local_unless_asked_for() {
+    let mut cfg = Config::generate().unwrap();
+    let interfaces = vec![
+        interface("lo", "127.0.0.1", true),
+        interface("ll", "169.254.7.7", true),
+        interface("test0", "192.0.2.1", true),
+        interface("lo6", "::1", true),
+    ];
+    let addrs = |cfg: &Config| {
+        discovery(cfg, interfaces.clone())
+            .unwrap()
+            .interfaces()
+            .iter()
+            .map(|i| i.addr.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(addrs(&cfg), ["192.0.2.1"]);
+    cfg.interface = Some("lo".into());
+    assert_eq!(addrs(&cfg), ["127.0.0.1"]);
+    cfg.interface = Some("ll".into());
+    assert_eq!(addrs(&cfg), ["169.254.7.7"]);
+    cfg.interface = None;
+    cfg.onvif_address = "127.0.0.1".parse().unwrap();
+    assert_eq!(addrs(&cfg), ["127.0.0.1"]);
+    cfg.onvif_address = "::1".parse().unwrap();
+    assert_eq!(addrs(&cfg), ["::1"]);
+    cfg.onvif_address = "::".parse().unwrap();
+    let mut v6 = interfaces.clone();
+    v6.push(interface("v6", "2001:db8::1", true));
+    assert_eq!(
+        discovery(&cfg, v6)
+            .unwrap()
+            .interfaces()
+            .iter()
+            .map(|i| i.addr.to_string())
+            .collect::<Vec<_>>(),
+        ["2001:db8::1"]
+    );
+    let only_unusable = vec![interface("lo", "127.0.0.1", true)];
+    cfg.onvif_address = "0.0.0.0".parse().unwrap();
+    assert_eq!(
+        kind(&discovery(&cfg, only_unusable).unwrap_err()),
+        kind(&Error::Interface)
+    );
+}
+
+#[test]
 fn discovery_uses_only_selected_local_interfaces_and_stored_identity() {
     let mut cfg = Config::generate().unwrap();
     let interfaces = vec![
         interface("test0", "192.0.2.1", true),
         interface("test1", "192.0.2.2", true),
+        interface("lo0", "127.0.0.1", true),
         interface("down", "192.0.2.3", false),
         interface("v6", "2001:db8::1", true),
     ];
