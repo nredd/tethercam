@@ -129,13 +129,15 @@ source tests. The sole local constraint remains exactly `src/transport/usb/nusb_
 and only when `CI` is absent and VHCI is absent. It is announced loudly; any `CI` value disables
 that exception. Hosted Linux requires the adapter's full coverage too.
 
-Toolchain: use a rustup toolchain with `llvm-tools-preview`, and keep it current. CI floats on
-`stable`, and LLVM region accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0
-disagree on the inline arguments of a `log::warn!`), so a local run on an older rustc can pass
-where CI fails, or the reverse. The gate prints a `TOOLCHAIN:` line; compare it with the CI log
-and `rustup update stable` when it is older. A distro or Homebrew rustc has no
-`llvm-tools-preview` (cargo-llvm-cov fails early and says so) and is not a supported gate
-toolchain, though its sysroot `rust-src` sources are excluded like `/rustc/` ones. The native
+Toolchain: `rust-toolchain.toml` pins one exact stable release (plus the `clippy`, `rustfmt` and
+`llvm-tools-preview` components and the two cross targets) for every gate, and LLVM region
+accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0 disagree on the inline
+arguments of a `log::warn!`), so an unpinned local run can pass where CI fails, or the reverse.
+Use rustup, which honors the file and installs the pin on first use; there is nothing to
+`rustup update`. The gate prints a `TOOLCHAIN:` line; it must match the CI log. A non-rustup
+install (distro, Homebrew) ignores the file, has no `llvm-tools-preview` (cargo-llvm-cov fails
+early and says so) and is unsupported for the gates, though its sysroot `rust-src` sources are
+excluded like `/rustc/` ones. The native
 summary lists uncovered *lines* only, so a region-only failure names no file. On any failure the
 gate also writes the same filtered text report to `coverage/uncovered.txt` and prints
 `grep -n -B1 '\^0' coverage/uncovered.txt`; `^0` marks an unexecuted region.
@@ -234,3 +236,18 @@ a separate downstream crate importing `test_support` with that feature enabled. 
 includes the reusable engine, personalities, scenarios and synthetic fixture sources. Only the
 repository-policy test remains excluded because its workflow/ruleset inputs are intentionally
 unpublished.
+
+## Toolchain pin
+
+`rust-toolchain.toml` is the single source of truth for the compiler. Every workflow installs that
+exact `channel` through `dtolnay/rust-toolchain` (never `stable`), including the release workflow,
+and repeats only the components and targets it needs. `tests/repository_policy.rs` fails when a
+workflow's `toolchain`, `components` or `targets` disagree with the file. `rust-version` in
+`Cargo.toml` is the MSRV, not the pin. The `test.yml` `msrv` job installs it and sets
+`RUSTUP_TOOLCHAIN` to it, since rustup would otherwise let the file override the action's
+default; its log prints `rustc --version --verbose`.
+
+To bump the pin, open a deliberate PR that changes `channel` in `rust-toolchain.toml` and the
+`toolchain:` value in each workflow in the same commit, runs the full gate (`make all`) and
+reads the Linux `coverage` job: region accounting can change and expose gaps that need tests, not
+exclusions. The `release.yml` pin is unexecuted until a tag runs it.

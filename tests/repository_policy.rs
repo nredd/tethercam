@@ -618,3 +618,173 @@ fn workflow_drift_and_skippable_checks_fail() -> Result<(), Box<dyn Error>> {
     assert!(validate(&policy()?, &workflows).is_err());
     Ok(())
 }
+
+const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@";
+
+/// Split a comma-separated action input into trimmed non-empty items.
+fn csv(value: &str) -> BTreeSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every toolchain step must install the pin from `rust-toolchain.toml`, except the `msrv` job,
+/// which installs `rust-version` and must also override rustup with `RUSTUP_TOOLCHAIN`.
+fn validate_toolchains(
+    workflows: &Workflows, toolchain_file: &str, manifest: &str,
+) -> Result<(), String> {
+    let file: toml::Value = toml::from_str(toolchain_file).map_err(|e| e.to_string())?;
+    let table = file.get("toolchain").ok_or("missing [toolchain]")?;
+    let channel = table
+        .get("channel")
+        .and_then(toml::Value::as_str)
+        .ok_or("missing channel")?;
+    let is_version =
+        |v: &str| v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u32>().is_ok());
+    require(
+        is_version(channel),
+        "channel must be an exact x.y.z release",
+    )?;
+    let listed = |key: &str| -> BTreeSet<String> {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (components, targets) = (listed("components"), listed("targets"));
+    let manifest: toml::Value = toml::from_str(manifest).map_err(|e| e.to_string())?;
+    let msrv = manifest["package"]["rust-version"]
+        .as_str()
+        .ok_or("missing rust-version")?;
+    require(
+        channel != msrv && !channel.starts_with(&format!("{msrv}.")),
+        "the pin must not be the MSRV",
+    )?;
+    let mut seen = 0;
+    for (file, workflow) in workflows {
+        for (id, job) in workflow["jobs"].as_object().ok_or("missing jobs")? {
+            let steps = job["steps"].as_array().map_or(&[][..], Vec::as_slice);
+            for step in steps {
+                if !step["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with(TOOLCHAIN_ACTION))
+                {
+                    continue;
+                }
+                seen += 1;
+                let at = format!("{file}/{id}");
+                let wanted = step["with"]["toolchain"]
+                    .as_str()
+                    .ok_or(format!("{at}: no toolchain"))?;
+                if at == "test.yml/msrv" {
+                    require(wanted == msrv, "msrv job must install rust-version")?;
+                    require(
+                        job["env"]["RUSTUP_TOOLCHAIN"].as_str() == Some(msrv),
+                        "msrv job must set RUSTUP_TOOLCHAIN to rust-version",
+                    )?;
+                    continue;
+                }
+                require(
+                    wanted == channel,
+                    &format!("{at}: toolchain {wanted} != pin {channel}"),
+                )?;
+                require(
+                    csv(step["with"]["components"].as_str().unwrap_or_default())
+                        .is_subset(&components),
+                    &format!("{at}: components outside rust-toolchain.toml"),
+                )?;
+                let wanted_targets = step["with"]["targets"].as_str().unwrap_or_default();
+                let resolved: BTreeSet<String> = if wanted_targets == "${{ matrix.target }}" {
+                    job["strategy"]["matrix"]["target"]
+                        .as_array()
+                        .ok_or("matrix targets")?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                } else {
+                    csv(wanted_targets)
+                };
+                require(
+                    resolved.is_subset(&targets),
+                    &format!("{at}: targets outside rust-toolchain.toml"),
+                )?;
+            }
+        }
+    }
+    require(seen > 0, "no toolchain steps found")
+}
+
+#[test]
+fn workflow_toolchains_match_rust_toolchain_file() -> Result<(), Box<dyn Error>> {
+    validate_toolchains(
+        &workflows()?,
+        include_str!("../rust-toolchain.toml"),
+        include_str!("../Cargo.toml"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn toolchain_drift_fails() -> Result<(), Box<dyn Error>> {
+    let file = include_str!("../rust-toolchain.toml");
+    let manifest = include_str!("../Cargo.toml");
+    let original = workflows()?;
+    let channel = "1.100.0";
+    assert!(file.contains(&format!("channel = \"{channel}\"")));
+    let mutations: [(&str, &str, Value); 5] = [
+        (
+            "coverage.yml",
+            "/jobs/coverage/steps/1/with/toolchain",
+            json!("stable"),
+        ),
+        (
+            "release.yml",
+            "/jobs/gate/steps/2/with/toolchain",
+            json!("1.99.1"),
+        ),
+        (
+            "lint.yml",
+            "/jobs/clippy/steps/1/with/components",
+            json!("miri"),
+        ),
+        (
+            "cross.yml",
+            "/jobs/check/steps/1/with/targets",
+            json!("wasm32-unknown-unknown"),
+        ),
+        (
+            "test.yml",
+            "/jobs/msrv/env/RUSTUP_TOOLCHAIN",
+            json!("1.100.0"),
+        ),
+    ];
+    for (name, pointer, value) in mutations {
+        let mut workflows = original.clone();
+        let (_, workflow) = workflows
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .ok_or("workflow")?;
+        *workflow.pointer_mut(pointer).ok_or(pointer)? = value;
+        assert!(
+            validate_toolchains(&workflows, file, manifest).is_err(),
+            "accepted {name} {pointer}"
+        );
+    }
+    let moved = file.replace(channel, "1.100.1");
+    assert!(validate_toolchains(&original, &moved, manifest).is_err());
+    let floating = file.replace(channel, "stable");
+    assert!(validate_toolchains(&original, &floating, manifest).is_err());
+    let msrv_pin = file.replace(channel, "1.90.0");
+    assert!(validate_toolchains(&original, &msrv_pin, manifest).is_err());
+    Ok(())
+}
