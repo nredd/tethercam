@@ -145,6 +145,7 @@ async fn serve_until<F: CameraFactory>(
         SessionConfig::default(),
         interval,
     )?;
+    let actor = actor.with_still_snapshots(cfg.streams.full_resolution_snapshot);
     cfg.validate()?;
     tracing::info!(event = "waiting_camera");
     let network = async {

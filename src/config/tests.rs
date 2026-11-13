@@ -209,3 +209,26 @@ proptest! {
         let _ = Config::load(&path);
     }
 }
+
+#[test]
+fn full_resolution_snapshot_defaults_off_and_older_configs_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = Config::generate().unwrap();
+    assert!(!config.streams.full_resolution_snapshot);
+    config.create(&path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    let older = content
+        .lines()
+        .filter(|line| !line.starts_with("full_resolution_snapshot"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(older, content);
+    fs::write(&path, older).unwrap();
+    assert!(
+        !Config::load(&path)
+            .unwrap()
+            .streams
+            .full_resolution_snapshot
+    );
+}

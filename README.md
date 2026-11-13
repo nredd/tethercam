@@ -14,7 +14,7 @@ single USB-C cable.
 - Serve the camera's live view as an authenticated RTSP stream
 - Present an ONVIF endpoint so UniFi Protect can discover and adopt it like any third-party
   camera, and Home Assistant can add it through its ONVIF integration
-- Serve full-resolution stills as the ONVIF snapshot
+- Serve the newest live-view JPEG as the ONVIF snapshot; full-resolution stills are opt-in
 - Run in the foreground on macOS and Linux, with graceful interrupt/terminate cleanup
 
 Install a per-user macOS launchd agent or a Linux system/user systemd service with
@@ -28,7 +28,8 @@ Developed against the a7 III (ILCE-7M3). The goal is every Sony body that suppor
 "PC Remote" over USB. A compatibility table will live here as bodies are verified.
 
 Live-view resolution is set by the camera, not by this software. On the a7 III it is
-1024x680 at about 15 fps. Full resolution is available as stills.
+1024x680 at about 15 fps. Full resolution is available as stills, but only on request
+(`streams.full_resolution_snapshot`).
 
 ## Install
 
@@ -82,16 +83,25 @@ Streams:
 - `rtsp://192.0.2.10:8554/live/mjpeg`: original JPEG, RFC 2435
 
 Use the generated credentials in the client's authentication settings, not in a logged URL.
-ONVIF advertises only enabled profiles and the corresponding stream and snapshot URIs. Stills
-are captured at full sensor resolution through the same camera actor; use JPEG capture mode,
-not RAW. A still briefly pauses live-view transactions. A changed live-view resolution fails
+ONVIF advertises only enabled profiles and the corresponding stream and snapshot URIs. A snapshot
+is the newest live-view JPEG: no shutter release, no card write, no pause in streaming. While
+streaming it is at most one frame old. With nobody streaming, a frame older than 2 s is replaced
+by one live-view fetch first, so a snapshot is never staler than that. With no camera connected
+it fails at once (HTTP 5xx) rather than waiting. Clients such as UniFi Protect and Home Assistant
+poll snapshots on their own schedule, which is why the shutter is not used by default.
+
+Set `streams.full_resolution_snapshot = true` to serve full sensor resolution stills instead (use
+JPEG capture mode, not RAW). Every snapshot then releases the shutter, writes to the card and
+pauses live-view transactions for the download. A failed still (focus miss, lens cap, RAW) answers
+that one request with an error and leaves the camera session and streams up. Configs without the
+key keep the default. A changed live-view resolution fails
 closed rather than advertising mismatched SDP/ONVIF metadata; restart to describe the new format.
 
 The actor waits for a camera and reconnects with capped backoff after unplug. One initial JPEG
 establishes actual stream dimensions before listeners start. Continuous capture and encoding begin
 only after the first authenticated `PLAY`, and stop after the last subscriber leaves. `SIGINT` or
 `SIGTERM` waits for in-flight camera work, releases shutter buttons, closes the PTP session, sends
-WS-Discovery `Bye` when enabled, and joins network/CPU workers. A long still download can delay
+WS-Discovery `Bye` when enabled, and joins network/CPU workers. With full-resolution snapshots enabled, a long still download can delay
 shutdown; force-killing the process skips this hygiene. A snapshot reply can time out independently
 without interrupting the camera operation.
 
@@ -112,7 +122,7 @@ the wrong interface on such networks.
 
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG
-is used for stills; integration tests inject a larger independent still. `--no-discovery` suppresses
+is used for live view and stills; integration tests inject a larger independent still. `--no-discovery` suppresses
 multicast announcements without disabling authentication. Logs use `log_level` from the config
 and contain static lifecycle events and sanitized error categories, never credentials, URLs,
 request/response bodies or device serials.
