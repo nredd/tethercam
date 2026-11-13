@@ -1,4 +1,7 @@
 //! Synthetic, credential-free metrics including PRFT side-data hashes.
+//!
+//! References:
+//! - <https://ffmpeg.org/ffmpeg-formats.html#framehash-1>
 
 use super::*;
 use std::fmt::Write as _;

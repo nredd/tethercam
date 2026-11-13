@@ -1,4 +1,7 @@
 //! Utility CLI argument and output failure boundaries.
+//!
+//! References:
+//! - <https://doc.rust-lang.org/std/io/trait.Write.html>
 use super::*;
 
 pub(super) struct Broken;

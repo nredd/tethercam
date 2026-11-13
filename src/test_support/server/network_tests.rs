@@ -1,4 +1,7 @@
 //! Real loopback admission, generic enumeration, cancellation, re-import and cleanup tests.
+//!
+//! References:
+//! - <https://docs.kernel.org/usb/usbip_protocol.html>
 use super::*;
 use crate::test_support::{Sony, Synthetic};
 

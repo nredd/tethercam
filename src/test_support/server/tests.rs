@@ -1,4 +1,7 @@
 //! Generic engine fault/deadline/resource and cleanup contracts, without a kernel adapter.
+//!
+//! References:
+//! - <https://docs.kernel.org/usb/usbip_protocol.html>
 use super::*;
 use crate::test_support::{Control, Identity, Sony, Synthetic};
 use std::future::{Future, ready};

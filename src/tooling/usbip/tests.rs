@@ -1,4 +1,7 @@
 //! Real temporary sysfs trees, strict command recording and injected syscall failures.
+//!
+//! References:
+//! - <https://docs.kernel.org/usb/usbip_protocol.html>
 
 use super::*;
 use std::cell::RefCell;

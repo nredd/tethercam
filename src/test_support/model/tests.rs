@@ -1,4 +1,7 @@
 //! Device personalities are independent of USB/IP framing and of one another.
+//!
+//! References:
+//! - <https://www.usb.org/document-library/still-image-capture-device-definition-10-and-errata-16-mar-2007>
 use super::*;
 
 #[tokio::test(start_paused = true)]

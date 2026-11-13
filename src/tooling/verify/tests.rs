@@ -1,4 +1,7 @@
 //! Owned process boundaries without physical hardware.
+//!
+//! References:
+//! - <https://doc.rust-lang.org/std/process/struct.Child.html>
 use super::*;
 #[test]
 fn child_success_failure_deadline_and_graceful_cleanup() {

@@ -1,4 +1,7 @@
 //! Synthetic success/failure measurements through the real Sony driver.
+//!
+//! References:
+//! - <https://www.iso.org/standard/63602.html>
 use super::*;
 use crate::ptp::session::SessionConfig;
 use crate::transport::sim::sony::{Defect, Shutter, SonySimConfig, sony_camera};

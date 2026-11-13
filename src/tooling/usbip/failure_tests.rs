@@ -1,4 +1,7 @@
 //! Filesystem and OS-string failures not reproducible on the hosted synthetic device.
+//!
+//! References:
+//! - <https://docs.kernel.org/usb/usbip_protocol.html>
 
 use super::tests::{CALLS, device, host, reset, tree};
 use super::*;
