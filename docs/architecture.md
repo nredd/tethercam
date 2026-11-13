@@ -53,6 +53,16 @@ The `ptp` payload layer (`src/ptp/`) sits above the container codec:
 - `DeviceInfo`, `ObjectInfo`, `DevicePropDesc`: dataset decode and encode. Decoders are total (typed `CodecError`, never a panic) and ignore trailing padding
 - `OperationCode`, `ResponseCode`, `EventCode`, `DevicePropCode`: `u16` newtypes with named constants. Vendor codes pass through; `Display` names standard codes and prints the rest as hex
 
+### Proposed cooperative macOS acquisition
+
+[Cooperative macOS camera acquisition](macos-camera.md) specifies a future shared
+session/transaction seam for raw USB and ImageCaptureCore, not a shipped backend. ICC cannot
+emulate USB pipes or recovery. Its caller deadlines do not cancel native work: one retained
+native operation must complete before close, and confirmed closure is required before reuse.
+Quarantine bounds admission but joined shutdown may remain unresolved indefinitely. The native
+dependency, independent unsafe audit and off-by-default feature require approval before implementation.
+Linux USB, simulator behavior and the existing security and CI contracts remain unchanged.
+
 ### Sony driver contract
 
 - `SonyCamera::run(session, config, body)` is the only way to get a connected camera: it opens the session, runs the handshake, calls `body` and closes the session on every exit path (the body's error wins over a close error). A camera therefore cannot outlive its session, and a failure anywhere leaves the body un-wedged
