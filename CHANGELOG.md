@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 - Reject partial media decodes when FFmpeg reports an error.
+- Prepare and clean up hosted USB/IP prerequisites for the release gate.
 
 Next release: `0.0.2`.
 

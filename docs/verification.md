@@ -89,7 +89,8 @@ tests never provision the host, and Cargo/test processes never run as root. Host
 uses native `usbip`; node ownership changes require canonical VHCI ancestry plus the exact
 synthetic serial/vendor/product tuple. Wrong-mode Sony and independent echo identities are
 explicitly enumerated. Physical USB ancestry and unrelated devices are rejected, never globally
-permissioned or detached. Cleanup runs even when a CI gate fails.
+permissioned or detached. Test, Coverage and Release gates provision the same hosted prerequisites;
+cleanup runs even when a CI gate fails.
 
 Local Linux requires an *explicitly preconfigured* host: installed native `usbip` tools, a loaded
 VHCI controller, delegated writable attach **and** detach controls, and access to the exact

@@ -221,6 +221,47 @@ fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<()
 }
 
 #[test]
+fn release_gate_prepares_and_cleans_up_native_usbip() -> Result<(), Box<dyn Error>> {
+    let workflows = workflows()?;
+    let release = &workflows
+        .iter()
+        .find(|(name, _)| name == "release.yml")
+        .ok_or("missing release")?
+        .1["jobs"]["gate"];
+    assert_eq!(release["runs-on"], "ubuntu-latest");
+    assert_eq!(release["env"]["TETHERCAM_USBIP"], json!(1));
+    let steps = release["steps"].as_array().ok_or("missing release steps")?;
+    let position = |command: &str| {
+        steps
+            .iter()
+            .position(|step| step["run"] == command)
+            .ok_or("missing release command")
+    };
+    let prepare =
+        position("cargo run --features repo-tools --bin tethercam-tools -- usbip prepare")?;
+    let gate = position("make all")?;
+    let package = position("cargo package --locked")?;
+    let dry_run = position("cargo publish --dry-run --locked")?;
+    let cleanup =
+        position("cargo run --features repo-tools --bin tethercam-tools -- usbip detach")?;
+    assert!(prepare < gate && gate < package && package < dry_run && dry_run < cleanup);
+    for index in [prepare, gate, package, dry_run] {
+        assert!(steps[index].get("if").is_none());
+        assert!(steps[index].get("continue-on-error").is_none());
+    }
+    assert_eq!(steps[cleanup]["if"], "always()");
+    assert!(steps.iter().any(|step| {
+        step["with"]["components"] == "rustfmt, clippy, llvm-tools-preview"
+            && step.get("if").is_none()
+    }));
+    assert!(steps.iter().any(|step| {
+        step["with"]["tool"] == "cargo-nextest,cargo-deny,cargo-llvm-cov"
+            && step.get("if").is_none()
+    }));
+    Ok(())
+}
+
+#[test]
 fn checked_in_policy_matches_every_owned_pr_job() -> Result<(), Box<dyn Error>> {
     validate(&policy()?, &workflows()?)?;
     Ok(())
