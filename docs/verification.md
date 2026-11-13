@@ -239,15 +239,21 @@ workflow/ruleset inputs are intentionally unpublished.
 
 ## Toolchain pin
 
-`rust-toolchain.toml` is the single source of truth for the compiler. Every workflow installs that
-exact `channel` through `dtolnay/rust-toolchain` (never `stable`), including the release workflow,
-and repeats only the components and targets it needs. `tests/repository_policy.rs` fails when a
-workflow's `toolchain` differs from the file, or names a component or target outside it. `rust-version` in
-`Cargo.toml` is the MSRV, not the pin. The `test.yml` `msrv` job installs it and sets
+`rust-toolchain.toml` is the single source of truth for the compiler. Every workflow job that
+runs cargo, including `deny` and the release workflow, installs that exact `channel` through its one
+`dtolnay/rust-toolchain` step (never `stable`). With the file present, rustup would fetch any
+listed component or cross target missing from the job on its first `cargo` call (seen in the `fmt`
+job log as a second "downloading 4 components"), so each step lists exactly the file's
+`components` and `targets`. That costs a few extra downloads in jobs that need less, and makes
+every job fetch the same set up front. `tests/repository_policy.rs` fails when a step's
+`toolchain`, `components` or `targets` differ from the file, when a job has a second toolchain
+setup action, or when a workflow step or Makefile recipe selects a toolchain by hand
+(`cargo +x`, `rustup`, `RUSTUP_TOOLCHAIN`). `rust-version` in `Cargo.toml` is the MSRV, not the
+pin. The `test.yml` `msrv` job installs it, installs no extra components, and sets
 `RUSTUP_TOOLCHAIN` to it, since rustup would otherwise let the file override the action's
 default; its log prints `rustc --version --verbose`.
 
 To bump the pin, open a deliberate PR that changes `channel` in `rust-toolchain.toml` and the
-`toolchain:` value in each workflow in the same commit, runs the full gate (`make all`) and
+`toolchain:` value in each workflow (plus any changed `components` or `targets`) in the same commit, runs the full gate (`make all`) and
 reads the Linux `coverage` job: region accounting can change and expose gaps that need tests, not
 exclusions. The `release.yml` pin is unexecuted until a tag runs it.

@@ -13,7 +13,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
-- Pin one Rust toolchain in `rust-toolchain.toml` for CI, the release workflow and local gates, enforce it in `tests/repository_policy.rs`, keep the `msrv` job on `rust-version` with `RUSTUP_TOOLCHAIN`, drop `rust-toolchain.toml` from the published crate, and stop the coverage failure hint claiming CI floats on `stable`
+- Pin one Rust toolchain in `rust-toolchain.toml` for CI, the release workflow and local gates, enforce it in `tests/repository_policy.rs`, keep the `msrv` job on `rust-version` with `RUSTUP_TOOLCHAIN`, drop `rust-toolchain.toml` from the published crate, stop the coverage failure hint claiming CI floats on `stable`, and run the `deny` job as `make deny` on that toolchain instead of the Docker action
 - Make runtime and actor log-capture tests deterministic when the lib tests share one process (tracing callsite interest was cached as disabled by a concurrent thread)
 - Make `make coverage` independent of where the toolchain keeps `rust-src`, print the rustc release, and on failure write a filtered text report (`coverage/uncovered.txt`) that locates uncovered regions
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation

@@ -17,7 +17,7 @@ after the new jobs have completed successfully and the current merge train is st
 | `docs.yml` | `rustdoc` | `make doc`, warnings denied |
 | `bench.yml` | `bench` | PR: `make bench-check`, compile and smoke-run every benchmark |
 | `cross.yml` | `check (aarch64-unknown-linux-gnu)`, `check (armv7-unknown-linux-gnueabihf)` | Embedded cross checks, all features |
-| `deny.yml` | `deny` | `cargo deny check` through the pinned action |
+| `deny.yml` | `deny` | `make deny` (`cargo deny check`) on the pinned toolchain |
 | `coverage.yml` | `coverage` | `make coverage`, exact 100% per-file lines/functions/regions across the actual `src/` root, including test modules; implicit filename exclusions disabled |
 
 All 16 checks are individual GitHub Actions jobs, not an optional aggregate. Actions app ID
