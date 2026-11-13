@@ -9,8 +9,8 @@
 //!   reply to send (or why it was dropped). No sockets, no sleeping, fully unit-testable
 //! - [`Responder`]: drives an [`Engine`] over a [`Transport`] with a [`Clock`], holding replies
 //!   until their random delay elapses
-//! - [`UdpTransport`]: the real UDP sockets. Tests use an in-memory [`Transport`] instead, so no
-//!   test sends multicast onto a network
+//! - [`UdpTransport`]: the real UDP sockets. Tests use an in-memory [`Transport`] for protocol
+//!   cases and loopback-only multicast for a socket round-trip
 //!
 //! Security posture:
 //! - Discovery is unauthenticated by design, so it discloses only what ONVIF requires: the
