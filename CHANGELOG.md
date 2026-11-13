@@ -29,6 +29,7 @@ All notable changes to this project are documented here. The format follows
 - `Session::scoped`; callers explicitly open and close sessions
 ### Changed
 
+- Document the WS-Discovery `XAddrs` limitation on overlapping subnets and test a synthetic multicast Probe round-trip on loopback
 - Disable implicit coverage filename exclusions and enforce exact per-file coverage for all executable source modules, including separately named tests
 
 - Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors

@@ -105,6 +105,11 @@ cargo run -- doctor --config ./camera.toml --simulate ./synthetic.jpg
 cargo run -- run --config ./camera.toml --simulate ./synthetic.jpg --no-discovery
 ```
 
+WS-Discovery infers the arrival interface from the sender's subnet, rather than receiving the
+interface from the socket. With overlapping subnets it chooses the most specific match; equal
+prefixes select the first configured interface. The advertised `XAddrs` can therefore point to
+the wrong interface on such networks.
+
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG
 is used for stills; integration tests inject a larger independent still. `--no-discovery` suppresses

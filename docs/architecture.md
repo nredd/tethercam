@@ -269,7 +269,7 @@ Not yet established, tracked as issues:
   failures through the same non-generic helpers used by the real sockets and threads. Loopback
   tests exercise request deadlines, pipelining, connection caps and wildcard shutdown; IPv4
   must succeed, while IPv6 may skip only an explicitly unavailable address family
-- WS-Discovery UDP tests use OS-assigned loopback ports, check fixed-port sharing and ephemeral-port exclusivity, and exercise socket setup failures without privileged host changes. A concrete receive syscall seam covers fatal errors without invalidating descriptors. Multicast packet round-trips and captured client probes remain tracked in #33
+- WS-Discovery UDP tests check fixed-port sharing and ephemeral-port exclusivity, exercise socket setup failures without privileged host changes, and round-trip a synthetic multicast Probe over loopback. Captured client probes remain blocked on #13 and tracked in #33. A concrete receive syscall seam covers fatal errors without invalidating descriptors
 - RTSP connection tests use real loopback sockets for reset, EOF and stalled-write failures;
   narrow entropy and UDP allocation seams cover OS failures without relying on ephemeral-port order
 - RTSP status conversion folds exactly three validated ASCII digits into `u16`; all values
