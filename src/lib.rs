@@ -5,7 +5,9 @@
 //! endpoint, so NVRs such as UniFi Protect and hubs such as Home Assistant can adopt it like any
 //! other IP camera.
 //!
-//! The crate is one library plus one binary. Layers are modules, bottom to top:
+//! The crate is one library plus the default application binary. Off-by-default `test-support`
+//! exposes reusable verification infrastructure; `repo-tools` adds a developer utility without
+//! changing normal startup or `cargo run` selection. Runtime layers are modules, bottom to top:
 //!
 //! - [`ptp`]: transport-independent PTP wire format
 //! - [`transport`]: USB and simulated byte transports
@@ -32,4 +34,6 @@ pub mod rtsp;
 pub mod service;
 pub mod sony;
 pub mod supervisor;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod transport;

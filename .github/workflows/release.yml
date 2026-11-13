@@ -39,15 +39,15 @@ jobs:
       - name: Tag matches Cargo.toml version
         env:
           TAG: ${{ github.ref_name }}
-        run: cargo run --locked --all-features --bin tethercam-tools -- release-tag "$TAG"
+        run: cargo run --locked --features repo-tools --bin tethercam-tools -- release-tag "$TAG"
       - name: Provision disposable CI USB/IP fixture
-        run: cargo run --locked --all-features --bin tethercam-tools -- usbip prepare
+        run: cargo run --features repo-tools --bin tethercam-tools -- usbip prepare
       - run: make all cross
-      - name: Detach only the synthetic CI fixture
-        if: always()
-        run: cargo run --locked --all-features --bin tethercam-tools -- usbip detach
       - run: cargo package --locked
       - run: cargo publish --dry-run --locked
+      - name: Detach only the synthetic CI fixture
+        if: always()
+        run: cargo run --features repo-tools --bin tethercam-tools -- usbip detach
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: crate-${{ github.sha }}

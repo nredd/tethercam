@@ -223,8 +223,8 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
             "gate",
             vec![
                 "git merge-base --is-ancestor HEAD origin/main",
-                "cargo run --locked --all-features --bin tethercam-tools -- release-tag \"$TAG\"",
-                "cargo run --locked --all-features --bin tethercam-tools -- usbip prepare",
+                "cargo run --locked --features repo-tools --bin tethercam-tools -- release-tag \"$TAG\"",
+                "cargo run --features repo-tools --bin tethercam-tools -- usbip prepare",
                 "make all cross",
                 "cargo package --locked",
                 "cargo publish --dry-run --locked",
@@ -334,36 +334,83 @@ fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<()
     let steps = coverage["steps"]
         .as_array()
         .ok_or("missing coverage steps")?;
-    assert!(
-        steps
-            .iter()
-            .any(|step| step["run"] == "scripts/usbip-ci.sh prepare" && step.get("if").is_none())
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|step| step["run"] == "scripts/usbip-ci.sh detach" && step["if"] == "always()")
-    );
+    assert!(steps.iter().any(|step| step["run"]
+        == "cargo run --features repo-tools --bin tethercam-tools -- usbip prepare"
+        && step.get("if").is_none()));
+    assert!(steps.iter().any(|step| step["run"]
+        == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
+        && step["if"] == "always()"));
     let tests = &workflows
         .iter()
         .find(|(name, _)| name == "test.yml")
         .ok_or("missing tests")?
         .1["jobs"]["test"];
+    assert_eq!(
+        tests["env"]["TETHERCAM_USBIP"],
+        "${{ matrix.os != 'macos-latest' && '1' || '0' }}"
+    );
     let steps = tests["steps"].as_array().ok_or("missing test steps")?;
     assert!(steps.iter().any(|step| {
         step["if"] == "runner.os == 'Linux'"
-            && step["run"].as_str().is_some_and(|run| {
-                run.contains("scripts/usbip-ci.sh prepare")
-                    && run.contains("TETHERCAM_USBIP=1")
-                    && run.contains("$GITHUB_ENV")
-            })
+            && step["run"]
+                == "cargo run --features repo-tools --bin tethercam-tools -- usbip prepare"
     }));
-    assert!(
+    assert!(steps.iter().any(|step| step["run"]
+        == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
+        && step["if"] == "always() && runner.os == 'Linux'"));
+    // All-feature make test executes native coverage acceptance crates, not only nextest.
+    for job in [coverage, tests] {
+        let steps = job["steps"]
+            .as_array()
+            .ok_or("missing native acceptance steps")?;
+        assert!(steps.iter().any(|step| {
+            step["with"]["components"] == "llvm-tools-preview" && step.get("if").is_none()
+        }));
+        assert!(steps.iter().any(|step| {
+            step["with"]["tool"] == "cargo-llvm-cov,cargo-nextest" && step.get("if").is_none()
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn release_gate_prepares_and_cleans_up_native_usbip() -> Result<(), Box<dyn Error>> {
+    let workflows = workflows()?;
+    let release = &workflows
+        .iter()
+        .find(|(name, _)| name == "release.yml")
+        .ok_or("missing release")?
+        .1["jobs"]["gate"];
+    assert_eq!(release["runs-on"], "ubuntu-latest");
+    assert_eq!(release["env"]["TETHERCAM_USBIP"], json!(1));
+    let steps = release["steps"].as_array().ok_or("missing release steps")?;
+    let position = |command: &str| {
         steps
             .iter()
-            .any(|step| step["run"] == "scripts/usbip-ci.sh detach"
-                && step["if"] == "always() && runner.os == 'Linux'")
-    );
+            .position(|step| step["run"] == command)
+            .ok_or("missing release command")
+    };
+    let prepare =
+        position("cargo run --features repo-tools --bin tethercam-tools -- usbip prepare")?;
+    let gate = position("make all cross")?;
+    let package = position("cargo package --locked")?;
+    let dry_run = position("cargo publish --dry-run --locked")?;
+    let cleanup =
+        position("cargo run --features repo-tools --bin tethercam-tools -- usbip detach")?;
+    assert!(prepare < gate && gate < package && package < dry_run && dry_run < cleanup);
+    for index in [prepare, gate, package, dry_run] {
+        assert!(steps[index].get("if").is_none());
+        assert!(steps[index].get("continue-on-error").is_none());
+    }
+    assert_eq!(steps[cleanup]["if"], "always()");
+    assert!(steps.iter().any(|step| {
+        step["with"]["components"] == "rustfmt, clippy, llvm-tools-preview"
+            && step.get("if").is_none()
+    }));
+    assert!(steps.iter().any(|step| {
+        step["with"]["tool"] == "cargo-nextest,cargo-deny,cargo-llvm-cov"
+            && step.get("if").is_none()
+    }));
     Ok(())
 }
 
@@ -473,18 +520,22 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
 #[test]
 fn repository_only_test_is_excluded_from_publication() -> Result<(), Box<dyn Error>> {
     let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))?;
-    for required in [
-        "tests/repository_policy.rs",
-        "tests/usb_emulated.rs",
-        "tests/usbip/",
-    ] {
-        assert!(
-            manifest["package"]["exclude"]
-                .as_array()
-                .is_some_and(|paths| paths.iter().any(|path| path.as_str() == Some(required))),
-            "repository-only test '{required}' must not ship without its excluded inputs"
-        );
+    let excludes = manifest["package"]["exclude"]
+        .as_array()
+        .ok_or("excludes")?;
+    assert!(
+        excludes
+            .iter()
+            .any(|path| path.as_str() == Some("tests/repository_policy.rs"))
+    );
+    for path in ["tests/usb_emulated.rs", "tests/usbip/", "src/test_support/"] {
+        assert!(!excludes.iter().any(|value| value.as_str() == Some(path)));
     }
+    assert!(manifest["features"].get("test-support").is_some());
+    assert_eq!(
+        manifest["package"]["default-run"].as_str(),
+        Some("tethercam")
+    );
     Ok(())
 }
 

@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Reject partial media decodes when FFmpeg reports an error.
+- Prepare and clean up hosted USB/IP prerequisites for the release gate.
+
+Next release: `0.0.2`.
+
+### Fixed
+
+- Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
+- Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
+- Preserve typed diagnostic-example error sources and property-test arbitrary USB/IP management/import inputs
+
+### Added
+
+- Off-by-default, importable `test-support` API with a generic USB/IP engine, Sony/SICDD and synthetic non-Sony personalities, fault/resource/deadline/re-import/cancellation verification and hosted native integration
+- Rust developer utilities for explicitly scoped VHCI provisioning, protected client inputs, bounded media-client termination with joined camera shutdown, source diagnostics/cadence and aggregate-only profiling; preserve default application install/run behavior
+- Typed public verification errors distinguish protocol/identity validation from I/O, model, deadline and task failures
+
+### Changed
+
+- Delegate SRC coverage enforcement/reporting to native `cargo-llvm-cov` zero-uncovered and fail-under-100 checks, including all source tests and optional verification/tooling code
+
+### Removed
+
+- Shell coverage validator/fixtures and USB/IP setup helper; maintained verification logic is Rust
+
+## [0.0.1] - 2026-11-12
+
 ### Fixed
 
 - Bind privileged service config ownership changes to validated no-follow file handles, and retain owned uninstall receipts across unlink, sync and native-reload failures
@@ -29,6 +56,7 @@ All notable changes to this project are documented here. The format follows
 - `Session::scoped`; callers explicitly open and close sessions
 ### Changed
 
+- Document the WS-Discovery `XAddrs` limitation on overlapping subnets and test a synthetic multicast Probe round-trip on loopback
 - Disable implicit coverage filename exclusions and enforce exact per-file coverage for all executable source modules, including separately named tests
 
 - Bound ONVIF SOAP conversion, redact request debug output, and return typed RTSP errors

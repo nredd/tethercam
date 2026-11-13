@@ -5,10 +5,9 @@ The tag-only `Release` workflow publishes to crates.io with
 immutable release containing the verified source `.crate` archive. No registry token secret
 or personal access token belongs in GitHub. There are no prebuilt platform binaries yet.
 
-The native `tethercam-tools` release-tag and disposable-CI USB/IP commands come from #65.
-This workflow must not be activated until that implementation is integrated and its combined
-exact-commit gate is green. `--all-features` enables the off-by-default verification tooling,
-including `test-support`; this is not normal camera runtime.
+The native `tethercam-tools` release-tag and disposable-CI USB/IP commands use the
+`repo-tools` feature, which enables `test-support`. These off-by-default verification tools are
+not normal camera runtime. The combined exact-commit gate must be green before release admission.
 
 ## Initial publication and authentication
 

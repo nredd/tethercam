@@ -5,6 +5,12 @@
 
 #[tokio::test]
 async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
     let cfg = cfg();
     let (ready, ready_rx) = oneshot::channel();
     let mut out = Ready(Some(ready));
@@ -17,8 +23,16 @@ async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
         },
         &mut out,
     )
+    .with_subscriber(subscriber)
     .await
     .unwrap();
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert!(logs.contains("waiting_camera"));
+    assert!(logs.contains("runtime_ready"));
+    assert_eq!(logs.matches("runtime_stopped").count(), 1);
+    assert!(!logs.contains("runtime_failed"));
+    assert!(!logs.contains(cfg.credentials.username.expose()));
+    assert!(!logs.contains(cfg.credentials.password.expose()));
     // The ready notification is one-shot, but subsequent diagnostic writes remain valid.
     out.write_all(b"secondary diagnostic").unwrap();
     assert!(std::net::TcpListener::bind((cfg.rtsp_address, cfg.rtsp_port)).is_ok());
@@ -79,17 +93,40 @@ impl Write for FlushFailure {
 
 #[tokio::test]
 async fn ready_output_flush_failure_closes_started_listeners_and_session() {
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
     let cfg = cfg();
+    let factory = Factory::new(vec![camera()]);
+    let released = Arc::clone(&factory.released);
     assert!(
         serve(
-            Factory::new(vec![camera()]),
+            factory,
             &cfg,
             None,
             std::future::pending(),
             &mut FlushFailure
         )
+        .with_subscriber(subscriber)
         .await
         .is_err()
+    );
+    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    assert_eq!(logs.matches("runtime_failed").count(), 1);
+    assert!(!logs.contains("runtime_stopped"));
+    assert!(!logs.contains("synthetic flush failure"));
+    assert!(!logs.contains(&format!("{:?}", jpeg(32, 32))));
+    assert!(!logs.contains(cfg.credentials.username.expose()));
+    assert!(!logs.contains(cfg.credentials.password.expose()));
+    let cameras = released.lock().unwrap();
+    assert_eq!(cameras.len(), 1);
+    assert_eq!(cameras[0].reset_count(), 0);
+    assert_eq!(
+        cameras[0].commands().last().unwrap().code,
+        crate::ptp::session::code::CLOSE_SESSION
     );
     assert!(std::net::TcpListener::bind((cfg.rtsp_address, cfg.rtsp_port)).is_ok());
     assert!(std::net::TcpListener::bind((cfg.onvif_address, cfg.onvif_port)).is_ok());
@@ -104,6 +141,7 @@ use crate::config::Secret;
 use crate::supervisor::testing::{Factory, camera, jpeg};
 use crate::transport::sim::sony::{SonySimConfig, sony_camera};
 use tokio::sync::oneshot;
+use tracing::instrument::WithSubscriber;
 
 fn cfg() -> Config {
     let mut cfg = Config::generate().unwrap();

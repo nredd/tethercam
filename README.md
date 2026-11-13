@@ -105,6 +105,11 @@ cargo run -- doctor --config ./camera.toml --simulate ./synthetic.jpg
 cargo run -- run --config ./camera.toml --simulate ./synthetic.jpg --no-discovery
 ```
 
+WS-Discovery infers the arrival interface from the sender's subnet, rather than receiving the
+interface from the socket. With overlapping subnets it chooses the most specific match; equal
+prefixes select the first configured interface. The advertised `XAddrs` can therefore point to
+the wrong interface on such networks.
+
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG
 is used for stills; integration tests inject a larger independent still. `--no-discovery` suppresses
@@ -120,16 +125,29 @@ make all        # the full gate: format check, clippy, tests, docs, benchmarks, 
 make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-cov)
 ```
 
-Tools: `jq`, `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` (needs the `llvm-tools-preview` rustup component, so put the rustup toolchain's `cargo` first on `PATH`). Everything runs without a camera attached. `make coverage` disables llvm-cov's implicit filename exclusions and validates exact line, function and region counts for every instrumented file under the actual `src/` root, including separately named test modules and nested test directories. Files with no executable code need no coverage; integration tests, examples, benchmarks and dependencies outside that root are not gated. Malformed reports, missing metrics and empty source inventories fail closed. `make coverage-report` writes unfiltered JSON, lcov and HTML artifacts under `coverage/`.
+Tools: `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` 0.9.1 or newer (with the
+`llvm-tools-preview` rustup component). Put the rustup toolchain's `cargo` first on `PATH`.
+`make coverage` cleans profiles and uses cargo-llvm-cov's native zero-uncovered line/function/
+region checks plus fail-under-100 guards, with implicit filename exclusions disabled. Actual
+`src/` includes named/nested source tests, developer tools and optional test-support implementation.
+There is no bespoke JSON/schema/inventory validator. Native empty aggregates and malformed
+profiles fail; external tests/examples/benchmarks/dependencies are outside SRC.
+`make coverage-report` writes unfiltered JSON, LCOV and HTML under `coverage/`.
 
-Hosted Linux coverage and test jobs execute the actual `nusb` backend through a loopback-only
-USB/IP Sony simulator and VHCI, without a physical camera. Setup and cleanup use
-`scripts/usbip-ci.sh`; only the synthetic USB node gets runner permissions and cargo never
-runs as root. See [`docs/usb.md`](docs/usb.md). The sole local constraint is exactly
-`src/transport/usb/nusb_backend.rs`: when `CI` is unset and VHCI is absent, its threshold is
-loudly not enforced. The unfiltered report still contains it. `CI` set to *any* value disables
-this exception; all source files, including this thin native adapter, require 100% in CI.
-No other file is eligible, and the retired coverage-pending mechanism is not used.
+Hosted Linux test/coverage jobs explicitly provision VHCI through the Rust utility, import
+loopback-only Sony and independent non-Sony USB/IP fixtures, and drive actual `nusb` handles.
+Cargo/tests never run as root; only exact synthetic VHCI identities authorize node permissions
+or detach. Local native testing requires explicitly preconfigured delegated access, never silent
+`sudo` or host mutation. The sole local coverage constraint remains exactly
+`src/transport/usb/nusb_backend.rs`, only when `CI` is absent and VHCI is absent. It is announced
+loudly; any `CI` value disables it, and no other source file is eligible.
+
+The next `0.0.2` release adds the off-by-default `test-support` feature with reusable `DeviceModel`/`Server` APIs and
+diagnostics, separate from normal camera runtime. The optional `repo-tools` feature builds
+`tethercam-tools` for native provisioning, protected client inputs, subprocess verification,
+offline profiling summaries and release-tag validation. Default install/run behavior is unchanged.
+See [`docs/verification.md`](docs/verification.md) for API, privilege, coverage, profiling and
+extracted-package verification contracts, and [`docs/usb.md`](docs/usb.md) for normal camera setup.
 
 `make bench-check` smoke-runs each case once; `make bench` records full Criterion measurements.
 The RTSP fan-out benchmark keeps subscribers alive across bursts, measuring steady-state packet
