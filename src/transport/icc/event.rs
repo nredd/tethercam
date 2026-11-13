@@ -180,9 +180,44 @@ mod tests {
         }
 
         #[test]
-        fn accepted_events_never_exceed_the_bounds(bytes in proptest::collection::vec(any::<u8>(), 0..40)) {
-            if let Ok(Notice::Ptp(event)) = classify(&tagged(TAG_PTP, &bytes)) {
-                prop_assert!(event.params.len() <= MAX_PARAMS);
+        fn header_shaped_events_are_accepted_exactly_when_well_formed(
+            kind in prop_oneof![3 => Just(4_u16), 1 => 1_u16..=5],
+            code in any::<u16>(), txid in any::<u32>(),
+            params in proptest::collection::vec(any::<u32>(), 0..=8),
+            trailing in proptest::collection::vec(any::<u8>(), 0..=8),
+            skew in -8_i64..=8, honest_length in any::<bool>(),
+        ) {
+            // A header whose length field is the true total (when `honest_length`) or off by
+            // `skew`, followed by `trailing` stray bytes, so every guard in `ptp_event` is hit
+            // with a mix of accepted and rejected inputs.
+            let honest = 12 + 4 * params.len();
+            let skew = if honest_length { i64::try_from(trailing.len()).expect("small") } else { skew };
+            let announced = u32::try_from(i64::try_from(honest).expect("small") + skew)
+                .unwrap_or(0);
+            let mut wire = vec![TAG_PTP];
+            wire.extend(announced.to_le_bytes());
+            wire.extend(kind.to_le_bytes());
+            wire.extend(code.to_le_bytes());
+            wire.extend(txid.to_le_bytes());
+            wire.extend(params.iter().flat_map(|p| p.to_le_bytes()));
+            wire.extend(&trailing);
+            let actual = honest + trailing.len();
+            let payload = actual - 12;
+            let well_formed = kind == 4
+                && usize::try_from(announced) == Ok(actual)
+                && payload % 4 == 0
+                && payload / 4 <= MAX_PARAMS;
+            match classify(&wire) {
+                Ok(Notice::Ptp(event)) => {
+                    prop_assert!(well_formed);
+                    prop_assert_eq!(event.code, code);
+                    prop_assert_eq!(event.transaction_id, txid);
+                    prop_assert_eq!(event.params.len(), payload / 4);
+                }
+                other => {
+                    prop_assert!(!well_formed, "{other:?}");
+                    prop_assert_eq!(other, Err(IccError::MalformedEvent));
+                }
             }
         }
     }

@@ -50,8 +50,12 @@ pub(super) struct Script {
     pub open: VecDeque<Result<(), IccError>>,
     pub transact: VecDeque<Step>,
     pub close: VecDeque<Result<(), IccError>>,
-    pub boundary_events: VecDeque<Result<Option<Vec<u8>>, IccError>>,
-    pub lease_events: VecDeque<Result<Option<Vec<u8>>, IccError>>,
+    /// The ONE process-wide event queue the boundary and every lease read, like the native one.
+    /// Whatever is queued when a session opens is stale.
+    pub events: VecDeque<Result<Option<Vec<u8>>, IccError>>,
+    /// Events that arrive once the session is open: released when a lease first polls an empty
+    /// queue, which is where the bridge's stale drain ends.
+    pub fresh: VecDeque<Result<Option<Vec<u8>>, IccError>>,
     pub calls: Vec<Call>,
     pub live_leases: usize,
     pub panic_on_discover: bool,
@@ -149,7 +153,11 @@ impl Lease for FakeLease<'_> {
     fn poll_event(&mut self) -> Result<Option<Vec<u8>>, IccError> {
         let mut script = lock(&self.shared);
         script.calls.push(Call::Event);
-        script.lease_events.pop_front().unwrap_or(Ok(None))
+        script.events.pop_front().unwrap_or_else(|| {
+            let arrived = std::mem::take(&mut script.fresh);
+            script.events.extend(arrived);
+            Ok(None)
+        })
     }
 }
 
@@ -194,7 +202,7 @@ impl Boundary for Fake {
     fn poll_event(&mut self) -> Result<Option<Vec<u8>>, IccError> {
         let mut script = lock(&self.shared);
         script.calls.push(Call::Event);
-        script.boundary_events.pop_front().unwrap_or(Ok(None))
+        script.events.pop_front().unwrap_or(Ok(None))
     }
 }
 

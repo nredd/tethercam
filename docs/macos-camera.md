@@ -45,16 +45,21 @@ Session semantics, all following from "ICC owns the pipes":
   `IccError::DeadlineExceeded` means native work continues. After a deadline the session is *retired*:
   it refuses work, never issues a second close, and a replacement `open` returns `IccError::Busy`
   until the native owner has settled cleanup. A cancelled `open` future leaves the session `Opening`:
-  the owner may still complete it, so `close` (not a second `open`) resolves it with confirmation. A late open success is closed natively after it completes
+  the owner may still complete it, so `close` (not a second `open`) confirms closure if a lease exists. If none does, nothing was confirmed: `close` reports `IccError::NotOpen` and the session is retired. `close` on a retired session is `NotOpen` too (terminal; a retry cannot help), and only `open` probes for reuse, which stays `Busy` until native cleanup settles. A late open success is closed natively after it completes
 - Failure categories are sanitized statics: permission, busy, removal, admission, deadline, malformed
   completion, event overflow, malformed event, cleanup failure, quarantine
 - Failures fault, retire or quarantine the session. A faulted session refuses transactions but `close`
   still confirms closure. A quarantined session (native quarantine, removal, close failure, owner gone)
   accepts nothing and never reopens
-- Events are advisory and bounded by the boundary (64). `poll_event` fails closed: overflow, removal,
-  access restriction, a native error observation, an oversized event and any malformed, truncated or
-  oversized PTP event are errors and fault the session, so the Sony layer must close and reconnect to
-  resynchronize. Only benign observations are skipped
+- Events are advisory and bounded by the boundary (64), and the boundary has ONE process-wide queue.
+  When a session opens, everything queued before it (stale PTP events, a previous native error or access
+  restriction, the overflow flag) is discarded so it cannot fault or feed the new session. Removal is not
+  lost by this: the native owner keeps a sticky, process-lifetime removal flag that quarantines
+  independently of the queue (`driver.rs` `disconnected`). The Sony handshake re-reads the property table
+  after open, so events lost in the instant between open completion and the discard are resynchronized.
+  Afterwards `poll_event` fails closed. Overflow, access restriction, a native error observation, an
+  oversized event and any malformed, truncated or oversized PTP event fault the session, so the Sony
+  layer must close and reconnect to resynchronize. Removal quarantines it. Only benign observations are skipped
 
 Native code runs on the main thread (`run` blocks it in the run loop) and joins one worker, which can
 wait forever if the framework never calls back. There is no bounded-shutdown guarantee.

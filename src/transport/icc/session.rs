@@ -7,17 +7,21 @@
 //!   retried, cancelled or overlapped. After a deadline the session is retired: it refuses
 //!   work, and a replacement `open` reports [`IccError::Busy`] until native cleanup settles
 //! - at most one native operation at a time, no backlog ([`IccError::Busy`])
-//! - events are advisory and bounded. Overflow, removal and any malformed event fail closed
-//!   and fault the session, so the Sony layer must close and reconnect to resynchronize
+//! - events are advisory and bounded. Overflow, access restriction, a native error observation,
+//!   an oversized event and any malformed event fail closed and fault the session, so the Sony
+//!   layer must close and reconnect to resynchronize. Removal quarantines it. Events queued
+//!   before a session opened are discarded when it opens, so it never sees a predecessor's
 //!
 //! Lifecycle: `Closed -> Opening -> Open -> Closed`, with the failure states
 //! - `Opening`: an `open` is pending or was cancelled, so the owner may still complete it and
-//!   hold a lease. `open` is refused and `close` resolves it with confirmation. A close that
-//!   finds no lease only means this owner holds none: a late native success is closed by the
-//!   native owner, and a replacement `open` stays [`IccError::Busy`] until that settles
+//!   hold a lease. `open` is refused and `close` confirms closure if a lease exists. If none
+//!   does, the open failed or is still settling natively, nothing was confirmed, and `close`
+//!   reports [`IccError::NotOpen`] and retires the session, like any retired one
 //! - `Faulted`: no more transactions, but the lease remains and `close` confirms closure
-//! - `Retired`: the lease was given up; native cleanup settles it. Reuse is only probed
-//!   through `open`, which the native owner refuses while cleanup is unresolved
+//! - `Retired`: the lease was given up; native cleanup settles it. `close` reports
+//!   [`IccError::NotOpen`] (terminal: there is nothing to close, so retrying cannot help). Reuse
+//!   is only probed through `open`, which the native owner refuses with [`IccError::Busy`] while
+//!   cleanup is unresolved
 //! - `Quarantined`: terminal. No new work and no replacement session
 //!
 //! Caller timeouts: `transaction_within` is the whole-command wait. Admission, the latest the
@@ -204,17 +208,12 @@ impl PtpSession for IccSession {
         match self.state {
             State::Closed => return Ok(()),
             State::Quarantined => return Err(IccError::Quarantined.into()),
-            State::Retired => return Err(IccError::Busy.into()),
+            State::Retired => return Err(IccError::NotOpen.into()),
             State::Opening | State::Open | State::Faulted => {}
         }
         let timeout = Self::timeout(self.config.transaction_timeout)?;
         match self.handle.close(timeout).await {
             Ok(()) => {
-                self.state = State::Closed;
-                Ok(())
-            }
-            // A cancelled open that never produced a lease leaves nothing to close.
-            Err(IccError::NotOpen) if self.state == State::Opening => {
                 self.state = State::Closed;
                 Ok(())
             }

@@ -84,6 +84,7 @@ const MAX_PREALLOC: usize = 1 << 20;
 
 /// Why a session operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SessionError {
     /// The transport failed.
     #[error("transport failure: {0}")]

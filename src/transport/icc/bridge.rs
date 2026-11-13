@@ -235,6 +235,23 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
     }
 }
 
+/// Most stale events discarded per open: the native queue holds 64, plus its overflow flag.
+const MAX_STALE: usize = 66;
+
+/// Discard what the boundary's one process-wide event queue held before this session opened:
+/// stale PTP events, a predecessor's native error or access restriction, and the sticky overflow
+/// flag, which a poll clears. Without this the first poll of a new session would fault on, or
+/// act on, another session's history. Removal is not lost: the native owner keeps its own sticky
+/// removal state that quarantines independently of the queue.
+fn discard_stale<L: Lease>(lease: &mut L) {
+    for _ in 0..MAX_STALE {
+        match lease.poll_event() {
+            Ok(None) | Err(IccError::Disconnected) => return,
+            Ok(Some(_)) | Err(_) => {}
+        }
+    }
+}
+
 /// Serve requests until the handle is dropped. The inbox is owned so that an owner that
 /// unwinds also closes the queue, and callers then see a disconnect instead of waiting forever.
 fn serve<B: Boundary>(boundary: &mut B, inbox: Inbox) {
@@ -246,7 +263,8 @@ fn serve<B: Boundary>(boundary: &mut B, inbox: Inbox) {
                 reply,
             } => inbox.answer(reply, boundary.discover(window, timeout)),
             Request::Open { id, timeout, reply } => match boundary.open(&id, timeout) {
-                Ok(lease) => {
+                Ok(mut lease) => {
+                    discard_stale(&mut lease);
                     inbox.answer(reply, Ok(()));
                     if !hold(lease, &inbox) {
                         return;

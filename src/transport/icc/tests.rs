@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use super::fake::{Call, Fake, HOLD_LIMIT, Script, Shared, SimBoundary, Step, ok_reply};
 use super::{
-    IccDeviceId, IccError, IccHandle, IccReply, IccSession, IccTimeout, MAX_DATA_BYTES,
+    IccDeviceId, IccError, IccHandle, IccReply, IccSession, IccTimeout, MAX_DATA_BYTES, Selector,
     read_only_sample, run_with,
 };
 use crate::ptp::ContainerError;
@@ -126,8 +126,8 @@ fn the_bridge_carries_every_request_kind() {
     let (out, shared) = run(
         |s| {
             s.discover.push_back(Ok(vec![id()]));
-            s.boundary_events.push_back(Ok(Some(vec![1])));
-            s.lease_events.push_back(Ok(Some(vec![2])));
+            s.events.push_back(Ok(Some(vec![1])));
+            s.fresh.push_back(Ok(Some(vec![2])));
             s.transact.push_back(done(Ok(reply(0x2001, &[4], &[5, 6]))));
         },
         |mut handle| {
@@ -154,6 +154,8 @@ fn the_bridge_carries_every_request_kind() {
             Call::Discover,
             Call::Event,
             Call::Open,
+            // The bridge's stale drain ends at the first empty poll.
+            Call::Event,
             Call::Event,
             Call::Transact {
                 operation: 0x1001,
@@ -212,7 +214,10 @@ fn dropping_the_handle_with_a_lease_requests_close_without_confirming() {
             });
         },
     );
-    assert_eq!(calls(&shared), [Call::Open, Call::LeaseDropped]);
+    assert_eq!(
+        calls(&shared),
+        [Call::Open, Call::Event, Call::LeaseDropped]
+    );
     assert_eq!(script(&shared).live_leases, 0);
 }
 
@@ -628,7 +633,8 @@ fn a_command_deadline_retires_the_lease_and_reuse_waits_for_native_cleanup() {
         },
     );
     assert_eq!(out.0, Err(icc(IccError::DeadlineExceeded)));
-    assert_eq!(out.1, Err(icc(IccError::Busy)));
+    // Retired: there is nothing to close, so a retry cannot help.
+    assert_eq!(out.1, Err(icc(IccError::NotOpen)));
     assert_eq!(out.2, Err(SessionError::NotOpen));
     assert_eq!(out.3, Err(icc(IccError::Busy)));
     assert_eq!(out.4, Ok(()));
@@ -662,7 +668,7 @@ fn a_native_busy_means_the_session_is_closing_and_retires_it() {
     );
     // The transaction's busy is reported as not open and retires the session at once.
     assert_eq!(out.0, Err(icc(IccError::NotOpen)));
-    assert_eq!(out.1, (false, Err(icc(IccError::Busy))));
+    assert_eq!(out.1, (false, Err(icc(IccError::NotOpen))));
     assert_eq!(out.2, Err(icc(IccError::NotOpen)));
     assert!(!out.3);
 }
@@ -793,7 +799,7 @@ fn close_failures_retire_or_quarantine_and_never_reissue_a_close() {
         let again = if terminal {
             icc(IccError::Quarantined)
         } else {
-            icc(IccError::Busy)
+            icc(IccError::NotOpen)
         };
         assert_eq!(out.1, Err(again));
         let closes = calls(&shared).iter().filter(|c| **c == Call::Close).count();
@@ -898,9 +904,9 @@ fn closing_with_an_unrepresentable_timeout_is_rejected() {
 fn ptp_events_arrive_and_advisory_observations_are_skipped() {
     let (out, shared) = run(
         |s| {
-            s.lease_events.push_back(Ok(Some(vec![3])));
-            s.lease_events.push_back(Ok(Some(vec![8])));
-            s.lease_events.push_back(Ok(Some(ptp_event(0xC201, &[5]))));
+            s.fresh.push_back(Ok(Some(vec![3])));
+            s.fresh.push_back(Ok(Some(vec![8])));
+            s.fresh.push_back(Ok(Some(ptp_event(0xC201, &[5]))));
         },
         |handle| {
             block(async move {
@@ -934,7 +940,7 @@ fn a_flood_of_advisory_events_is_bounded_per_poll() {
     let (out, shared) = run(
         |s| {
             for _ in 0..70 {
-                s.lease_events.push_back(Ok(Some(vec![1])));
+                s.fresh.push_back(Ok(Some(vec![1])));
             }
         },
         |handle| {
@@ -948,7 +954,8 @@ fn a_flood_of_advisory_events_is_bounded_per_poll() {
     assert_eq!(out, Ok(None));
     assert_eq!(
         calls(&shared).iter().filter(|c| **c == Call::Event).count(),
-        64
+        // One poll ends the stale drain, then the 64 advisory skips of this poll.
+        65
     );
 }
 
@@ -965,7 +972,7 @@ fn event_failures_fail_closed_with_the_right_effect() {
     ];
     for (event, expected, quarantined) in cases {
         let (out, shared) = run(
-            |s| s.lease_events.push_back(event),
+            |s| s.fresh.push_back(event),
             |handle| {
                 block(async move {
                     let mut s = session(handle);
@@ -994,7 +1001,7 @@ fn event_failures_fail_closed_with_the_right_effect() {
 #[test]
 fn polling_failures_from_the_bridge_apply_their_effect() {
     let (out, shared) = run(
-        |s| s.lease_events.push_back(Err(IccError::Disconnected)),
+        |s| s.fresh.push_back(Err(IccError::Disconnected)),
         |handle| {
             block(async move {
                 let mut s = session(handle);
@@ -1056,34 +1063,115 @@ fn a_cancelled_open_leaves_the_session_unresolved_until_close_confirms() {
 }
 
 #[test]
-fn a_cancelled_open_that_never_opened_closes_as_a_no_op() {
-    let (entered_tx, entered_rx) = sync_channel(1);
-    let (release_tx, release_rx) = sync_channel(1);
+fn a_cancelled_open_without_a_lease_is_never_reported_closed() {
+    // However the abandoned native open ended, no lease exists to confirm closing, so `close`
+    // must not claim success: the session is retired and only `open` probes for reuse.
+    for ended in [
+        IccError::NativeFailure,
+        IccError::DeadlineExceeded,
+        IccError::Quarantined,
+    ] {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (out, shared) = run(
+            |s| {
+                s.hold_open = Some((entered_tx, release_rx));
+                s.open.push_back(Err(ended));
+            },
+            |handle| {
+                block(async move {
+                    let mut s = session(handle);
+                    let slow = tokio::time::timeout(Duration::from_millis(50), s.open()).await;
+                    assert!(slow.is_err());
+                    entered_rx.recv_timeout(HOLD_LIMIT).expect("open started");
+                    let closed = settle_after(
+                        Err(icc(IccError::Busy)),
+                        || release_tx.send(()).expect("release"),
+                        async || s.close().await,
+                    )
+                    .await;
+                    (closed, s.close().await, s.open().await)
+                })
+            },
+        );
+        assert_eq!(out.0, Err(icc(IccError::NotOpen)), "{ended:?}");
+        // Retired: a repeat is terminal, not a retry-later `Busy`.
+        assert_eq!(out.1, Err(icc(IccError::NotOpen)), "{ended:?}");
+        assert_eq!(out.2, Ok(()), "the native owner now accepts a probe");
+        assert!(!calls(&shared).contains(&Call::Close));
+    }
+}
+
+#[test]
+fn stale_events_from_earlier_sessions_never_reach_a_new_session() {
+    // One process-wide queue: a native error, an access restriction, an oversized event, the
+    // overflow flag and a stale PTP event all predate this open.
     let (out, shared) = run(
         |s| {
-            s.hold_open = Some((entered_tx, release_rx));
-            s.open.push_back(Err(IccError::NativeFailure));
+            s.events.extend([
+                Ok(Some(vec![6])),
+                Ok(Some(vec![10])),
+                Ok(Some(vec![12])),
+                Err(IccError::EventOverflow),
+                Ok(Some(ptp_event(0xC201, &[1]))),
+            ]);
+            s.fresh.push_back(Ok(Some(ptp_event(0xC202, &[2]))));
         },
         |handle| {
             block(async move {
                 let mut s = session(handle);
-                let slow = tokio::time::timeout(Duration::from_millis(50), s.open()).await;
-                assert!(slow.is_err());
-                entered_rx.recv_timeout(HOLD_LIMIT).expect("open started");
-                let closed = settle_after(
-                    Err(icc(IccError::Busy)),
-                    || release_tx.send(()).expect("release"),
-                    async || s.close().await,
-                )
-                .await;
-                (closed, s.open().await)
+                s.open().await.unwrap();
+                let first = s.poll_event_within(Duration::ZERO).await;
+                (first, s.is_open())
             })
         },
     );
-    // The failed native open produced no lease: closing is trivially done and no close ran.
-    assert_eq!(out.0, Ok(()));
-    assert_eq!(out.1, Ok(()));
-    assert!(!calls(&shared).contains(&Call::Close));
+    // Only the event that arrived after the open is delivered, and the session is healthy.
+    assert_eq!(
+        out,
+        (
+            Ok(Some(Event {
+                code: 0xC202,
+                transaction_id: 0,
+                params: vec![2]
+            })),
+            true
+        )
+    );
+    assert!(script(&shared).events.is_empty());
+}
+
+#[test]
+fn the_stale_drain_stops_at_a_dead_queue_and_is_bounded() {
+    // A disconnected queue ends the drain at once.
+    let (out, shared) = run(
+        |s| s.events.push_back(Err(IccError::Disconnected)),
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                s.open().await.map(|()| s.is_open())
+            })
+        },
+    );
+    assert_eq!(out, Ok(true));
+    assert_eq!(
+        calls(&shared).iter().filter(|c| **c == Call::Event).count(),
+        1
+    );
+    // A flood larger than the native queue is cut off after MAX_STALE polls, not drained forever.
+    let ((), shared) = run(
+        |s| s.events.extend((0..200).map(|_| Ok(Some(vec![1])))),
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                s.open().await.unwrap();
+            });
+        },
+    );
+    assert_eq!(
+        calls(&shared).iter().filter(|c| **c == Call::Event).count(),
+        66
+    );
 }
 
 // ---- end to end --------------------------------------------------------------------------
@@ -1219,7 +1307,7 @@ fn simulated_camera_refusals_and_faults_surface_as_the_right_categories() {
 
 fn sample(setup: impl FnOnce(&mut Script), cycles: usize) -> (super::Receipt, Shared) {
     run(setup, move |handle| {
-        block(async move { read_only_sample(handle, &id(), cycles).await })
+        block(async move { read_only_sample(handle, &Selector::Exact(id()), cycles).await })
     })
 }
 
@@ -1346,6 +1434,59 @@ fn the_sample_stops_at_the_first_failure_and_still_closes() {
     assert_eq!(close_failed.confirmed_closes, 0);
     assert_eq!(close_failed.response_codes, [0x2001]);
     assert!(!close_failed.passed(1));
+}
+
+fn sole(setup: impl FnOnce(&mut Script)) -> (super::Receipt, Shared) {
+    run(setup, |handle| {
+        block(async move { read_only_sample(handle, &Selector::SoleCandidate, 1).await })
+    })
+}
+
+#[test]
+fn the_sole_candidate_mode_picks_exactly_one_and_never_guesses() {
+    let other = || IccDeviceId::new("synthetic-other".into()).expect("valid");
+
+    let (none, shared) = sole(|s| s.discover.push_back(Ok(Vec::new())));
+    assert_eq!(
+        (none.candidates, none.failure),
+        (0, Some(IccError::NotFound.into()))
+    );
+    assert!(!calls(&shared).contains(&Call::Open));
+
+    let (many, shared) = sole(|s| s.discover.push_back(Ok(vec![id(), other()])));
+    assert_eq!(
+        (many.candidates, many.failure.clone()),
+        (2, Some(IccError::Ambiguous.into()))
+    );
+    // Two cameras are never resolved by taking the first: nothing was opened.
+    assert!(!calls(&shared).contains(&Call::Open));
+    let mut out = Vec::new();
+    many.write_to(&mut out).expect("write");
+    let line = String::from_utf8(out).expect("utf8");
+    assert!(line.starts_with("candidates=2 cycles=0 "), "{line}");
+    assert!(line.ends_with("result=failed category=discovery\n"));
+    assert!(!line.contains("synthetic"));
+
+    let (one, shared) = sole(|s| {
+        s.discover.push_back(Ok(vec![other()]));
+        s.transact.push_back(done(Ok(reply(0x2001, &[], &[1]))));
+    });
+    assert!(one.passed(1), "{one:?}");
+    assert_eq!(one.candidates, 1);
+    assert!(calls(&shared).contains(&Call::Open));
+
+    // Exact mode still insists on its identifier among several candidates.
+    let (exact, _) = sample(
+        |s| {
+            s.discover.push_back(Ok(vec![other(), id()]));
+            s.transact.push_back(done(Ok(reply(0x2001, &[], &[1]))));
+        },
+        1,
+    );
+    assert!(exact.passed(1));
+    assert_eq!(exact.candidates, 2);
+    let (wrong, _) = sample(|s| s.discover.push_back(Ok(vec![other()])), 1);
+    assert_eq!(wrong.failure, Some(IccError::NotFound.into()));
 }
 
 #[test]

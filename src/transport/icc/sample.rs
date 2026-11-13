@@ -6,7 +6,8 @@
 //! payload byte, so it is safe to paste into shared logs.
 //!
 //! Running it against a real camera is a hardware action reserved to the hardware owner; see
-//! `examples/icc_sample.rs`, which refuses to start native code without an explicit flag.
+//! `examples/icc_sample.rs`, which refuses to start native code without an explicit flag. The
+//! camera is picked by exact identifier or as the sole discovery candidate ([`Selector`]).
 //!
 //! References:
 //! - `docs/macos-camera.md`, Evidence and validation
@@ -102,6 +103,31 @@ impl Receipt {
     }
 }
 
+/// How the sample picks its one camera. It never picks "the first of several".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selector {
+    /// Exactly this identifier, which discovery must return exactly once.
+    Exact(IccDeviceId),
+    /// Whatever camera discovery returns, but only if it returns exactly one. Lets the hardware
+    /// owner run without ever handling the identifier.
+    SoleCandidate,
+}
+
+impl Selector {
+    /// Choose from `found`: [`IccError::NotFound`] for none, [`IccError::Ambiguous`] for several.
+    fn choose(&self, found: &[IccDeviceId]) -> Result<IccDeviceId, IccError> {
+        let matching: Vec<&IccDeviceId> = match self {
+            Self::Exact(wanted) => found.iter().filter(|id| *id == wanted).collect(),
+            Self::SoleCandidate => found.iter().collect(),
+        };
+        match matching.as_slice() {
+            [] => Err(IccError::NotFound),
+            [only] => Ok((*only).clone()),
+            _ => Err(IccError::Ambiguous),
+        }
+    }
+}
+
 /// One open, `GetDeviceInfo`, confirmed close cycle. Returns the handle for the next one.
 async fn cycle(
     handle: IccHandle, selector: &IccDeviceId, receipt: &mut Receipt,
@@ -134,12 +160,12 @@ async fn cycle(
     Ok(session.into_handle())
 }
 
-/// Run `cycles` read-only cycles on the camera named exactly by `selector`.
+/// Run `cycles` read-only cycles on the one camera `selector` picks from discovery.
 ///
-/// Discovery must find that identifier exactly once. The first failure ends the sample, and
-/// the receipt records it.
+/// The first failure ends the sample, and the receipt records it, including the candidate count
+/// when selection fails.
 pub async fn read_only_sample(
-    mut handle: IccHandle, selector: &IccDeviceId, cycles: usize,
+    mut handle: IccHandle, selector: &Selector, cycles: usize,
 ) -> Receipt {
     let mut receipt = Receipt::default();
     let found = match handle
@@ -153,17 +179,15 @@ pub async fn read_only_sample(
         }
     };
     receipt.candidates = found.len();
-    let error = match found.iter().filter(|id| *id == selector).count() {
-        0 => Some(IccError::NotFound),
-        1 => None,
-        _ => Some(IccError::Ambiguous),
+    let device = match selector.choose(&found) {
+        Ok(device) => device,
+        Err(error) => {
+            receipt.failure = Some(error.into());
+            return receipt;
+        }
     };
-    if let Some(error) = error {
-        receipt.failure = Some(error.into());
-        return receipt;
-    }
     for _ in 0..cycles {
-        match cycle(handle, selector, &mut receipt).await {
+        match cycle(handle, &device, &mut receipt).await {
             Ok(next) => handle = next,
             Err(error) => {
                 receipt.failure = Some(error);

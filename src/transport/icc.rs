@@ -45,5 +45,5 @@ pub use error::{Effect, IccError};
 pub use event::{Notice, classify};
 #[cfg(target_os = "macos")]
 pub use native::run;
-pub use sample::{Receipt, SampleError, read_only_sample};
+pub use sample::{Receipt, SampleError, Selector, read_only_sample};
 pub use session::IccSession;
