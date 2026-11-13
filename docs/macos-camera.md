@@ -45,7 +45,7 @@ Session semantics, all following from "ICC owns the pipes":
   `IccError::DeadlineExceeded` means native work continues. After a deadline the session is *retired*:
   it refuses work, never issues a second close, and a replacement `open` returns `IccError::Busy`
   until the native owner has settled cleanup. A cancelled `open` future leaves the session `Opening`:
-  the owner may still complete it, so `close` (not a second `open`) confirms closure if a lease exists. If none does, nothing was confirmed: `close` reports `IccError::NotOpen` and the session is retired. `close` on a retired session is `NotOpen` too (terminal; a retry cannot help), and only `open` probes for reuse, which stays `Busy` until native cleanup settles. A late open success is closed natively after it completes
+  the owner may still complete it, so `close` (not a second `open`) confirms closure if a lease exists. If none does, nothing was confirmed: `close` reports `IccError::NotOpen` and the session is retired. `close` on a retired session is `NotOpen` too (terminal; a retry cannot help), and only `open` probes for reuse, which stays `Busy` until native cleanup settles. A late open success is closed natively after it completes.
 - Failure categories are sanitized statics: permission, busy, removal, admission, deadline, malformed
   completion, event overflow, malformed event, cleanup failure, quarantine
 - Failures fault, retire or quarantine the session. A faulted session refuses transactions but `close`
@@ -55,8 +55,10 @@ Session semantics, all following from "ICC owns the pipes":
   When a session opens, everything queued before it (stale PTP events, a previous native error or access
   restriction, the overflow flag) is discarded so it cannot fault or feed the new session. Removal is not
   lost by this: the native owner keeps a sticky, process-lifetime removal flag that quarantines
-  independently of the queue (`driver.rs` `disconnected`). The Sony handshake re-reads the property table
-  after open, so events lost in the instant between open completion and the discard are resynchronized.
+  independently of the queue (`driver.rs` `disconnected`): the next transaction, close or open reports it,
+  but a consumer that only polls events will not see a removal discarded here until then. Events that
+  arrive in the instant between open completion and the discard are lost too, so the guarantee is
+  conditional on the caller resynchronizing after open; the Sony handshake re-reads the property table.
   Afterwards `poll_event` fails closed. Overflow, access restriction, a native error observation, an
   oversized event and any malformed, truncated or oversized PTP event fault the session, so the Sony
   layer must close and reconnect to resynchronize. Removal quarantines it. Only benign observations are skipped
@@ -81,7 +83,10 @@ wait forever if the framework never calls back. There is no bounded-shutdown gua
 cargo build --release --features macos-icc --example icc_sample
 # default path does nothing native:
 target/release/examples/icc_sample
-# hardware owner only; the exact device identifier stays in the environment:
+# hardware owner only. Either select the camera only if discovery finds exactly one, so the identifier
+# is never handled (zero or several candidates fail with exit 1 and counts only, never "the first"):
+target/release/examples/icc_sample --hardware-admitted --sole-candidate
+# or name it exactly; the identifier stays in the environment (mutually exclusive with --sole-candidate):
 TETHERCAM_ICC_DEVICE_ID=<exact identifier> target/release/examples/icc_sample --hardware-admitted
 ```
 

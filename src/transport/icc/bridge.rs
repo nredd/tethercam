@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
+use super::boundary::EVENT_QUEUE;
 use super::{Boundary, IccDeviceId, IccError, IccReply, IccTimeout, Lease};
 
 type Reply<T> = oneshot::Sender<Result<T, IccError>>;
@@ -235,8 +236,9 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
     }
 }
 
-/// Most stale events discarded per open: the native queue holds 64, plus its overflow flag.
-const MAX_STALE: usize = 66;
+/// Most polls per open drain: a full native queue, one poll that clears the overflow flag and one
+/// that finds the queue empty.
+const MAX_STALE: usize = EVENT_QUEUE + 2;
 
 /// Discard what the boundary's one process-wide event queue held before this session opened:
 /// stale PTP events, a predecessor's native error or access restriction, and the sticky overflow

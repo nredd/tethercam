@@ -26,6 +26,8 @@ pub const MAX_ID_BYTES: usize = 1024;
 pub const MAX_DATA_BYTES: usize = 16 * 1024 * 1024;
 /// Longest admission or wait.
 pub const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Depth of the native advisory event queue.
+pub(super) const EVENT_QUEUE: usize = 64;
 /// Latest a request may still enter native code, unless the caller's wait is shorter.
 pub(super) const ADMISSION: Duration = Duration::from_secs(5);
 /// Default caller wait.

@@ -11,6 +11,7 @@
 //!   an oversized event and any malformed event fail closed and fault the session, so the Sony
 //!   layer must close and reconnect to resynchronize. Removal quarantines it. Events queued
 //!   before a session opened are discarded when it opens, so it never sees a predecessor's
+//!   history.
 //!
 //! Lifecycle: `Closed -> Opening -> Open -> Closed`, with the failure states
 //! - `Opening`: an `open` is pending or was cancelled, so the owner may still complete it and
@@ -33,7 +34,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::boundary::ADMISSION;
+use super::boundary::{ADMISSION, EVENT_QUEUE};
 use super::event::{Notice, classify};
 use super::{
     Effect, IccDeviceId, IccError, IccHandle, IccReply, IccTimeout, MAX_DATA_BYTES, MAX_WAIT,
@@ -44,7 +45,7 @@ use crate::ptp::{ContainerError, MAX_PARAMS};
 /// Pause between polls of an empty event queue.
 const POLL_STEP: Duration = Duration::from_millis(10);
 /// Advisory events skipped per poll, the size of the native queue.
-const MAX_ADVISORY: usize = 64;
+const MAX_ADVISORY: usize = EVENT_QUEUE;
 
 /// Where the session is in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

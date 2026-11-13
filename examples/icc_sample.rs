@@ -43,7 +43,7 @@ enum Error {
     )]
     Usage,
     #[error("{DEVICE_ENV} is missing or not a valid exact identifier")]
-    Selector,
+    Identifier,
     #[error("the native runtime failed: {0}")]
     Native(IccError),
     #[cfg(target_os = "macos")]
@@ -89,10 +89,10 @@ fn parse(
     }
     let device = device
         .and_then(|value| value.into_string().ok())
-        .ok_or(Error::Selector)?;
+        .ok_or(Error::Identifier)?;
     IccDeviceId::new(device)
         .map(|id| Mode::Run(Selector::Exact(id)))
-        .map_err(|_| Error::Selector)
+        .map_err(|_| Error::Identifier)
 }
 
 #[cfg(target_os = "macos")]
@@ -182,7 +182,7 @@ mod tests {
         for device in [None, Some(os("")), Some(os("a\0b"))] {
             assert!(matches!(
                 parse([os(ADMISSION_FLAG)], device),
-                Err(Error::Selector)
+                Err(Error::Identifier)
             ));
         }
     }
