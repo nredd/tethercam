@@ -1,5 +1,8 @@
 //! Camera session ownership, reconnect and serialized snapshot requests.
 //!
+//! A snapshot is the newest live-view JPEG by default: no shutter, no card write. An opt-in
+//! mode captures and downloads a full-resolution still instead.
+//!
 //! References:
 //! - `docs/architecture.md`, Sony driver contract
 
@@ -82,6 +85,10 @@ pub enum SupervisorError {
     FrameInterval,
 }
 
+/// Oldest live-view frame a snapshot may serve without fetching a fresh one. Streaming refreshes
+/// the slot every frame interval (at most one second), so this only lapses while nobody streams.
+const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
+
 type SnapshotReply = blocking::SyncSender<Result<Vec<u8>, SnapshotError>>;
 
 /// Handles shared with the network and media tasks. Debug never exposes image bytes.
@@ -127,6 +134,10 @@ impl SnapshotSource for Control {
 
 impl Control {
     fn request_snapshot(&self, timeout: Duration) -> Result<Vec<u8>, SnapshotError> {
+        // The slot is empty exactly while no camera session is serving; fail now, not in 360 s.
+        if self.frames.borrow().is_none() {
+            return Err(SnapshotError);
+        }
         let (tx, rx) = blocking::sync_channel(1);
         self.snapshots.try_send(tx).map_err(|_| SnapshotError)?;
         // This is only a caller reply budget, not a camera deadline. Expiry abandons the
@@ -151,6 +162,7 @@ pub struct Supervisor<F: CameraFactory> {
     session: SessionConfig,
     clock: fn() -> Instant,
     frame_interval: Duration,
+    still_snapshots: bool,
     demand: watch::Receiver<[u64; 2]>,
     snapshots: mpsc::Receiver<SnapshotReply>,
     frames: watch::Sender<Option<Arc<[u8]>>>,
@@ -181,6 +193,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 session,
                 clock: Instant::now,
                 frame_interval,
+                still_snapshots: false,
                 demand: demand_rx,
                 snapshots: snapshots_rx,
                 frames,
@@ -204,11 +217,31 @@ impl<F: CameraFactory> Supervisor<F> {
         self
     }
 
+    /// Serve snapshots as full-resolution stills (shutter release, card write, live view paused
+    /// for the download) instead of the newest live-view frame. A still that fails without
+    /// leaving the shutter pressed (unsupported, or no image in time) is answered with an
+    /// error and leaves the session up; any other still failure ends the session.
+    #[must_use]
+    pub fn with_still_snapshots(mut self, enabled: bool) -> Self {
+        self.still_snapshots = enabled;
+        self
+    }
+
+    /// Fail queued snapshots; their requester saw a live camera that is now gone or stopping.
+    fn reject_snapshots(&mut self) {
+        while let Ok(reply) = self.snapshots.try_recv() {
+            let _ = reply.send(Err(SnapshotError));
+        }
+    }
+
     /// Wait for a camera and reconnect with capped exponential backoff until shutdown.
     /// Camera operations are deliberately outside `select!`: no in-flight PTP future is dropped.
     pub async fn run(mut self) -> F {
         let mut delay = Duration::from_millis(100);
         while !*self.stop.borrow() && self.stop.has_changed().is_ok() {
+            // A request that passed `Control::snapshot`'s slot check just before the last
+            // session's slot was cleared lands here, after that session's rejection.
+            self.reject_snapshots();
             let connected = self.factory.connect().await;
             if let Err(error) = &connected {
                 tracing::warn!(event = "camera_open_failed", reason = %error);
@@ -244,6 +277,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 self.factory.release(camera);
             }
             self.frames.send_replace(None);
+            self.reject_snapshots();
             self.status.send_replace(CameraStatus::Disconnected);
             if *self.stop.borrow() {
                 break;
@@ -255,9 +289,7 @@ impl<F: CameraFactory> Supervisor<F> {
             delay = (delay * 2).min(Duration::from_secs(5));
         }
         self.snapshots.close();
-        while let Ok(reply) = self.snapshots.try_recv() {
-            let _ = reply.send(Err(SnapshotError));
-        }
+        self.reject_snapshots();
         self.status.send_replace(CameraStatus::Stopped);
         self.factory
     }
@@ -266,6 +298,7 @@ impl<F: CameraFactory> Supervisor<F> {
         &mut self, camera: &mut SonyCamera<'_, F::Session>,
     ) -> Result<(), SonyError> {
         let mut next_frame = tokio::time::Instant::now();
+        let mut last_frame = next_frame;
         let mut telemetry = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if *self.stop.borrow() {
@@ -277,18 +310,25 @@ impl<F: CameraFactory> Supervisor<F> {
                 _ = self.stop.changed() => return Ok(()),
                 reply = self.snapshots.recv() => {
                     let Some(reply) = reply else { return Ok(()); };
-                    match camera.capture_still().await {
-                        Ok(image) => { let _ = reply.send(snapshot_image(image)); },
-                        Err(error) => {
+                    if self.still_snapshots {
+                        let outcome = Self::still(camera).await;
+                        let outcome = outcome.inspect_err(|_| {
                             let _ = reply.send(Err(SnapshotError));
-                            return Err(error);
-                        },
+                        })?;
+                        let _ = reply.send(outcome);
+                    } else if last_frame.elapsed() <= SNAPSHOT_MAX_AGE {
+                        let _ = reply.send(self.latest_frame());
+                    } else {
+                        let refreshed = self.refresh(camera, &mut last_frame).await;
+                        refreshed.inspect_err(|_| {
+                            let _ = reply.send(Err(SnapshotError));
+                        })?;
+                        let _ = reply.send(self.latest_frame());
                     }
                 },
                 _ = self.demand.changed() => {},
                 () = tokio::time::sleep_until(next_frame), if active => {
-                    let frame = camera.next_live_view_frame().await?;
-                    self.frames.send_replace(Some(Arc::from(frame)));
+                    self.refresh(camera, &mut last_frame).await?;
                     next_frame = tokio::time::Instant::now() + self.frame_interval;
                 },
                 () = tokio::time::sleep_until(telemetry) => {
@@ -298,6 +338,40 @@ impl<F: CameraFactory> Supervisor<F> {
                     telemetry = tokio::time::Instant::now() + Duration::from_secs(5);
                 },
             }
+        }
+    }
+
+    /// Fetch one live-view frame into the slot and note when.
+    async fn refresh(
+        &self, camera: &mut SonyCamera<'_, F::Session>, last_frame: &mut tokio::time::Instant,
+    ) -> Result<(), SonyError> {
+        let frame = camera.next_live_view_frame().await?;
+        self.frames.send_replace(Some(Arc::from(frame)));
+        *last_frame = tokio::time::Instant::now();
+        Ok(())
+    }
+
+    fn latest_frame(&self) -> Result<Vec<u8>, SnapshotError> {
+        let slot = self.frames.borrow();
+        slot.as_deref().map(<[u8]>::to_vec).ok_or(SnapshotError)
+    }
+
+    /// Capture one still. Only failures that provably left the shutter released keep the
+    /// session: no remote capture support (nothing was pressed) and no image before the wait
+    /// budget (the release already succeeded, e.g. an AF miss). The driver only *attempts* both
+    /// releases, and `release_shutter` can fail with a healthy link, so every other error (a
+    /// press or release failure, a transport or download error) ends the session and its close
+    /// cleans up. A RAW or malformed object after a clean capture is refused for that request.
+    async fn still(
+        camera: &mut SonyCamera<'_, F::Session>,
+    ) -> Result<Result<Vec<u8>, SnapshotError>, SonyError> {
+        match camera.capture_still().await {
+            Ok(image) => Ok(snapshot_image(image)),
+            Err(SonyError::CaptureUnsupported | SonyError::CaptureTimeout { .. }) => {
+                tracing::warn!(event = "snapshot_still_failed");
+                Ok(Err(SnapshotError))
+            }
+            Err(error) => Err(error),
         }
     }
 }

@@ -265,7 +265,12 @@ mod suite {
         mjpeg.play(&jpeg_uri).await.unwrap();
         inspect_h264(cfg, &main.frame(96).await.unwrap());
         inspect_jpeg(live, &mjpeg.frame(26).await.unwrap());
-        snapshot(cfg, still).await;
+        let expected = if cfg.streams.full_resolution_snapshot {
+            still
+        } else {
+            live
+        };
+        snapshot(cfg, expected).await;
         timeout(WAIT, async {
             while released.lock().unwrap().is_empty() {
                 let _ = main.frame(96).await.unwrap();
@@ -278,7 +283,17 @@ mod suite {
 
     #[tokio::test]
     async fn both_authenticated_mounts_snapshot_reconnect_and_close() {
-        let cfg = cfg();
+        scenario(false).await;
+    }
+
+    #[tokio::test]
+    async fn opt_in_full_resolution_snapshots_serve_the_still() {
+        scenario(true).await;
+    }
+
+    async fn scenario(full_resolution: bool) {
+        let mut cfg = cfg();
+        cfg.streams.full_resolution_snapshot = full_resolution;
         let live = jpeg(64, 48);
         let still = jpeg(128, 96);
         let sim = SonySimConfig {

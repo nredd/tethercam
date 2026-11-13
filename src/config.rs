@@ -115,6 +115,10 @@ pub struct Streams {
     pub h264: bool,
     /// Enable the JPEG stream.
     pub mjpeg: bool,
+    /// Serve ONVIF snapshots as full-resolution stills instead of the newest live-view frame.
+    /// Each snapshot releases the shutter and writes to the card; off by default.
+    #[serde(default)]
+    pub full_resolution_snapshot: bool,
 }
 
 /// Complete validated configuration.
@@ -193,6 +197,7 @@ impl Config {
                 bitrate: 2_000_000,
                 h264: true,
                 mjpeg: true,
+                full_resolution_snapshot: false,
             },
             credentials: Credentials {
                 username: Secret::new(random_hex(16, fill)?),
