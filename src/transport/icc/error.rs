@@ -79,7 +79,8 @@ pub enum IccError {
     /// never forwarded.
     #[error("raw session operations are not permitted")]
     RawSessionOperation,
-    /// There is no open native session.
+    /// There is no open native session: none was opened, or the native owner is already
+    /// closing it, which it reports to a command as busy.
     #[error("no open native session")]
     NotOpen,
     /// The bridge or native owner ended.
@@ -121,7 +122,7 @@ impl IccError {
     /// retired or unresolved, and only the native owner can settle it.
     #[must_use]
     pub const fn retires_lease(self) -> bool {
-        matches!(self.effect(), Effect::Retire | Effect::Quarantine) || matches!(self, Self::Busy)
+        matches!(self.effect(), Effect::Retire | Effect::Quarantine)
     }
 }
 
@@ -173,7 +174,6 @@ mod tests {
         assert_eq!(
             retiring,
             [
-                IccError::Busy,
                 IccError::Removed,
                 IccError::DeadlineExceeded,
                 IccError::CleanupFailure,

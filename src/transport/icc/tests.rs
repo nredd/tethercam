@@ -86,6 +86,10 @@ fn ptp_event(code: u16, params: &[u32]) -> Vec<u8> {
     wire
 }
 
+/// Upper bound on 1 ms polls while abandoned native work finishes; a regression fails the test
+/// after ten seconds instead of hanging it.
+const SETTLE_ATTEMPTS: usize = 10_000;
+
 fn calls(shared: &Shared) -> Vec<Call> {
     script(shared).calls.clone()
 }
@@ -253,12 +257,14 @@ fn a_cancelled_caller_neither_backlogs_nor_overlaps_native_work() {
                     handle.close(t()).await,
                 );
                 release_tx.send(()).expect("release");
-                let settled = loop {
-                    match handle.transact(0x1001, vec![], vec![], t()).await {
-                        Err(IccError::Busy) => std::thread::sleep(Duration::from_millis(1)),
-                        other => break other,
+                let mut settled = Err(IccError::Busy);
+                for _ in 0..SETTLE_ATTEMPTS {
+                    settled = handle.transact(0x1001, vec![], vec![], t()).await;
+                    if settled != Err(IccError::Busy) {
+                        break;
                     }
-                };
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 // The lease survived the abandoned call, and exactly one op ran per request.
                 (during, settled)
             })
@@ -305,6 +311,51 @@ fn a_panicking_user_is_reported_not_propagated() {
         std::panic::resume_unwind(Box::new("synthetic"))
     });
     assert_eq!(result, Err(IccError::Runtime));
+}
+
+#[test]
+fn an_owner_that_dies_while_a_caller_is_gone_still_reports_disconnect() {
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (fake, shared) = Fake::new();
+    script(&shared).transact.push_back(Step::Die {
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let seen = std::sync::Mutex::new(None);
+    let seen_ref = &seen;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_with(fake, move |mut handle| {
+            let after = block(async {
+                handle.open(id(), t()).await.unwrap();
+                let slow = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    handle.transact(0x1001, vec![], vec![], t()),
+                )
+                .await;
+                assert!(slow.is_err(), "the caller stopped waiting");
+                entered_rx.recv().expect("native work started");
+                release_tx.send(()).expect("release");
+                // Nobody is waiting for the answer the dead owner never gives, so the gate
+                // alone must not strand the handle: the owner's end releases it.
+                let mut after = Err(IccError::Busy);
+                for _ in 0..SETTLE_ATTEMPTS {
+                    after = handle.poll_event().await;
+                    if after != Err(IccError::Busy) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                after
+            });
+            *seen_ref.lock().expect("seen") = Some(after);
+        })
+    }));
+    assert!(result.is_err(), "the owner's panic propagates");
+    assert_eq!(
+        *seen.lock().expect("seen"),
+        Some(Err(IccError::Disconnected))
+    );
 }
 
 // ---- session -----------------------------------------------------------------------------
@@ -573,6 +624,35 @@ fn a_command_deadline_retires_the_lease_and_reuse_waits_for_native_cleanup() {
 }
 
 #[test]
+fn a_native_busy_means_the_session_is_closing_and_retires_it() {
+    let (out, _) = run(
+        |s| {
+            s.transact.push_back(done(Err(IccError::Busy)));
+            s.close.push_back(Err(IccError::Busy));
+        },
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                s.open().await.unwrap();
+                let busy = s.transaction(0x1009, &[], None).await.map(|_| ());
+                let retired = (s.is_open(), s.close().await);
+                // A second session whose close is refused as busy by the native lease.
+                let handle = s.into_handle();
+                let mut s = session(handle);
+                s.open().await.unwrap();
+                let close = s.close().await;
+                (busy, retired, close, s.is_open())
+            })
+        },
+    );
+    // The transaction's busy is reported as not open and retires the session at once.
+    assert_eq!(out.0, Err(icc(IccError::NotOpen)));
+    assert_eq!(out.1, (false, Err(icc(IccError::Busy))));
+    assert_eq!(out.2, Err(icc(IccError::NotOpen)));
+    assert!(!out.3);
+}
+
+#[test]
 fn quarantine_is_terminal_and_submits_nothing_more() {
     let (out, shared) = run(
         |s| s.transact.push_back(done(Err(IccError::Quarantined))),
@@ -731,14 +811,15 @@ fn a_gate_busy_close_can_be_retried_once_the_abandoned_work_settles() {
                 entered_rx.recv().expect("started");
                 let busy = s.close().await;
                 release_tx.send(()).expect("release");
-                loop {
-                    match s.close().await {
-                        Err(SessionError::Icc(IccError::Busy)) => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        other => return (busy, other),
+                let mut closed = Err(icc(IccError::Busy));
+                for _ in 0..SETTLE_ATTEMPTS {
+                    closed = s.close().await;
+                    if closed != Err(icc(IccError::Busy)) {
+                        break;
                     }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
+                (busy, closed)
             })
         },
     );

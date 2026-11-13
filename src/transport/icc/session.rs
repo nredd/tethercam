@@ -25,6 +25,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::boundary::ADMISSION;
 use super::event::{Notice, classify};
 use super::{
     Effect, IccDeviceId, IccError, IccHandle, IccReply, IccTimeout, MAX_DATA_BYTES, MAX_WAIT,
@@ -32,8 +33,6 @@ use super::{
 use crate::ptp::session::{Event, Outcome, PtpSession, SessionConfig, SessionError, code};
 use crate::ptp::{ContainerError, MAX_PARAMS};
 
-/// Latest a command may still enter native code.
-const ADMISSION: Duration = Duration::from_secs(5);
 /// Pause between polls of an empty event queue.
 const POLL_STEP: Duration = Duration::from_millis(10);
 /// Advisory events skipped per poll, the size of the native queue.

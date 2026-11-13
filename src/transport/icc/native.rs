@@ -42,10 +42,10 @@ fn map_error(error: Error) -> IccError {
     }
 }
 
-fn timeout(timeout: IccTimeout) -> Timeout {
+fn native_timeout(limit: IccTimeout) -> Timeout {
     Timeout {
-        admission: timeout.admission(),
-        wait: timeout.wait(),
+        admission: limit.admission(),
+        wait: limit.wait(),
     }
 }
 
@@ -84,12 +84,14 @@ impl Lease for NativeLease<'_> {
     fn transact(
         &mut self, operation: u16, params: &[u32], outgoing: Vec<u8>, wait: IccTimeout,
     ) -> Result<IccReply, IccError> {
-        let result = self.0.transact(operation, params, outgoing, timeout(wait));
+        let result = self
+            .0
+            .transact(operation, params, outgoing, native_timeout(wait));
         result.map(reply).map_err(map_error)
     }
 
     fn close(self, wait: IccTimeout) -> Result<(), IccError> {
-        self.0.close(timeout(wait)).map_err(map_error)
+        self.0.close(native_timeout(wait)).map_err(map_error)
     }
 
     fn poll_event(&mut self) -> Result<Option<Vec<u8>>, IccError> {
@@ -103,13 +105,13 @@ impl Boundary for Client {
     fn discover(
         &mut self, window: Duration, wait: IccTimeout,
     ) -> Result<Vec<IccDeviceId>, IccError> {
-        let found = Client::discover(self, window, timeout(wait)).map_err(map_error)?;
+        let found = Client::discover(self, window, native_timeout(wait)).map_err(map_error)?;
         identifiers(&found)
     }
 
     fn open(&mut self, id: &IccDeviceId, wait: IccTimeout) -> Result<NativeLease<'_>, IccError> {
         let id = DeviceId::new(id.as_str().to_owned()).map_err(map_error)?;
-        Client::open(self, id, timeout(wait))
+        Client::open(self, id, native_timeout(wait))
             .map(NativeLease)
             .map_err(map_error)
     }
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn timeouts_replies_and_identifiers_convert_without_loss() {
         let wait = IccTimeout::new(Duration::from_secs(2), Duration::from_secs(9)).unwrap();
-        let native = timeout(wait);
+        let native = native_timeout(wait);
         assert_eq!(
             (native.admission, native.wait),
             (Duration::from_secs(2), Duration::from_secs(9))

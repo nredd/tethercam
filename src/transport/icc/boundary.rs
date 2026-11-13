@@ -26,6 +26,10 @@ pub const MAX_ID_BYTES: usize = 1024;
 pub const MAX_DATA_BYTES: usize = 16 * 1024 * 1024;
 /// Longest admission or wait.
 pub const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Latest a request may still enter native code, unless the caller's wait is shorter.
+pub(super) const ADMISSION: Duration = Duration::from_secs(5);
+/// Default caller wait.
+const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 
 /// An exact framework device identifier. It identifies a private device, so it is never
 /// printed: `Debug` is redacted and nothing here formats the value.
@@ -69,8 +73,8 @@ impl Default for IccTimeout {
     /// Five seconds to admission and thirty to the caller's wait.
     fn default() -> Self {
         Self {
-            admission: Duration::from_secs(5),
-            wait: Duration::from_secs(30),
+            admission: ADMISSION,
+            wait: DEFAULT_WAIT,
         }
     }
 }

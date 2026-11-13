@@ -33,6 +33,11 @@ pub(super) enum Step {
         release: Receiver<()>,
         result: Result<IccReply, IccError>,
     },
+    /// As `Hold`, but the native owner dies once released.
+    Die {
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    },
 }
 
 /// What the fake answers, in order. An exhausted queue answers success.
@@ -120,6 +125,11 @@ impl Lease for FakeLease<'_> {
                 entered.send(()).expect("test is listening");
                 release.recv().expect("test releases");
                 result
+            }
+            Some(Step::Die { entered, release }) => {
+                entered.send(()).expect("test is listening");
+                release.recv().expect("test releases");
+                std::panic::resume_unwind(Box::new("synthetic native owner failure"))
             }
         }
     }

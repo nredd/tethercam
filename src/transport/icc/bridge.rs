@@ -151,6 +151,14 @@ struct Inbox {
     busy: Arc<AtomicBool>,
 }
 
+impl Drop for Inbox {
+    /// An owner that ends, even by unwinding, must not leave the gate held: with it open the
+    /// caller's next send fails and reports a disconnect instead of waiting for an answer.
+    fn drop(&mut self) {
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
 impl Inbox {
     /// Release the gate first, so a caller that sees the reply may submit immediately.
     fn answer<T>(&self, reply: Reply<T>, result: Result<T, IccError>) {
@@ -175,6 +183,16 @@ fn channel() -> (IccHandle, Inbox) {
     )
 }
 
+/// A lease that answers a command or close as busy is closing natively and cannot be used
+/// again. That is "not open" for the caller, unlike the gate's own busy, which submitted nothing.
+fn lease_failure(error: IccError) -> IccError {
+    if error == IccError::Busy {
+        IccError::NotOpen
+    } else {
+        error
+    }
+}
+
 /// Serve requests while a lease is held. Returns whether the owner should keep serving.
 fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
     loop {
@@ -189,7 +207,9 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
                 timeout,
                 reply,
             } => {
-                let result = lease.transact(operation, &params, outgoing, timeout);
+                let result = lease
+                    .transact(operation, &params, outgoing, timeout)
+                    .map_err(lease_failure);
                 let retire = result.as_ref().is_err_and(|e| e.retires_lease());
                 inbox.answer(reply, result);
                 if retire {
@@ -197,7 +217,7 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
                 }
             }
             Request::Close { timeout, reply } => {
-                inbox.answer(reply, lease.close(timeout));
+                inbox.answer(reply, lease.close(timeout).map_err(lease_failure));
                 return true;
             }
             Request::Event { reply } => inbox.answer(reply, lease.poll_event()),

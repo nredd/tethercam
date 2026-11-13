@@ -19,6 +19,7 @@ Next release: `0.0.2`.
 
 ### Added
 
+- Add the experimental, off-by-default, macOS-only `macos-icc` feature: `transport::icc::IccSession` runs Sony over `ImageCaptureCore` via the pinned `image-capture` `=0.1.0` crate with single-flight native work, typed deadline/quarantine/event failure categories and a gated read-only `icc_sample` example. No runtime selects it and there is no production support claim
 - Protected-source, OIDC-only crates.io publishing with verified Cargo archives, staged immutable GitHub releases, release-tag integrity policy, and explicit owner bootstrap/recovery instructions
 - Off-by-default, importable `test-support` API with a generic USB/IP engine, Sony/SICDD and synthetic non-Sony personalities, fault/resource/deadline/re-import/cancellation verification and hosted native integration
 - Rust developer utilities for explicitly scoped VHCI provisioning, protected client inputs, bounded media-client termination with joined camera shutdown, source diagnostics/cadence and aggregate-only profiling; preserve default application install/run behavior
@@ -26,7 +27,6 @@ Next release: `0.0.2`.
 
 ### Changed
 
-- Add the experimental, off-by-default, macOS-only `macos-icc` feature: `transport::icc::IccSession` runs Sony over `ImageCaptureCore` via the pinned `image-capture` `=0.1.0` crate with single-flight native work, typed deadline/quarantine/event failure categories and a gated read-only `icc_sample` example. No runtime selects it and there is no production support claim
 - Generalize Sony execution over `PtpSession`; external `CameraFactory` implementations now supply and recover an associated session, and explicit `SonyCamera` type annotations use the session type instead of the transport type
 - Delegate SRC coverage enforcement/reporting to native `cargo-llvm-cov` zero-uncovered and fail-under-100 checks, including all source tests and optional verification/tooling code
 
