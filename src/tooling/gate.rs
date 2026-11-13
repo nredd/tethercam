@@ -25,6 +25,9 @@ fn escape(path: &Path) -> Result<String, Error> {
     Ok(escaped)
 }
 
+/// Filtered text report written when the native gate fails.
+const TEXT_REPORT: &str = "coverage/uncovered.txt";
+
 /// Only top-level non-source trees and toolchain sources are outside the SRC contract.
 /// Standard-library sources live under `/rustc/<hash>/` unless the toolchain ships `rust-src`,
 /// in which case rustc maps them into the sysroot, so both locations are excluded.
@@ -88,8 +91,6 @@ fn text_arguments(ignore: &str) -> Vec<OsString> {
     .to_vec()
 }
 
-const TEXT_REPORT: &str = "coverage/uncovered.txt";
-
 /// The compiler that instrumented the tests. Region accounting changes between rustc releases.
 struct Toolchain {
     release: String,
@@ -101,17 +102,21 @@ fn rustc_output(rustc: &OsString, args: [&str; 2]) -> Result<String, Error> {
     if !output.status.success() {
         return Err(Error::Invalid("cannot query the Rust toolchain"));
     }
-    String::from_utf8(output.stdout).map_err(|_| Error::Invalid("non-UTF-8 Rust toolchain output"))
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| Error::Invalid("non-UTF-8 Rust toolchain output"))?;
+    let text = text.trim_end();
+    if text.is_empty() {
+        return Err(Error::Invalid("empty Rust toolchain output"));
+    }
+    Ok(text.to_owned())
 }
 
 fn toolchain(rustc: &OsString) -> Result<Toolchain, Error> {
     let version = rustc_output(rustc, ["--version", "--verbose"])?;
     let release = version.lines().next().unwrap_or_default().to_owned();
-    let sysroot = rustc_output(rustc, ["--print", "sysroot"])?;
-    Ok(Toolchain {
-        release,
-        sysroot: PathBuf::from(sysroot.trim_end()).canonicalize()?,
-    })
+    // Not canonicalized: llvm-cov matches the path strings rustc itself recorded.
+    let sysroot = PathBuf::from(rustc_output(rustc, ["--print", "sysroot"])?);
+    Ok(Toolchain { release, sysroot })
 }
 
 fn local(ci_present: bool, vhci: bool) -> bool {
@@ -140,6 +145,10 @@ fn invoke(
     }
     writeln!(out, "TOOLCHAIN: {}", toolchain.release)?;
     std::fs::create_dir_all(root.join("coverage"))?;
+    match std::fs::remove_file(root.join(TEXT_REPORT)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        _ => {}
+    }
     let ignore = ignore(root, cargo_home, &toolchain.sysroot, local)?;
     let status = Command::new(cargo)
         .args(arguments(&ignore))
@@ -213,7 +222,9 @@ mod tests {
     }
 
     /// Accepts this many complete lines, then fails.
+    #[cfg(unix)]
     struct FailAfterLines(usize);
+    #[cfg(unix)]
     impl Write for FailAfterLines {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if self.0 == 0 {
@@ -298,7 +309,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn toolchain_reports_release_and_canonical_sysroot_or_fails() {
+    fn toolchain_reports_release_and_sysroot_or_fails() {
         let temp = tempfile::tempdir().expect("temp");
         let sysroot = temp.path().canonicalize().expect("canonical");
         let rustc = script(
@@ -312,6 +323,18 @@ mod tests {
         let found = toolchain(&rustc).expect("toolchain");
         assert_eq!(found.release, "rustc 1.2.3 (synthetic)");
         assert_eq!(found.sysroot, sysroot);
+        // Symlinked sysroots are reported as rustc spells them.
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&sysroot, &link).expect("symlink");
+        let linked = script(
+            temp.path(),
+            "linked",
+            &format!(
+                "case \"$1\" in --print) echo '{}';; *) echo 'rustc 1.2.3';; esac",
+                link.display()
+            ),
+        );
+        assert_eq!(toolchain(&linked).expect("linked").sysroot, link);
         let invalid = script(temp.path(), "invalid", "printf '\\377'");
         assert!(toolchain(&invalid).is_err());
         let no_sysroot = script(
@@ -322,7 +345,7 @@ mod tests {
         assert!(toolchain(&no_sysroot).is_err());
         assert!(toolchain(&"/usr/bin/false".into()).is_err());
         assert!(toolchain(&"/missing-fixture".into()).is_err());
-        // An empty sysroot cannot be canonicalized.
+        // Silent output is not a toolchain.
         assert!(toolchain(&"/usr/bin/true".into()).is_err());
     }
 
@@ -473,5 +496,31 @@ mod tests {
             .is_err()
         );
         std::fs::remove_file(temp.path().join("coverage")).expect("remove file");
+        // A stale report is replaced; one that cannot be removed fails before native work.
+        std::fs::create_dir_all(temp.path().join(TEXT_REPORT)).expect("report directory");
+        std::fs::write(temp.path().join(TEXT_REPORT).join("keep"), b"x").expect("occupied");
+        assert!(
+            invoke(
+                temp.path(),
+                temp.path(),
+                &fake_toolchain(),
+                &cargo,
+                false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(temp.path().join(TEXT_REPORT)).expect("clear");
+        std::fs::write(temp.path().join(TEXT_REPORT), b"stale").expect("stale");
+        invoke(
+            temp.path(),
+            temp.path(),
+            &fake_toolchain(),
+            &cargo,
+            false,
+            &mut Vec::new(),
+        )
+        .expect("stale report removed");
+        assert!(!temp.path().join(TEXT_REPORT).exists());
     }
 }
