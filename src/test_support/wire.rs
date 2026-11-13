@@ -176,6 +176,19 @@ impl Urb {
     }
 }
 
+/// Parse a complete management header; operation support is decided by the engine.
+pub(super) fn management(bytes: &[u8]) -> Result<u16, Error> {
+    let [1, 0x11, high, low, 0, 0, 0, 0] = bytes else {
+        return Err(invalid());
+    };
+    Ok(u16::from_be_bytes([*high, *low]))
+}
+
+/// Validate the fixed-width import identifier, including all required zero padding.
+pub(super) fn valid_bus(bytes: &[u8; 32]) -> bool {
+    bytes.get(..4) == Some(b"1-1\0") && bytes.iter().skip(4).all(|byte| *byte == 0)
+}
+
 /// Encode a USB/IP management operation header.
 #[must_use]
 pub fn operation(code: u16, status: u32) -> Vec<u8> {
@@ -207,4 +220,18 @@ pub fn exported(identity: &super::Identity) -> Vec<u8> {
     bytes.extend_from_slice(&identity.product.to_be_bytes());
     bytes.extend_from_slice(&[1, 0, 0, 0, 0, 1, 1, 1]);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_management_headers_and_import_ids_never_panic(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
+            bus in proptest::prelude::any::<[u8; 32]>(),
+        ) {
+            let _ = super::management(&bytes);
+            let _ = super::valid_bus(&bus);
+        }
+    }
 }

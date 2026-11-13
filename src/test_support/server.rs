@@ -265,21 +265,7 @@ impl Drop for ImportLease {
 async fn negotiate(
     socket: &mut TcpStream, state: &Mutex<State>, write_op: WriteOp, model: &dyn ModelIo,
 ) -> Result<Option<ImportLease>, Error> {
-    let op = read::<8>(socket).await?;
-    let [
-        version_high,
-        version_low,
-        high,
-        low,
-        status0,
-        status1,
-        status2,
-        status3,
-    ] = op;
-    if [version_high, version_low] != [1, 0x11] || [status0, status1, status2, status3] != [0; 4] {
-        return Err(wire::invalid());
-    }
-    let command = u16::from_be_bytes([high, low]);
+    let command = wire::management(&read::<8>(socket).await?)?;
     let identity = model.identity().await;
     match command {
         0x8005 => {
@@ -292,7 +278,7 @@ async fn negotiate(
         }
         0x8003 => {
             let bus = read::<32>(socket).await?;
-            if bus.get(..4) != Some(b"1-1\0") || bus.iter().skip(4).any(|b| *b != 0) {
+            if !wire::valid_bus(&bus) {
                 write_op(socket, &wire::operation(3, 1)).await?;
                 return Ok(None);
             }

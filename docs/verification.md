@@ -63,7 +63,8 @@ resource-isolation claim simply from Cargo metadata.
 
 Portable tests exercise real loopback framing, independent echo transfers, fragmented reads,
 malformed requests, duplicate imports/sequences, stalls/failures, resource exhaustion, deadlines,
-class cancellation, re-import and joined cleanup. Unit tests also inject native socket failures
+class cancellation, re-import and joined cleanup. Arbitrary-byte property tests cover management
+headers and fixed-width import identifiers as well as URB and model-control parsing. Unit tests also inject native socket failures
 without invalidating descriptors. Integration scenarios remain in `tests/`; public engine and
 fixture implementation lives under `src/test_support/` and ships in the package.
 
@@ -150,7 +151,8 @@ format; numerical output includes the actual PTP object format. Nothing enumerat
 this reusable API. `Operation::validate` allows bounds checking before transport acquisition.
 
 The thin example defaults to no implicit hardware choice: pass `--simulate` or explicitly
-`--native`. Output directories must be new. Synthetic examples:
+`--native`. It preserves typed argument, diagnostic, I/O and native USB error sources.
+Output directories must be new. Synthetic examples:
 
 ```sh
 cargo run --features test-support --example diagnostic -- --simulate source 4 /tmp/new-source-measurement

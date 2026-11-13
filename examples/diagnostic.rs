@@ -3,7 +3,6 @@
 //! References:
 //! - <https://docs.rs/tethercam/latest/tethercam/test_support/diagnostics/>
 
-use std::error::Error;
 use std::io::{self, Write};
 use std::path::Path;
 use tethercam::ptp::session::{Session, SessionConfig};
@@ -11,11 +10,26 @@ use tethercam::sony::SonyConfig;
 use tethercam::test_support::diagnostics::{self, Operation};
 use tethercam::transport::Transport;
 use tethercam::transport::sim::sony::{ResolutionControls, SonySimConfig, sony_camera};
-use tethercam::transport::usb::{NusbBus, camera, list_cameras, open};
+use tethercam::transport::usb::{NusbBus, UsbError, camera, list_cameras, open};
+
+/// Preserve distinct argument, diagnostic, filesystem and native transport failure sources.
+#[derive(Debug, thiserror::Error)]
+enum Error {
+    #[error("diagnostic operation failed")]
+    Diagnostic(#[from] diagnostics::Error),
+    #[error("invalid diagnostic count")]
+    Count(#[from] std::num::ParseIntError),
+    #[error("diagnostic count is out of range")]
+    CountRange(#[from] std::num::TryFromIntError),
+    #[error("diagnostic I/O failed")]
+    Io(#[from] io::Error),
+    #[error("native diagnostic USB failed")]
+    Usb(#[from] UsbError),
+}
 
 async fn measure<T: Transport>(
     transport: T, packet: usize, operation: Operation, output: &Path,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Error> {
     let mut session = Session::new(
         transport,
         SessionConfig {
@@ -46,7 +60,7 @@ async fn measure<T: Transport>(
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Error> {
     let args: Vec<_> = std::env::args_os().skip(1).take(5).collect();
     let [mode, operation, count, output] = args.as_slice() else {
         return Err(diagnostics::Error::Limits.into());
@@ -95,5 +109,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ..SonySimConfig::default()
         });
         measure(transport, 512, operation, Path::new(output)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn diagnostic_failure_sources_remain_typed() {
+        let errors: [Error; 5] = [
+            diagnostics::Error::Limits.into(),
+            "not-a-count"
+                .parse::<u16>()
+                .expect_err("invalid integer")
+                .into(),
+            u8::try_from(256_u16).expect_err("out of range").into(),
+            io::Error::other("synthetic output failure").into(),
+            UsbError::NoCamera.into(),
+        ];
+        for error in errors {
+            assert!(error.source().is_some());
+            assert_ne!(error.to_string(), "");
+            assert_ne!(format!("{error:?}"), "");
+        }
     }
 }
