@@ -144,6 +144,11 @@ pub enum SessionError {
     /// Clearing halts and resetting the device did not revive the camera.
     #[error("camera did not recover after clear-halt and reset: {0}")]
     Unrecoverable(TransportError),
+    /// The `ImageCaptureCore` session failed. Its categories are sanitized, and a caller
+    /// deadline there never cancels native work.
+    #[cfg(feature = "macos-icc")]
+    #[error("ImageCaptureCore session: {0}")]
+    Icc(#[from] crate::transport::icc::IccError),
 }
 
 /// Tunables for a [`Session`].

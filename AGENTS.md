@@ -22,7 +22,7 @@ Hard rules:
 - This repository is PUBLIC. Never commit real IP addresses, hostnames, serial numbers, MAC addresses, credentials or anything identifying a private network. Use `192.0.2.0/24` (TEST-NET-1) and obviously synthetic values in docs, tests and fixtures
 
 Layout:
-- One package: library `tethercam` plus default application binary `tethercam`. Off-by-default `test-support` exposes reusable verification APIs, not camera runtime; `repo-tools` enables the developer-only `tethercam-tools` binary. Keep `default-run = "tethercam"`. Layers and maintained helper logic are Rust modules under `src/`
+- One package: library `tethercam` plus default application binary `tethercam`. Off-by-default `test-support` exposes reusable verification APIs, not camera runtime; `repo-tools` enables the developer-only `tethercam-tools` binary; `macos-icc` enables the experimental macOS ImageCaptureCore session (pinned `image-capture` crate, no local unsafe). Keep `default-run = "tethercam"`. Layers and maintained helper logic are Rust modules under `src/`
 - Unit tests live beside the code in `#[cfg(test)] mod tests`. Tests through the public API live in `tests/`
 - `examples/` holds runnable usage examples; `benches/` holds `criterion` benchmarks
 

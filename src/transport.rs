@@ -8,9 +8,15 @@
 //! Implementations must enforce the supplied timeout and preserve USB transfer boundaries,
 //! including zero-length packets, because the PTP data phase depends on both.
 //!
+//! The experimental `macos-icc` feature adds `icc`, a [`PtpSession`](crate::ptp::session::PtpSession)
+//! over Apple's `ImageCaptureCore`. It is a session, not a [`Transport`], because ICC owns the
+//! USB pipes.
+//!
 //! References:
 //! - USB Still Image Capture Device Definition 1.0, sections 5-7
 
+#[cfg(feature = "macos-icc")]
+pub mod icc;
 pub mod sim;
 pub mod usb;
 

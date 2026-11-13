@@ -23,6 +23,12 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Native boundary exception (feature `macos-icc`, off by default, macOS-only). Its licenses are already
+# allowed above and it vendors no C. The only exception it needs is this pin: any other version is
+# banned until a renewed independent source review is recorded in docs/macos-camera.md.
+deny = [
+    { crate = "image-capture:>0.1.0", reason = "unsafe native boundary; bumps need renewed review" },
+]
 
 [sources]
 unknown-registry = "deny"

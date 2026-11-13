@@ -64,15 +64,24 @@ factory implementations and explicit `SonyCamera` type annotations; replace the 
 parameter with `Session<TransportType>` for the raw implementation. No backend selection or
 fallback is introduced.
 
-### Proposed cooperative macOS acquisition
+### Experimental cooperative macOS acquisition
 
-[Cooperative macOS camera acquisition](macos-camera.md) specifies a future shared
-ImageCaptureCore backend using the shared session/transaction seam, not a shipped backend. ICC cannot
-emulate USB pipes or recovery. Its caller deadlines do not cancel native work: one retained
-native operation must complete before close, and confirmed closure is required before reuse.
-Quarantine bounds admission but joined shutdown may remain unresolved indefinitely. The native
-dependency, independent unsafe audit and off-by-default feature require approval before implementation.
-Linux USB, simulator behavior and the existing security and CI contracts remain unchanged.
+The off-by-default `macos-icc` feature adds `transport::icc`, an `IccSession` implementing `PtpSession`
+over `ImageCaptureCore` (ICC), specified in [Cooperative macOS camera acquisition](macos-camera.md).
+ICC owns the USB pipes, so it is a session, not a `Transport`: it cannot emulate pipes or recovery, and
+it never forwards raw `OpenSession`/`CloseSession`. Caller deadlines do not cancel native work: one
+retained native operation completes before close, and confirmed closure is required before reuse.
+Quarantine bounds admission, but joined shutdown may remain unresolved indefinitely. The Sony layer is
+unchanged and shared. Nothing selects it at runtime yet ([#77](https://github.com/nredd/tethercam/issues/77)).
+
+Native dependency justification (required for any dependency that links native code): the feature depends
+on the registry crate `image-capture` `=0.1.0`, target-gated to macOS. It wraps Apple's `ImageCaptureCore`
+through the `objc2` family, so all `unsafe` lives there and this repository stays `unsafe`-free. It links
+only Apple system frameworks, vendors and compiles no C, and requires Rust 1.99 where enabled. The only
+`deny.toml` entry is a ban on every other version of it, because an unreviewed bump would change reviewed
+unsafe code. Its licenses are already allowed. Validation is an AI-assisted independent source review (not
+a certification) and one short real-camera sample; there is no production support claim. Linux USB,
+simulator behavior, cross builds and the existing security and CI contracts are unchanged.
 
 ### Sony driver contract
 

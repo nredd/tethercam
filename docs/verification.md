@@ -137,6 +137,18 @@ Coverage CI jobs provision these prerequisites explicitly. Workflow tests bind L
 unskippable native adapter scenario. `make coverage-report` writes unfiltered JSON, LCOV and HTML
 under `coverage/`; it does not replace the enforcement result with a custom policy.
 
+### `macos-icc` coverage
+
+The portable ICC layers (`src/transport/icc/`, except `native.rs`) are fully covered on hosted Linux
+through deterministic fakes and the simulated Sony body. `native.rs` is `cfg(target_os = "macos")`, so
+it is not compiled, and not in the report, on the required Linux coverage job. On macOS its error
+mapping, conversions and event draining are covered by unit tests, but its delegations onto
+`image-capture` (the `Boundary`/`Lease` impls and `run`) need a live `Client`, which exists only inside
+`native::run` on the main thread with a camera. A local macOS `make coverage` therefore reports those
+few lines as uncovered. This is a real gap, not an exclusion: no ignore regex, `coverage(off)` or other
+waiver covers it. It is closed only by the hardware-owner `icc_sample` run, see
+[`macos-camera.md`](macos-camera.md).
+
 ## Diagnostics and profiling
 
 All maintained analysis, orchestration and diagnostic logic is Rust. There are no maintained
