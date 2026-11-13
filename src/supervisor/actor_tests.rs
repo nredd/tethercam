@@ -193,7 +193,7 @@ async fn shutdown_does_not_cancel_a_shutter_wait_or_skip_release() {
         ..SonySimConfig::default()
     });
     let (mut actor, control) = actor(Factory::new(vec![no_image]));
-    actor.still_snapshots = true;
+    actor.still_snapshots.store(true, Ordering::Relaxed);
     actor.sony.capture_timeout = Duration::from_millis(100);
     actor.sony.poll_interval = Duration::from_millis(10);
     let (factory, ()) = tokio::join!(
@@ -411,7 +411,7 @@ async fn a_still_that_times_out_after_a_clean_release_keeps_the_session() {
         ..SonySimConfig::default()
     });
     let (mut actor, control) = actor(Factory::new(vec![no_image]));
-    actor.still_snapshots = true;
+    actor.still_snapshots.store(true, Ordering::Relaxed);
     actor.sony.capture_timeout = Duration::from_millis(50);
     actor.sony.poll_interval = Duration::from_millis(10);
     let work = async {

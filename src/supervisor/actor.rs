@@ -191,7 +191,8 @@ impl Control {
     }
 
     fn request_snapshot(&self, timeout: Duration) -> Result<Vec<u8>, SnapshotError> {
-        // The slot is empty exactly while no camera session is serving; fail now, not after the reply budget.
+        // The slot is empty exactly while no camera session is serving; fail now, not after
+        // the reply budget.
         if self.frames.borrow().is_none() {
             return Err(SnapshotError);
         }
@@ -219,8 +220,7 @@ pub struct Supervisor<F: CameraFactory> {
     session: SessionConfig,
     clock: fn() -> Instant,
     frame_interval: Duration,
-    still_snapshots: bool,
-    still_flag: Arc<AtomicBool>,
+    still_snapshots: Arc<AtomicBool>,
     demand: watch::Receiver<[u64; 2]>,
     snapshots: mpsc::Receiver<SnapshotReply>,
     frames: watch::Sender<Option<Arc<[u8]>>>,
@@ -252,8 +252,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 session,
                 clock: Instant::now,
                 frame_interval,
-                still_snapshots: false,
-                still_flag: Arc::clone(&still_flag),
+                still_snapshots: Arc::clone(&still_flag),
                 demand: demand_rx,
                 snapshots: snapshots_rx,
                 frames,
@@ -283,9 +282,8 @@ impl<F: CameraFactory> Supervisor<F> {
     /// leaving the shutter pressed (unsupported, or no image in time) is answered with an
     /// error and leaves the session up; any other still failure ends the session.
     #[must_use]
-    pub fn with_still_snapshots(mut self, enabled: bool) -> Self {
-        self.still_snapshots = enabled;
-        self.still_flag.store(enabled, Ordering::Relaxed);
+    pub fn with_still_snapshots(self, enabled: bool) -> Self {
+        self.still_snapshots.store(enabled, Ordering::Relaxed);
         self
     }
 
@@ -373,7 +371,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 _ = self.stop.changed() => return Ok(()),
                 reply = self.snapshots.recv() => {
                     let Some(reply) = reply else { return Ok(()); };
-                    if self.still_snapshots {
+                    if self.still_snapshots.load(Ordering::Relaxed) {
                         let outcome = Self::still(camera).await;
                         let outcome = outcome.inspect_err(|_| {
                             let _ = reply.send(Err(SnapshotError));

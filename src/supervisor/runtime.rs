@@ -378,12 +378,12 @@ async fn serve_live(
     publishers: (StreamPublisher<super::RuntimeSource>, ModelPublisher),
     discovery: Option<DiscoveryResponder>,
 ) -> Result<(), RunError> {
-    let (streams, model) = publishers;
+    let (streams, model_slot) = publishers;
     let Some(first) = first_frame(control).await? else {
         return Ok(());
     };
     let (pipeline, sources) = Pipeline::prepare(&first, &cfg.streams, control.clone())?;
-    let description = self::model(cfg, pipeline.width, pipeline.height)?;
+    let description = model(cfg, pipeline.width, pipeline.height)?;
     let [main, jpeg] = sources;
     let (primary, additional) = if cfg.streams.h264 {
         let additional = if cfg.streams.mjpeg {
@@ -396,7 +396,7 @@ async fn serve_live(
         (jpeg, Vec::new())
     };
     streams.publish(primary, additional)?;
-    model.publish(description);
+    model_slot.publish(description);
     writeln!(
         out,
         "Serving authenticated RTSP and ONVIF; interrupt to stop."
