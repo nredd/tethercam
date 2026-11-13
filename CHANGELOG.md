@@ -63,6 +63,8 @@ Next release: `0.0.2`.
 
 ### Added
 
+- Protected-source, OIDC-only crates.io publishing with verified Cargo archives, staged immutable GitHub releases, release-tag integrity policy, and explicit owner bootstrap/recovery instructions
+
 - Explicit `service install|uninstall|status` for protected per-user launchd agents and Linux system/user systemd units, with persisted identity, dedicated system account, Sony USB udev access, native state diagnostics and unlimited graceful stop time
 
 - Loopback-only, pure-Rust USB/IP Sony simulator for real `nusb` Linux backend tests on hosted x64 and arm64 runners, with targeted synthetic-device permissions, stateful cancellation and an export-lifetime memory admission budget
