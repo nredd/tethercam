@@ -941,4 +941,6 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
 }
 
 #[cfg(test)]
+mod test_log;
+#[cfg(test)]
 mod tests;

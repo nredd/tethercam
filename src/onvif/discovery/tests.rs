@@ -650,21 +650,7 @@ fn scoped_link_local_senders_pick_the_interface_with_that_index() {
 
 #[test]
 fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
-    struct Capture(std::sync::Mutex<Vec<String>>);
-    impl log::Log for Capture {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            self.0.lock().unwrap().push(record.args().to_string());
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
-    log::set_logger(&CAPTURE).unwrap();
-    log::set_max_level(log::LevelFilter::Warn);
-    assert!(log::logger().enabled(&log::Metadata::builder().level(log::Level::Warn).build()));
-    log::logger().flush();
+    super::test_log::install();
     let link = Interface {
         addr: "fe80::10".parse().unwrap(),
         prefix_len: 64,
@@ -705,10 +691,7 @@ fn link_local_ipv6_requires_an_advertisable_address_on_the_same_interface() {
     let cfg = config_with(vec![link, iface(10)]);
     assert_eq!(cfg.interfaces(), &[iface(10)]);
     assert!(
-        CAPTURE
-            .0
-            .lock()
-            .unwrap()
+        super::test_log::lines()
             .iter()
             .any(|s| s.contains("interface index '4'")
                 && s.contains("no non-link-local IPv6 address"))

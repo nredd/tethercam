@@ -440,12 +440,35 @@ mod tests {
         assert_eq!(t.usable(), [false, true]);
         assert_eq!(t.sockets.len(), 1);
         let dest = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
-        assert!(matches!(
-            t.send(1, dest, b"x"),
-            Err(Error::NoSuchInterface(1))
-        ));
+        assert_eq!(
+            t.send(1, dest, b"x").unwrap_err().to_string(),
+            "no interface with index '1'"
+        );
         t.send(0, dest, b"x").unwrap();
         assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn the_skip_warning_names_family_position_index_and_kind_but_no_address() {
+        crate::onvif::discovery::test_log::install();
+        let v6 = Interface {
+            addr: "2001:db8:5eed::1".parse().unwrap(),
+            prefix_len: 64,
+            index: u32::MAX - 6,
+        };
+        // The kind is whatever this OS reports for a join on a nonexistent interface.
+        let kind = open(&v6, 0, true).unwrap_err().kind();
+        UdpTransport::bind_inner(&[loopback(), v6], 0, true).unwrap();
+        let lines = crate::onvif::discovery::test_log::lines();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("OS index 4294967289"))
+            .unwrap();
+        assert_eq!(
+            line,
+            &format!("Skipping IPv6 discovery interface 2/2 (OS index 4294967289): {kind:?}")
+        );
+        assert!(!line.contains("2001") && !line.contains("127."));
     }
 
     #[test]
