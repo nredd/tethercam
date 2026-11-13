@@ -96,6 +96,33 @@ fn term_resistant_clients_are_killed_and_reaped_but_server_cleanup_stays_joined(
 }
 
 #[test]
+fn inspect_rejects_a_corrupt_frame_after_valid_data() {
+    let (temp, program, _) = fixture();
+    let decoder = temp.path().join("decode-corrupt");
+    fs::copy(&program, &decoder).expect("copy decoder fixture");
+    let tools = Tools {
+        server: timed::TimedServer::start,
+        helper: &program,
+        bin: &program,
+        ffmpeg: &decoder,
+        ffprobe: &program,
+        curl: &program,
+    };
+    let valid = temp.path().join("valid");
+    fs::create_dir(&valid).expect("valid directory");
+    fs::write(valid.join("still.jpg"), b"synthetic valid frame").expect("valid frame");
+    inspect(OsStr::new("snapshot"), &tools, &valid).expect("valid decode");
+    let corrupt = temp.path().join("corrupt");
+    fs::create_dir(&corrupt).expect("corrupt directory");
+    fs::write(
+        corrupt.join("still.jpg"),
+        b"synthetic valid frame\xff\xd8\xff\xd9",
+    )
+    .expect("partially corrupt frame");
+    assert!(inspect(OsStr::new("snapshot"), &tools, &corrupt).is_err());
+}
+
+#[test]
 fn every_verification_plan_uses_owned_children_and_protected_files() {
     let (temp, program, cfg) = fixture();
     let tools = Tools {

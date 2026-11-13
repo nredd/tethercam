@@ -20,6 +20,15 @@ fn main() -> io::Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(60));
         return Ok(());
     }
+    if name == "decode-corrupt"
+        && let Some([_, path]) = args
+            .windows(2)
+            .find(|pair| pair.first().is_some_and(|arg| arg == "-i"))
+        && std::fs::read(path)?.ends_with(&[0xff, 0xd8, 0xff, 0xd9])
+        && args.iter().any(|arg| arg == "-xerror")
+    {
+        return Err(io::Error::other("injected corrupt trailing frame"));
+    }
     let mut out = io::stdout().lock();
     if args.iter().any(|arg| arg == "%{http_code}") {
         let status = if args.first().is_some_and(|arg| arg == "--config") {

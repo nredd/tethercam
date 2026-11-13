@@ -366,7 +366,7 @@ fn inspect(mode: &OsStr, tools: &Tools<'_>, output: &Path) -> Result<(), Error> 
             &output.join(format!("{name}.inspection.json")),
             Duration::from_secs(20),
         )?;
-        let mut decode = args(&["-v", "error", "-nostdin", "-i"]);
+        let mut decode = args(&["-v", "error", "-nostdin", "-xerror", "-i"]);
         decode.push(output.join(name).into());
         decode.extend(args(&["-f", "null", "-"]));
         Owned::start(tools.ffmpeg, &decode)?.wait(Duration::from_secs(30))?;

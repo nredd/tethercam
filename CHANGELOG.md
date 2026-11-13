@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Reject partial media decodes when FFmpeg reports an error.
+
 Next release: `0.0.2`.
 
 ### Fixed

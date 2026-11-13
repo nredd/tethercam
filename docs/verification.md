@@ -182,7 +182,7 @@ and `profile` (30 s framehash/H.264/packet measurements). All paths must be abso
 selects the application's explicit simulator; `-` explicitly requests the configured native
 camera. **Do not use `-` for hardware-free testing.** It requires independent FFmpeg/ffprobe/curl
 executables, checks unauthenticated `401` and authenticated snapshot `200`, independently inspects
-and fully decodes recordings, and fails on client errors/deadlines. It never manipulates photo
+and fully decodes recordings with FFmpeg `-xerror`, failing on decode errors or client deadlines. It never manipulates photo
 import daemons or host services.
 
 The verifier owns its exact children, never searches for process names/PIDs, never uses shell
