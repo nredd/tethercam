@@ -64,6 +64,16 @@ factory implementations and explicit `SonyCamera` type annotations; replace the 
 parameter with `Session<TransportType>` for the raw implementation. No backend selection or
 fallback is introduced.
 
+### Proposed cooperative macOS acquisition
+
+[Cooperative macOS camera acquisition](macos-camera.md) specifies a future shared
+ImageCaptureCore backend using the shared session/transaction seam, not a shipped backend. ICC cannot
+emulate USB pipes or recovery. Its caller deadlines do not cancel native work: one retained
+native operation must complete before close, and confirmed closure is required before reuse.
+Quarantine bounds admission but joined shutdown may remain unresolved indefinitely. The native
+dependency, independent unsafe audit and off-by-default feature require approval before implementation.
+Linux USB, simulator behavior and the existing security and CI contracts remain unchanged.
+
 ### Sony driver contract
 
 - `SonyCamera::run(session, config, body)` is the only way to get a connected camera: it opens the session, runs the handshake, calls `body` and closes the session on every exit path (the body's error wins over a close error). A camera therefore cannot outlive its session, and a failure anywhere leaves the body un-wedged

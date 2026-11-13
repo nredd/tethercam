@@ -226,10 +226,12 @@ pub fn exported(identity: &super::Identity) -> Vec<u8> {
 mod tests {
     proptest::proptest! {
         #[test]
-        fn arbitrary_management_headers_and_import_ids_never_panic(
+        fn arbitrary_words_management_headers_and_import_ids_never_panic(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512),
             bus in proptest::prelude::any::<[u8; 32]>(),
+            offset in proptest::prelude::any::<usize>(),
         ) {
+            let _ = super::word(&bytes, offset);
             let _ = super::management(&bytes);
             let _ = super::valid_bus(&bus);
         }

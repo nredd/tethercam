@@ -311,6 +311,39 @@ async fn pending_completion_write_failure_is_fatal_and_admission_is_bounded() {
     server.shutdown().await.expect("stop");
 }
 
+#[tokio::test]
+async fn held_out_work_remains_pending_until_unlinked() {
+    let server = Server::start(0, Synthetic::default()).await.expect("start");
+    server.state.lock().await.hold_out = true;
+    let mut socket = imported(&server).await;
+    socket
+        .write_all(&request(4, 0, 1, 0, [0; 8]))
+        .await
+        .expect("held out");
+    timeout(Duration::from_secs(2), async {
+        while server.state.lock().await.submitted == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("submit accepted");
+    let mut unlink = request(0, 0, 2, 0, [0; 8]);
+    unlink[..4].copy_from_slice(&2_u32.to_be_bytes());
+    unlink[20..24].copy_from_slice(&1_u32.to_be_bytes());
+    socket.write_all(&unlink).await.expect("unlink");
+    let mut reply = [0; 48];
+    timeout(Duration::from_secs(2), socket.read_exact(&mut reply))
+        .await
+        .expect("reply deadline")
+        .expect("reply");
+    assert_eq!(
+        wire::word(&reply, 20).expect("status"),
+        u32::from_be_bytes((-104_i32).to_be_bytes())
+    );
+    assert_eq!(server.state.lock().await.unlinked, 1);
+    server.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test(start_paused = true)]
 async fn held_out_work_expires_and_deadline_write_failure_is_fatal() {
     FAIL_WRITE_AT.with(|count| count.set(2));

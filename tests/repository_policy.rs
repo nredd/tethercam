@@ -162,6 +162,159 @@ fn validate(policy: &Value, workflows: &Workflows) -> Result<(), String> {
     )
 }
 
+/// Fail closed when release authentication, source checks or publication order drift.
+fn validate_release(workflow: &Value) -> Result<(), String> {
+    for (pointer, expected) in [
+        ("/on/push/tags", json!(["v*"])),
+        ("/permissions", json!({"contents": "read"})),
+        ("/concurrency/cancel-in-progress", json!(false)),
+        (
+            "/jobs/gate/if",
+            json!(
+                "github.repository == 'nredd/tethercam' && startsWith(github.ref, 'refs/tags/v')"
+            ),
+        ),
+        ("/jobs/gate/env/TETHERCAM_USBIP", json!(1)),
+        ("/jobs/publish/needs", json!("gate")),
+        ("/jobs/publish/environment", json!("crates-io")),
+        (
+            "/jobs/publish/permissions",
+            json!({"contents": "read", "id-token": "write"}),
+        ),
+        ("/jobs/github-release/needs", json!("publish")),
+        ("/jobs/github-release/environment", json!("crates-io")),
+        (
+            "/jobs/github-release/permissions",
+            json!({"contents": "write"}),
+        ),
+    ] {
+        require(
+            workflow.pointer(pointer) == Some(&expected),
+            "release security boundary changed",
+        )?;
+    }
+    let events = workflow
+        .get("on")
+        .and_then(Value::as_object)
+        .ok_or("missing events")?;
+    require(events.len() == 1, "only release tag pushes may publish")?;
+    let jobs = workflow
+        .get("jobs")
+        .and_then(Value::as_object)
+        .ok_or("missing release jobs")?;
+    require(jobs.len() == 3, "unexpected release privilege boundary")?;
+    for job in jobs.values() {
+        for step in job["steps"].as_array().ok_or("missing release steps")? {
+            require(
+                step.get("continue-on-error").is_none(),
+                "release steps must fail closed",
+            )?;
+            if let Some(action) = step["uses"].as_str() {
+                let (_, sha) = action.rsplit_once('@').ok_or("unpinned release action")?;
+                require(
+                    sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "release actions must use full commit SHAs",
+                )?;
+            }
+        }
+    }
+    for (job, commands) in [
+        (
+            "gate",
+            vec![
+                "git merge-base --is-ancestor HEAD origin/main",
+                "cargo run --locked --features repo-tools --bin tethercam-tools -- release-tag \"$TAG\"",
+                "cargo run --features repo-tools --bin tethercam-tools -- usbip prepare",
+                "make all cross",
+                "cargo package --locked",
+                "cargo publish --dry-run --locked",
+            ],
+        ),
+        (
+            "publish",
+            vec![
+                "cargo publish --dry-run --locked",
+                "cmp \"$RUNNER_TEMP\"/gated-package/*.crate target/package/*.crate",
+                "cargo publish --locked",
+            ],
+        ),
+        (
+            "github-release",
+            vec![
+                "gh release create \"$TAG\" \"$RUNNER_TEMP\"/gated-package/*.crate --draft --verify-tag --target \"$COMMIT\" --title \"$TAG\" --notes-file CHANGELOG.md",
+                "gh release edit \"$TAG\" --draft=false",
+            ],
+        ),
+    ] {
+        let steps = jobs
+            .get(job)
+            .and_then(|job| job.get("steps"))
+            .and_then(Value::as_array)
+            .ok_or("missing steps")?;
+        let mut previous = None;
+        for command in commands {
+            let index = steps
+                .iter()
+                .position(|step| step["run"] == command && step.get("if").is_none())
+                .ok_or("missing unconditional release command")?;
+            require(
+                previous.is_none_or(|previous| previous < index),
+                "release commands must preserve validation and staging order",
+            )?;
+            previous = Some(index);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn release_policy_preserves_source_auth_and_immutable_staging() -> Result<(), Box<dyn Error>> {
+    let workflow: Value = serde_saphyr::from_str(include_str!("../.github/workflows/release.yml"))?;
+    validate_release(&workflow)?;
+    let ruleset: Value = serde_json::from_str(include_str!("../.github/rulesets/releases.json"))?;
+    assert_eq!(
+        ruleset,
+        json!({
+            "name": "Release tag integrity", "target": "tag", "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            "rules": [{"type": "update"}, {"type": "deletion"}]
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn weakened_release_boundaries_and_reordered_staging_fail() -> Result<(), Box<dyn Error>> {
+    let original: Value = serde_saphyr::from_str(include_str!("../.github/workflows/release.yml"))?;
+    for pointer in [
+        "/on/push/tags",
+        "/permissions",
+        "/concurrency/cancel-in-progress",
+        "/jobs/gate/if",
+        "/jobs/gate/env/TETHERCAM_USBIP",
+        "/jobs/publish/needs",
+        "/jobs/publish/environment",
+        "/jobs/publish/permissions",
+        "/jobs/github-release/needs",
+        "/jobs/github-release/environment",
+        "/jobs/github-release/permissions",
+    ] {
+        let mut workflow = original.clone();
+        *workflow
+            .pointer_mut(pointer)
+            .ok_or("missing release field")? = Value::Null;
+        assert!(validate_release(&workflow).is_err(), "accepted {pointer}");
+    }
+    let mut workflow = original;
+    let steps = workflow["jobs"]["github-release"]["steps"]
+        .as_array_mut()
+        .ok_or("missing release steps")?;
+    steps.reverse();
+    assert!(validate_release(&workflow).is_err());
+    Ok(())
+}
+
 /// Load the exact activation payload used by the administrator.
 fn policy() -> Result<Value, Box<dyn Error>> {
     Ok(serde_json::from_str(include_str!(
@@ -239,7 +392,7 @@ fn release_gate_prepares_and_cleans_up_native_usbip() -> Result<(), Box<dyn Erro
     };
     let prepare =
         position("cargo run --features repo-tools --bin tethercam-tools -- usbip prepare")?;
-    let gate = position("make all")?;
+    let gate = position("make all cross")?;
     let package = position("cargo package --locked")?;
     let dry_run = position("cargo publish --dry-run --locked")?;
     let cleanup =
