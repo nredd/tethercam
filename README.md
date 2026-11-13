@@ -146,7 +146,9 @@ make coverage   # 100% line, function and region coverage of src/ (cargo-llvm-co
 ```
 
 Tools: `cargo-nextest`, `cargo-deny` and `cargo-llvm-cov` 0.9.1 or newer (with the
-`llvm-tools-preview` rustup component). Put the rustup toolchain's `cargo` first on `PATH`.
+`llvm-tools-preview` rustup component). Put the rustup toolchain's `cargo` first on `PATH` and keep
+it current (`rustup update stable`): CI floats on `stable` and coverage regions differ between rustc
+releases.
 `make coverage` cleans profiles and uses cargo-llvm-cov's native zero-uncovered line/function/
 region checks plus fail-under-100 guards, with implicit filename exclusions disabled. Actual
 `src/` includes named/nested source tests, developer tools and optional test-support implementation.
