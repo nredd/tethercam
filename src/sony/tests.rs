@@ -15,12 +15,12 @@ use crate::transport::sim::{Fault, SimCamera};
 use crate::transport::{Endpoint, TransportError};
 
 /// One body for both successful handshakes and failures that never invoke the body.
-async fn connected(_: &mut SonyCamera<'_, SimCamera>) -> Result<(), SonyError> {
+async fn connected(_: &mut SonyCamera<'_, Session<SimCamera>>) -> Result<(), SonyError> {
     Ok(())
 }
 
 /// Share the frame operation across successful handshakes and early disconnects.
-async fn frame(camera: &mut SonyCamera<'_, SimCamera>) -> Result<Vec<u8>, SonyError> {
+async fn frame(camera: &mut SonyCamera<'_, Session<SimCamera>>) -> Result<Vec<u8>, SonyError> {
     camera.fetch_live_view_frame().await
 }
 

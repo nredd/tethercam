@@ -69,15 +69,16 @@ async fn concrete_fake_bus_covers_selection_opening_and_real_packet_geometry() {
     );
     let mut factory = Native::new(FakeBus::with_camera(0x0c34), Some("SERIAL0000".into()));
     let camera = factory.connect().await.unwrap().unwrap();
-    assert_eq!(factory.packet_size(&camera), Some(512));
-    let session = factory.session(camera, SessionConfig::default());
-    factory.release(session.into_transport()); // no session was opened by the factory
+    assert_eq!(camera.bulk_max_packet_size(), 512);
+    let session = factory.session(camera, SessionConfig::default(), std::time::Instant::now);
+    let camera = factory.recover(session);
+    factory.release(camera); // no session was opened by the factory
     factory.pause(Duration::ZERO).await;
     let mut bus = FakeBus::with_camera(0x0c34);
     *bus.config.as_mut().unwrap().get_mut(14).unwrap() = 4; // 1024-byte USB 3 bulk endpoint
     let mut factory = Native::new(bus, None);
     let camera = factory.connect().await.unwrap().unwrap();
-    assert_eq!(factory.packet_size(&camera), Some(1024));
+    assert_eq!(camera.bulk_max_packet_size(), 1024);
     factory.release(camera);
 }
 

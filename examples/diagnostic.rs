@@ -27,7 +27,7 @@ enum Error {
     Usb(#[from] UsbError),
 }
 
-async fn measure<T: Transport>(
+async fn measure<T: Transport + Send>(
     transport: T, packet: usize, operation: Operation, output: &Path,
 ) -> Result<(), Error> {
     let mut session = Session::new(

@@ -40,13 +40,14 @@ pub(super) async fn probe<F: CameraFactory>(
     mut factory: F, out: &mut dyn Write,
 ) -> Result<(), Error> {
     let transport = factory.connect().await?.ok_or(Error::NoCamera)?;
-    let mut session = factory.session(transport, SessionConfig::default());
+    let mut session = factory.session(transport, SessionConfig::default(), std::time::Instant::now);
     let report = SonyCamera::run(&mut session, SonyConfig::default(), async |camera| {
         camera.wait_live_view_ready().await?;
         Ok((camera.protocol(), camera.capabilities(), camera.battery()))
     })
     .await;
-    factory.release(session.into_transport());
+    let transport = factory.recover(session);
+    factory.release(transport);
     let (protocol, capabilities, battery) = report.map_err(|_| Error::Camera)?;
     writeln!(
         out,

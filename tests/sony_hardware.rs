@@ -32,7 +32,7 @@ struct Soak {
 }
 
 /// Hands out live-view frames for `duration`, then closes the session.
-async fn soak<T: Transport>(
+async fn soak<T: Transport + Send>(
     session: &mut Session<T>, config: SonyConfig, duration: Duration,
 ) -> Result<Soak, SonyError> {
     SonyCamera::run(session, config, async |camera| {

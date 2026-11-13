@@ -60,6 +60,19 @@ impl Factory {
 
 impl CameraFactory for Factory {
     type Camera = SimCamera;
+    type Session = crate::ptp::session::Session<Self::Camera>;
+
+    fn session(
+        &self, camera: Self::Camera, mut cfg: crate::ptp::session::SessionConfig,
+        clock: fn() -> std::time::Instant,
+    ) -> Self::Session {
+        let _ = &mut cfg;
+        Self::Session::new(camera, cfg).with_clock(clock)
+    }
+    fn recover(&self, session: Self::Session) -> Self::Camera {
+        session.into_transport()
+    }
+
     fn connect(&mut self) -> impl Future<Output = Result<Option<SimCamera>, OpenError>> + Send {
         if let Some(stop) = &self.stop_on_connect {
             stop.send_replace(true);

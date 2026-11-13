@@ -25,6 +25,7 @@ Next release: `0.0.2`.
 
 ### Changed
 
+- Generalize Sony execution over `PtpSession`; external `CameraFactory` implementations now supply and recover an associated session, and explicit `SonyCamera` type annotations use the session type instead of the transport type
 - Delegate SRC coverage enforcement/reporting to native `cargo-llvm-cov` zero-uncovered and fail-under-100 checks, including all source tests and optional verification/tooling code
 
 ### Removed

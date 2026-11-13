@@ -84,7 +84,7 @@ pub struct Artifact {
 /// # Errors
 /// Returns invalid limits, typed camera errors, or output errors. Session cleanup is attempted
 /// on every camera failure; output failures occur only after cleanup.
-pub async fn run<T: Transport>(
+pub async fn run<T: Transport + Send>(
     session: &mut Session<T>, cfg: SonyConfig, operation: Operation, out: &mut dyn Write,
 ) -> Result<Vec<Artifact>, Error> {
     operation.validate()?;
@@ -153,8 +153,8 @@ pub async fn run<T: Transport>(
 }
 
 /// Release both shutter stages even when preparation or capture fails.
-async fn capture<T: Transport>(
-    camera: &mut SonyCamera<'_, T>, count: u8, text: &mut Vec<String>,
+async fn capture<T: Transport + Send>(
+    camera: &mut SonyCamera<'_, Session<T>>, count: u8, text: &mut Vec<String>,
     artifacts: &mut Vec<Artifact>,
 ) -> Result<(), SonyError> {
     let prepared = camera

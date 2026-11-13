@@ -17,9 +17,9 @@ use super::property::{PropertyTable, decode_properties};
 use super::protocol::{ExtDeviceInfo, Protocol};
 use super::quirks::Quirks;
 use super::{event, handle, op, prop};
-use crate::ptp::session::{Event, Session, SessionError, code};
+use crate::ptp::session::{Event, PtpSession, SessionError, code};
 use crate::ptp::{DeviceInfo, DevicePropCode, OperationCode, ResponseCode, Value};
-use crate::transport::{Transport, TransportError};
+use crate::transport::TransportError;
 
 /// Events read per [`SonyCamera::pump_events`] call, so a camera that never stops sending
 /// events cannot hold the caller forever.
@@ -89,7 +89,7 @@ pub enum SonyEvent {
 /// when the closure returns.
 #[derive(Debug)]
 pub struct SonyCamera<'s, T> {
-    pub(super) session: &'s mut Session<T>,
+    pub(super) session: &'s mut T,
     pub(super) config: SonyConfig,
     device: DeviceInfo,
     ext: ExtDeviceInfo,
@@ -98,7 +98,7 @@ pub struct SonyCamera<'s, T> {
     quirks: Quirks,
 }
 
-impl<T: Transport> SonyCamera<'_, T> {
+impl<T: PtpSession> SonyCamera<'_, T> {
     /// Opens a session, connects, runs `body` and closes the session on every exit path.
     ///
     /// The body's error wins over a close error; a close error after a successful body is
@@ -108,7 +108,7 @@ impl<T: Transport> SonyCamera<'_, T> {
     ///
     /// Any [`SonyError`] from opening, connecting, `body` or closing.
     pub async fn run<R>(
-        session: &mut Session<T>, config: SonyConfig,
+        session: &mut T, config: SonyConfig,
         body: impl AsyncFnOnce(&mut SonyCamera<'_, T>) -> Result<R, SonyError>,
     ) -> Result<R, SonyError> {
         session.open().await?;
@@ -124,9 +124,9 @@ impl<T: Transport> SonyCamera<'_, T> {
     }
 }
 
-impl<'s, T: Transport> SonyCamera<'s, T> {
+impl<'s, T: PtpSession> SonyCamera<'s, T> {
     /// The Sony handshake on an open session.
-    async fn connect(session: &'s mut Session<T>, config: SonyConfig) -> Result<Self, SonyError> {
+    async fn connect(session: &'s mut T, config: SonyConfig) -> Result<Self, SonyError> {
         let device = DeviceInfo::decode(&session.get_device_info().await?)?;
         if !device
             .operations_supported
@@ -410,9 +410,7 @@ impl<'s, T: Transport> SonyCamera<'s, T> {
     }
 }
 
-async fn connect_phase<T: Transport>(
-    session: &mut Session<T>, phase: u32,
-) -> Result<(), SonyError> {
+async fn connect_phase<T: PtpSession>(session: &mut T, phase: u32) -> Result<(), SonyError> {
     session
         .transaction(op::SDIO_CONNECT, &[phase, 0, 0], None)
         .await?;
@@ -440,8 +438,8 @@ fn is_refusal(err: &SonyError) -> bool {
 /// same session. A stall or timeout makes the session layer clear the halts and reset the
 /// device, which ends the session: it is reopened and the handshake replayed to phase 2 first,
 /// so the camera is never left wedged.
-async fn negotiate_ext_info<T: Transport>(
-    session: &mut Session<T>, config: &SonyConfig, start: Protocol,
+async fn negotiate_ext_info<T: PtpSession>(
+    session: &mut T, config: &SonyConfig, start: Protocol,
 ) -> Result<ExtDeviceInfo, SonyError> {
     let first = match ext_device_info(session, config, start).await {
         Err(err) if is_refusal(&err) => err,
@@ -467,8 +465,8 @@ async fn negotiate_ext_info<T: Transport>(
 }
 
 /// `SDIOGetExtDeviceInfo` for `protocol`, retried while the camera answers empty or busy.
-async fn ext_device_info<T: Transport>(
-    session: &mut Session<T>, config: &SonyConfig, protocol: Protocol,
+async fn ext_device_info<T: PtpSession>(
+    session: &mut T, config: &SonyConfig, protocol: Protocol,
 ) -> Result<ExtDeviceInfo, SonyError> {
     let params = [u32::from(protocol.version()), 1];
     let started = session.now();
@@ -522,6 +520,7 @@ fn classify(raw: Event) -> SonyEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptp::session::Session;
 
     fn event(code: u16, params: &[u32]) -> Event {
         Event {

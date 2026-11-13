@@ -212,6 +212,73 @@ pub struct Event {
     pub params: Vec<u32>,
 }
 
+/// A single-flight PTP session with an injectable monotonic clock.
+///
+/// Callers must drive operations to completion and explicitly close the session. Implementations
+/// preserve borrowed outgoing data until the returned future completes and return typed errors.
+pub trait PtpSession: Send {
+    /// Current time on the session clock.
+    fn now(&self) -> Instant;
+    /// Whether this handle has an open session.
+    fn is_open(&self) -> bool;
+    /// Open the camera session.
+    fn open(&mut self) -> impl Future<Output = Result<(), SessionError>> + Send;
+    /// Close the camera session and perform any necessary recovery.
+    fn close(&mut self) -> impl Future<Output = Result<(), SessionError>> + Send;
+    /// Execute a transaction with an optional borrowed host-to-device data phase.
+    fn transaction(
+        &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+    ) -> impl Future<Output = Result<Outcome, SessionError>> + Send;
+    /// Execute a transaction with an explicit whole-transaction deadline.
+    fn transaction_within(
+        &mut self, limit: Duration, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+    ) -> impl Future<Output = Result<Outcome, SessionError>> + Send;
+    /// Fetch the raw `DeviceInfo` dataset.
+    fn get_device_info(&mut self) -> impl Future<Output = Result<Vec<u8>, SessionError>> + Send;
+    /// Poll for one event using the session's default timeout.
+    fn poll_event(&mut self) -> impl Future<Output = Result<Option<Event>, SessionError>> + Send;
+    /// Poll for one event for at most `timeout`.
+    fn poll_event_within(
+        &mut self, timeout: Duration,
+    ) -> impl Future<Output = Result<Option<Event>, SessionError>> + Send;
+}
+
+impl<T: Transport + Send> PtpSession for Session<T> {
+    fn now(&self) -> Instant {
+        Session::now(self)
+    }
+    fn is_open(&self) -> bool {
+        Session::is_open(self)
+    }
+    async fn open(&mut self) -> Result<(), SessionError> {
+        Session::open(self).await
+    }
+    async fn close(&mut self) -> Result<(), SessionError> {
+        Session::close(self).await
+    }
+    async fn transaction(
+        &mut self, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+    ) -> Result<Outcome, SessionError> {
+        Session::transaction(self, operation, params, data_out).await
+    }
+    async fn transaction_within(
+        &mut self, limit: Duration, operation: u16, params: &[u32], data_out: Option<&[u8]>,
+    ) -> Result<Outcome, SessionError> {
+        Session::transaction_within(self, limit, operation, params, data_out).await
+    }
+    async fn get_device_info(&mut self) -> Result<Vec<u8>, SessionError> {
+        Session::get_device_info(self).await
+    }
+    async fn poll_event(&mut self) -> Result<Option<Event>, SessionError> {
+        Session::poll_event(self).await
+    }
+    async fn poll_event_within(
+        &mut self, timeout: Duration,
+    ) -> Result<Option<Event>, SessionError> {
+        Session::poll_event_within(self, timeout).await
+    }
+}
+
 /// A PTP session handle. See the module docs for the hygiene contract.
 #[derive(Debug)]
 pub struct Session<T> {
@@ -852,6 +919,41 @@ mod tests {
             .iter()
             .map(|c| (c.code, c.transaction_id))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn generic_session_exercises_borrowed_data_events_and_deadlines() {
+        async fn exercise<S: PtpSession>(s: &mut S) {
+            assert!(!s.is_open());
+            let _ = s.now();
+            s.open().await.unwrap();
+            assert!(s.is_open());
+            assert!(s.get_device_info().await.is_ok());
+            let bytes = [3_u8, 1, 4];
+            s.transaction(SEND_OBJECT, &[7], Some(&bytes))
+                .await
+                .unwrap();
+            s.transaction_within(Duration::from_secs(1), SEND_OBJECT, &[], Some(&bytes))
+                .await
+                .unwrap();
+            assert_eq!(s.poll_event().await.unwrap(), None);
+            assert_eq!(s.poll_event_within(Duration::ZERO).await.unwrap(), None);
+            s.close().await.unwrap();
+            assert!(!s.is_open());
+        }
+        let camera = SimCamera::new().with_operation(SEND_OBJECT, Reply::accepting_data());
+        let mut s = session(camera);
+        exercise(&mut s).await;
+        assert_eq!(
+            ids(&s).iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+            vec![
+                code::OPEN_SESSION,
+                code::GET_DEVICE_INFO,
+                SEND_OBJECT,
+                SEND_OBJECT,
+                code::CLOSE_SESSION
+            ]
+        );
     }
 
     #[tokio::test]
