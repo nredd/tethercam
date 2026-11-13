@@ -36,5 +36,5 @@ pub mod source;
 pub use digest::{Algorithm, Authenticator, ClientDigest, ConnectionId, Credentials, DigestError};
 pub use message::{Headers, Limits, Method, ParseError, Request, Response};
 pub use sdp::{MediaKind, SdpError, TrackInfo};
-pub use server::{RtspServer, ServerConfig, ServerError};
+pub use server::{RtspServer, ServerConfig, ServerError, StreamPublisher};
 pub use source::{Fanout, MediaSource, Packet, Subscription};

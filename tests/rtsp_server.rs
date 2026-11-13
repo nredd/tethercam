@@ -402,6 +402,110 @@ mod suite {
     }
 
     #[tokio::test]
+    async fn pending_server_answers_503_until_streams_are_published() {
+        let creds = Credentials::new(USER, PASS, REALM).unwrap();
+        let (server, publisher) =
+            RtspServer::bind_pending("127.0.0.1:0".parse().unwrap(), creds, config())
+                .await
+                .unwrap();
+        assert!(server.fanout().is_none());
+        let addr = server.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            server
+                .serve(async move {
+                    let _ = stopped.await;
+                })
+                .await;
+        });
+        let base = format!("rtsp://{addr}/stream");
+        let mut client = Client::connect(addr).await;
+        client.login(&base).await;
+        // Authentication still comes first, and OPTIONS works: the server is up.
+        assert_eq!(client.request("OPTIONS", &base, &[]).await.status, 200);
+        let reply = client.request("DESCRIBE", &base, &[]).await;
+        assert_eq!(reply.status, 503);
+        assert_eq!(reply.header("retry-after"), Some("5"));
+        let reply = client
+            .request(
+                "SETUP",
+                &format!("{base}/trackID=0"),
+                &[("Transport", "RTP/AVP/TCP;unicast;interleaved=0-1")],
+            )
+            .await;
+        assert_eq!(reply.status, 503);
+        let mut anonymous = Client::connect(addr).await;
+        anonymous.send("DESCRIBE", &base, None, &[], "").await;
+        assert_eq!(anonymous.read_reply().await.status, 401);
+
+        // Publication makes the very same connection describable, no restart.
+        publisher
+            .publish(TestSource::new().source, Vec::new())
+            .unwrap();
+        let reply = client.request("DESCRIBE", &base, &[]).await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("H264"));
+        let _ = stop.send(());
+        timeout(WAIT, task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publisher_validates_tracks_and_paths_and_failure_stays_pending() {
+        let creds = || Credentials::new(USER, PASS, REALM).unwrap();
+        let pending = || async {
+            RtspServer::bind_pending("127.0.0.1:0".parse().unwrap(), creds(), config())
+                .await
+                .unwrap()
+        };
+        let mut bad_track = track("H264");
+        bad_track.clock_rate = 0;
+        let bad = Arc::new(ScriptedSource::new(bad_track, Vec::new(), false, None));
+        let (_server, publisher) = pending().await;
+        assert!(publisher.publish(bad, Vec::new()).is_err());
+        let (server, publisher) = pending().await;
+        let source = TestSource::new().source;
+        assert!(
+            publisher
+                .publish(
+                    Arc::clone(&source),
+                    vec![("/stream/child".into(), Arc::clone(&source))]
+                )
+                .is_err()
+        );
+        assert!(server.fanout().is_none());
+        let (server, publisher) = pending().await;
+        publisher
+            .publish(
+                Arc::clone(&source),
+                vec![("/jpeg".into(), Arc::clone(&source))],
+            )
+            .unwrap();
+        assert!(server.fanout().is_some());
+        assert!(
+            RtspServer::<ScriptedSource>::bind_pending(
+                server.local_addr().unwrap(),
+                creds(),
+                config()
+            )
+            .await
+            .is_err()
+        );
+        let invalid = ServerConfig {
+            max_sessions: 0,
+            ..config()
+        };
+        assert!(
+            RtspServer::<ScriptedSource>::bind_pending(
+                "127.0.0.1:0".parse().unwrap(),
+                creds(),
+                invalid
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn tcp_interleaved_flow() {
         let server = start(config()).await;
         let base = server.url("/stream");
@@ -1304,7 +1408,7 @@ mod suite {
         let server = RtspServer::bind(addr, TestSource::new().source, creds(), config())
             .await
             .unwrap();
-        assert_eq!(server.fanout().dropped_packets(), 0);
+        assert_eq!(server.fanout().unwrap().dropped_packets(), 0);
         assert!(
             RtspServer::bind(
                 server.local_addr().unwrap(),

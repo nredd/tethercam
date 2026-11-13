@@ -88,7 +88,54 @@ mod suite {
     struct Ready(Option<oneshot::Sender<()>>);
     impl Write for Ready {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if let Some(tx) = self.0.take() {
+            if bytes.starts_with(b"Serving")
+                && let Some(tx) = self.0.take()
+            {
+                let _ = tx.send(());
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Cameras the test hands over while the service runs, as a USB hot-plug would.
+    struct Hotplug {
+        queue: Arc<Mutex<VecDeque<SimCamera>>>,
+        released: Arc<Mutex<Vec<SimCamera>>>,
+    }
+    impl CameraFactory for Hotplug {
+        type Camera = SimCamera;
+        type Session = tethercam::ptp::session::Session<Self::Camera>;
+
+        fn session(
+            &self, camera: Self::Camera, cfg: tethercam::ptp::session::SessionConfig,
+            clock: fn() -> std::time::Instant,
+        ) -> Self::Session {
+            Self::Session::new(camera, cfg).with_clock(clock)
+        }
+        fn recover(&self, session: Self::Session) -> Self::Camera {
+            session.into_transport()
+        }
+        fn connect(&mut self) -> impl Future<Output = Result<Option<SimCamera>, OpenError>> + Send {
+            std::future::ready(Ok(self.queue.lock().unwrap().pop_front()))
+        }
+        fn release(&mut self, camera: SimCamera) {
+            self.released.lock().unwrap().push(camera);
+        }
+        fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send {
+            tokio::time::sleep(delay.min(Duration::from_millis(200)))
+        }
+    }
+
+    /// Fires on the "waiting" line, i.e. once the listeners are bound with no camera.
+    struct Listening(Option<oneshot::Sender<()>>);
+    impl Write for Listening {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.starts_with(b"Listening")
+                && let Some(tx) = self.0.take()
+            {
                 let _ = tx.send(());
             }
             Ok(bytes.len())
@@ -352,5 +399,206 @@ mod suite {
         session.open().await.unwrap();
         session.close().await.unwrap();
         assert_eq!(session.transport().reset_count(), 0);
+    }
+    /// An authenticated `GET` on the ONVIF port; returns status and body.
+    async fn authed_get(cfg: &Config, path: &str) -> (u16, String) {
+        let address = SocketAddr::new(cfg.onvif_address, cfg.onvif_port);
+        let mut http = Client::open(address).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+        http.socket
+            .write_all(format!("{request}\r\n").as_bytes())
+            .await
+            .unwrap();
+        let challenge = http.reply().await.unwrap();
+        assert_eq!(challenge.status, 401);
+        let authorization = authorization(
+            "GET",
+            path,
+            nonce(challenge.header("www-authenticate").unwrap()).unwrap(),
+            1,
+        );
+        http.socket
+            .write_all(
+                format!("{request}Authorization: {authorization}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let reply = http.reply().await.unwrap();
+        (reply.status, String::from_utf8(reply.body).unwrap())
+    }
+
+    /// Poll the status endpoint until the camera state is `state`.
+    async fn wait_for_state(cfg: &Config, state: &str) {
+        let wanted = format!("\"camera\":\"{state}\"");
+        timeout(WAIT, async {
+            loop {
+                let (status, body) = authed_get(cfg, "/tethercam/status").await;
+                assert_eq!(status, 200);
+                if body.contains(&wanted) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("status never became {state}"));
+    }
+
+    /// `DESCRIBE` on a fresh authenticated connection; returns the reply.
+    async fn describe(cfg: &Config, path: &str) -> super::client::Reply {
+        let addr = SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port);
+        let uri = format!("rtsp://{addr}{path}");
+        let mut rtsp = Client::open(addr).await.unwrap();
+        rtsp.authenticate(&uri).await.unwrap();
+        rtsp.request("DESCRIBE", &uri, "").await.unwrap()
+    }
+
+    async fn media_status(cfg: &Config, operation: &str) -> u16 {
+        let mut http = Client::open(SocketAddr::new(cfg.onvif_address, cfg.onvif_port))
+            .await
+            .unwrap();
+        let body = format!(
+            "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\"><s:Body>{operation}</s:Body></s:Envelope>"
+        );
+        let head = format!(
+            "POST /onvif/media_service HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/soap+xml\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        http.socket
+            .write_all(format!("{head}{body}").as_bytes())
+            .await
+            .unwrap();
+        http.reply().await.unwrap().status
+    }
+
+    #[tokio::test]
+    async fn service_waits_without_a_camera_becomes_ready_and_survives_unplug() {
+        let cfg = cfg();
+        let live = jpeg(64, 48);
+        let sim = SonySimConfig {
+            warmup_reads: 0,
+            live_view_jpeg: live.clone(),
+            ..SonySimConfig::default()
+        };
+        let mut first = sony_camera(sim.clone());
+        first.inject(Endpoint::BulkOut, 18, Fault::Disconnect);
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let factory = Hotplug {
+            queue: Arc::clone(&queue),
+            released: Arc::clone(&released),
+        };
+        let (stop, stopped) = oneshot::channel();
+        let (listening, listening_rx) = oneshot::channel();
+        let server = Box::pin(async {
+            tethercam::supervisor::serve(
+                factory,
+                &cfg,
+                None,
+                async {
+                    let _ = stopped.await;
+                },
+                &mut Listening(Some(listening)),
+            )
+            .await
+        });
+        let clients = async {
+            listening_rx.await.unwrap();
+            // Waiting: reachable, and every surface says so instead of hanging or guessing.
+            let reply = describe(&cfg, "/live/main").await;
+            assert_eq!(reply.status, 503);
+            assert_eq!(reply.header("retry-after"), Some("5"));
+            assert_eq!(media_status(&cfg, "<trt:GetProfiles/>").await, 503);
+            wait_for_state(&cfg, "waiting").await;
+            let (waiting, body) = authed_get(&cfg, "/tethercam/status").await;
+            assert_eq!((waiting, body.as_str()), (200, "{\"camera\":\"waiting\"}"));
+
+            // A camera appears: profiles, SDP and video come from its first frame.
+            queue.lock().unwrap().push_back(first);
+            wait_for_state(&cfg, "ready").await;
+            let profiles = soap(&cfg, "<trt:GetProfiles/>").await;
+            assert!(profiles.contains("token=\"main\""));
+            assert!(profiles.contains("Width>64<"));
+            assert_eq!(describe(&cfg, "/live/main").await.status, 200);
+            let main_uri = uri(&cfg, "GetStreamUri", "main").await;
+            let addr = SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port);
+            let mut main = Client::open(addr).await.unwrap();
+            main.authenticate(&main_uri).await.unwrap();
+            main.play(&main_uri).await.unwrap();
+            let _ = main.frame(96).await.unwrap();
+
+            // It goes away: back to waiting, listeners and the published format stay up, and a
+            // snapshot is refused rather than served stale.
+            wait_for_state(&cfg, "waiting").await;
+            assert_eq!(released.lock().unwrap().len(), 1);
+            assert_eq!(describe(&cfg, "/live/main").await.status, 200);
+            let snapshot_uri = uri(&cfg, "GetSnapshotUri", "main").await;
+            let path = snapshot_uri
+                .strip_prefix(&format!("http://{}:{}", cfg.onvif_address, cfg.onvif_port))
+                .unwrap();
+            assert_eq!(authed_get(&cfg, path).await.0, 503);
+
+            // It returns: ready again and the same client's stream resumes.
+            queue.lock().unwrap().push_back(sony_camera(sim.clone()));
+            wait_for_state(&cfg, "ready").await;
+            let _ = timeout(WAIT, main.frame(96)).await.unwrap().unwrap();
+            stop.send(()).unwrap();
+        };
+        let (result, ()) = timeout(Duration::from_secs(60), async {
+            tokio::join!(server, clients)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        assert_eq!(released.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_camera_returning_with_another_resolution_fails_the_run_instead_of_being_served() {
+        let cfg = cfg();
+        let sim = |width, height| SonySimConfig {
+            warmup_reads: 0,
+            live_view_jpeg: jpeg(width, height),
+            ..SonySimConfig::default()
+        };
+        let mut first = sony_camera(sim(64, 48));
+        first.inject(Endpoint::BulkOut, 18, Fault::Disconnect);
+        let queue = Arc::new(Mutex::new(VecDeque::from([first])));
+        let released = Arc::new(Mutex::new(Vec::new()));
+        let factory = Hotplug {
+            queue: Arc::clone(&queue),
+            released: Arc::clone(&released),
+        };
+        let (ready, ready_rx) = oneshot::channel();
+        let mut out = Ready(Some(ready));
+        let server = Box::pin(tethercam::supervisor::serve(
+            factory,
+            &cfg,
+            None,
+            std::future::pending(),
+            &mut out,
+        ));
+        let clients = async {
+            ready_rx.await.unwrap();
+            let main_uri = uri(&cfg, "GetStreamUri", "main").await;
+            let addr = SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port);
+            let mut main = Client::open(addr).await.unwrap();
+            main.authenticate(&main_uri).await.unwrap();
+            main.play(&main_uri).await.unwrap();
+            wait_for_state(&cfg, "waiting").await;
+            queue.lock().unwrap().push_back(sony_camera(sim(32, 32)));
+        };
+        let (result, ()) = timeout(Duration::from_secs(60), async {
+            tokio::join!(server, clients)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(tethercam::supervisor::RunError::Pipeline(_))
+        ));
+        // Both bodies were closed cleanly; the second was never streamed.
+        assert_eq!(released.lock().unwrap().len(), 2);
     }
 }

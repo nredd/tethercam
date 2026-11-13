@@ -131,6 +131,16 @@ universally available, and emitting mandatory inaccessible namespaces would prev
 No privilege escalation, global rule installation, lingering change or bus creation is attempted
 by a user install. User services normally stop on logout unless an administrator enables lingering.
 
+## Starting without a camera
+
+The installed service starts, and stays up, whether or not the camera is connected, awake or in PC
+Remote mode. RTSP and ONVIF HTTP bind at startup (so a busy port fails the unit at once), answer
+`503` until the first live-view frame defines the stream, and the authenticated
+`GET /tethercam/status` reports `waiting` or `ready` with battery and power. WS-Discovery starts
+announcing when the camera is ready. Unplugging or power-cycling the camera returns the service to
+`waiting` without a restart; a camera that returns with a different live-view size ends the run,
+and the manager's restart policy picks up the new size. See [`architecture.md`](architecture.md#waiting-for-the-camera).
+
 ## Shutdown and validation
 
 Stopping a service sends `SIGTERM` and waits for joined runtime cleanup. systemd uses

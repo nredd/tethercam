@@ -28,6 +28,12 @@ Next release: `0.0.2`.
 
 ### Changed
 
+- Start RTSP and ONVIF HTTP without a camera: RTSP `DESCRIBE`/`SETUP` and the ONVIF Device and Media services answer `503` until the first live-view frame defines the stream size, then publish profiles and SDP from it; WS-Discovery announces once ready. No resolution is declared or guessed
+- Add the Digest-authenticated `GET /tethercam/status` (`waiting`/`ready`, battery percentage and power source, no device identity) and `camera_ready`/`runtime_listening` log events
+- Check every live-view frame's JPEG header size against the described streams, even with no subscriber; a changed size now fails the run instead of waiting for the first `PLAY`
+- Give live-view snapshots a 10 s reply budget; only opt-in full-resolution stills keep 360 s
+- Print `Listening ... waiting for a camera.` first; `Serving authenticated RTSP and ONVIF` now follows the first frame
+- `RtspServer::fanout` returns `Option`, and `RtspServer::bind_pending` with `StreamPublisher` and `OnvifService::pending` with `ModelPublisher` allow late stream and model publication
 - Serve the newest live-view JPEG as the ONVIF snapshot instead of firing the shutter for every request, fetching one frame when the last is over 2 s old and failing at once with no camera
 - Add opt-in `streams.full_resolution_snapshot` (default off) for full-resolution stills; a still that fails without leaving the shutter pressed (no image, unsupported) no longer ends the camera session
 - Keep WS-Discovery running when one interface cannot bind or join: skip it with a warning and fail only when none is usable; skip loopback and IPv4 link-local addresses when neither `interface` nor a specific `onvif_address` is set, and keep a skipped interface from claiming its subnet in the responder

@@ -23,7 +23,7 @@ use tokio::time::sleep_until;
 use super::digest::{AuthOutcome, hex};
 use super::message::{Incoming, Method, Request, Response, encode_interleaved, parse_incoming};
 use super::rtcp::{RtpHeader, SenderInfo, ntp_timestamp, write_sender_report};
-use super::server::Shared;
+use super::server::{Shared, Streams};
 use super::setup::{TransportSpec, format_transport, parse_transport};
 use super::source::{Fanout, MediaSource, Packet, Subscription};
 
@@ -236,16 +236,13 @@ impl<S: MediaSource> Connection<S> {
         }
     }
 
-    fn mount(&self, uri: &str, setup: bool) -> Option<(&str, &Arc<Fanout<S>>)> {
+    fn mount<'a>(
+        &'a self, streams: &'a Streams<S>, uri: &str, setup: bool,
+    ) -> Option<(&'a str, &'a Arc<Fanout<S>>)> {
         let path = uri_path(uri)?;
-        std::iter::once((self.shared.config.mount_path.as_str(), &self.shared.fanout))
-            .chain(
-                self.shared
-                    .mounts
-                    .iter()
-                    .map(|m| (m.path.as_str(), &m.fanout)),
-            )
-            .find(|(mount, fanout)| {
+        std::iter::once((self.shared.config.mount_path.as_str(), &streams.fanout))
+            .chain(streams.mounts.iter().map(|m| (m.path.as_str(), &m.fanout)))
+            .find(move |(mount, fanout)| {
                 if setup {
                     path == format!("{mount}/{}", fanout.source().track().control)
                 } else {
@@ -254,8 +251,16 @@ impl<S: MediaSource> Connection<S> {
             })
     }
 
+    /// `503` with a retry hint: the streams do not exist yet, e.g. no camera has appeared.
+    fn not_ready() -> Response {
+        Response::new(503).with_header("Retry-After", "5")
+    }
+
     fn describe(&self, request: &Request) -> Response {
-        let Some((_, fanout)) = self.mount(&request.uri, false) else {
+        let Some(streams) = self.shared.streams.get() else {
+            return Self::not_ready();
+        };
+        let Some((_, fanout)) = self.mount(streams, &request.uri, false) else {
             return Response::new(404);
         };
         let track = fanout.source().track();
@@ -271,7 +276,10 @@ impl<S: MediaSource> Connection<S> {
     }
 
     async fn setup(&mut self, request: &Request) -> Response {
-        let Some((mount, fanout)) = self.mount(&request.uri, true) else {
+        let Some(streams) = self.shared.streams.get() else {
+            return Self::not_ready();
+        };
+        let Some((mount, fanout)) = self.mount(streams, &request.uri, true) else {
             return Response::new(404);
         };
         let mount = mount.to_owned();

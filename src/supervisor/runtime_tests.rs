@@ -23,6 +23,7 @@ async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
     .unwrap();
     let logs = logs.text();
     assert!(logs.contains("waiting_camera"));
+    assert!(logs.contains("runtime_listening"));
     assert!(logs.contains("runtime_ready"));
     assert_eq!(logs.matches("runtime_stopped").count(), 1);
     assert!(!logs.contains("runtime_failed"));
@@ -76,13 +77,35 @@ async fn malformed_live_frame_through_ptp_stops_networks_and_closes_the_camera()
     );
 }
 
-struct FlushFailure;
-impl Write for FlushFailure {
+/// Fails the write, or the flush after it, of the line starting with `line`.
+struct LineFailure {
+    line: &'static [u8],
+    on_flush: bool,
+    hit: bool,
+}
+impl LineFailure {
+    fn new(line: &'static str, on_flush: bool) -> Self {
+        Self {
+            line: line.as_bytes(),
+            on_flush,
+            hit: false,
+        }
+    }
+}
+impl Write for LineFailure {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // `writeln!` with arguments arrives in pieces; only the first starts with the line.
+        self.hit |= bytes.starts_with(self.line);
+        if self.hit && !self.on_flush {
+            return Err(io::Error::other("synthetic write failure"));
+        }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        Err(io::Error::other("synthetic flush failure"))
+        if self.hit {
+            return Err(io::Error::other("synthetic flush failure"));
+        }
+        Ok(())
     }
 }
 
@@ -98,7 +121,7 @@ async fn ready_output_flush_failure_closes_started_listeners_and_session() {
             &cfg,
             None,
             std::future::pending(),
-            &mut FlushFailure
+            &mut LineFailure::new("Serving", true)
         )
         .with_subscriber(logs.dispatch())
         .await
@@ -200,7 +223,7 @@ fn profiles_match_enabled_codecs_actual_dimensions_rate_and_mounts() {
 }
 
 #[tokio::test]
-async fn shutdown_before_camera_and_invalid_config_do_not_start_listeners() {
+async fn shutdown_before_camera_only_reports_waiting_and_invalid_config_fails() {
     let mut cfg = cfg();
     let mut out = Vec::new();
     serve(
@@ -212,7 +235,10 @@ async fn shutdown_before_camera_and_invalid_config_do_not_start_listeners() {
     )
     .await
     .unwrap();
-    assert_eq!(out, [] as [u8; 0]);
+    let out_text = String::from_utf8(out.clone()).unwrap();
+    assert!(out_text.starts_with("Listening for RTSP and ONVIF; waiting for a camera."));
+    assert!(!out_text.contains("Serving"));
+    out.clear();
     cfg.onvif_port = 0;
     assert!(
         serve(
@@ -267,13 +293,30 @@ async fn startup_failures_still_close_the_camera_session() {
     assert_eq!(released.lock().unwrap()[0].reset_count(), 0);
     let factory = Factory::new(vec![camera()]);
     let released = Arc::clone(&factory.released);
-    let mut full: &mut [u8] = &mut [];
+    let mut failing = LineFailure::new("Serving", false);
     assert!(
-        serve(factory, &cfg, None, std::future::pending(), &mut full)
+        serve(factory, &cfg, None, std::future::pending(), &mut failing)
             .await
             .is_err()
     );
     assert_eq!(released.lock().unwrap().len(), 1);
+    // The waiting line fails before any camera exists; nothing is left bound.
+    for on_flush in [false, true] {
+        let mut failing = LineFailure::new("Listening", on_flush);
+        assert!(
+            serve(
+                Factory::new(Vec::new()),
+                &cfg,
+                None,
+                std::future::pending(),
+                &mut failing
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(std::net::TcpListener::bind((cfg.rtsp_address, cfg.rtsp_port)).is_ok());
+    assert!(std::net::TcpListener::bind((cfg.onvif_address, cfg.onvif_port)).is_ok());
     let occupied = std::net::TcpListener::bind((cfg.rtsp_address, cfg.rtsp_port)).unwrap();
     assert!(
         serve(
@@ -303,32 +346,146 @@ async fn startup_failures_still_close_the_camera_session() {
 }
 
 #[tokio::test]
-async fn startup_mount_selection_and_credential_validation_are_consistent() {
+async fn listeners_bind_before_any_camera_and_validate_credentials() {
     let control = control();
-    for flags in [(true, true), (true, false), (false, true)] {
-        let mut cfg = cfg();
-        cfg.streams.h264 = flags.0;
-        cfg.streams.mjpeg = flags.1;
-        let (_pipeline, rtsp, http) = start_servers(&cfg, &control, &jpeg(32, 32)).await.unwrap();
-        assert_eq!(rtsp.local_addr().unwrap().port(), cfg.rtsp_port);
-        drop(http);
-    }
-    let mut cfg = cfg();
+    let cfg = cfg();
+    let (listeners, http) = start_listeners(&cfg, &control).await.unwrap();
+    assert_eq!(listeners.rtsp.local_addr().unwrap().port(), cfg.rtsp_port);
+    assert!(listeners.rtsp.fanout().is_none());
+    assert_eq!(http.local_addr().port(), cfg.onvif_port);
+    drop(http);
+    let mut cfg = cfg;
     cfg.credentials.username = Secret::new("invalid:username".into());
-    assert!(start_servers(&cfg, &control, &jpeg(32, 32)).await.is_err());
+    assert!(start_listeners(&cfg, &control).await.is_err());
     cfg.credentials.username = Secret::new(String::new());
-    assert!(start_servers(&cfg, &control, &jpeg(32, 32)).await.is_err());
-    cfg.streams.h264 = false;
-    cfg.streams.mjpeg = false;
-    assert!(start_servers(&cfg, &control, &jpeg(32, 32)).await.is_err());
+    assert!(start_listeners(&cfg, &control).await.is_err());
     let error = crate::onvif::service::SetupError::Auth(crate::onvif::auth::AuthError::Entropy);
     assert!(start_http(&cfg, &control, Err(error)).is_err());
 }
 
+type Publishers = (
+    StreamPublisher<crate::supervisor::RuntimeSource>,
+    ModelPublisher,
+);
+
+/// Pending RTSP and ONVIF publishers; `mount` is the RTSP primary path.
+async fn pending_publishers(
+    cfg: &Config, mount: &str,
+) -> (RtspServer<crate::supervisor::RuntimeSource>, Publishers) {
+    let credentials = crate::rtsp::digest::Credentials::new("user", "password", "test").unwrap();
+    let (rtsp, streams) = RtspServer::bind_pending(
+        SocketAddr::new(cfg.rtsp_address, 0),
+        credentials,
+        ServerConfig {
+            mount_path: mount.into(),
+            ..ServerConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (_, model) = OnvifService::pending(
+        crate::onvif::auth::Credentials::new("user", "password").unwrap(),
+        Arc::new(crate::onvif::time::SystemClock),
+    )
+    .unwrap();
+    (rtsp, (streams, model))
+}
+
+/// Run the real actor over one synthetic camera and `serve_live` over `publishers` until it
+/// finishes on its own (an error) or the camera has produced its first frame.
+async fn live_with(cfg: &Config, publishers: Publishers) -> Result<(), RunError> {
+    let (actor, control) = Supervisor::new(
+        Factory::new(vec![camera()]),
+        crate::sony::SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let live = async {
+        let result = serve_live(cfg, &control, &mut out, publishers, None).await;
+        control.shutdown();
+        result
+    };
+    let (_, result) = tokio::join!(Box::pin(actor.run()), live);
+    result
+}
+
+#[tokio::test]
+async fn a_format_the_model_or_mounts_cannot_describe_fails_the_run_not_the_listeners() {
+    let mut cfg = cfg();
+    // The primary mount collides with the extra JPEG mount: the publisher refuses it.
+    let (_rtsp, publishers) = pending_publishers(&cfg, "/live/mjpeg").await;
+    assert_eq!(
+        live_with(&cfg, publishers).await.unwrap_err().to_string(),
+        "RTSP listener unavailable"
+    );
+    // No codec leaves nothing to describe: the model is refused.
+    cfg.streams.h264 = false;
+    cfg.streams.mjpeg = false;
+    let (_rtsp, publishers) = pending_publishers(&cfg, "/live/main").await;
+    assert_eq!(
+        live_with(&cfg, publishers).await.unwrap_err().to_string(),
+        "invalid network camera description"
+    );
+}
+
+#[tokio::test]
+async fn published_mounts_follow_the_enabled_codecs() {
+    for (h264, mjpeg, present, absent) in [
+        (true, true, &["/live/main", "/live/mjpeg"][..], &[][..]),
+        (true, false, &["/live/main"][..], &["/live/mjpeg"][..]),
+        (false, true, &["/live/mjpeg"][..], &["/live/main"][..]),
+    ] {
+        let mut cfg = cfg();
+        cfg.streams.h264 = h264;
+        cfg.streams.mjpeg = mjpeg;
+        let (stop, stopped) = oneshot::channel();
+        let (ready, ready_rx) = oneshot::channel();
+        let mut out = Ready(Some(ready));
+        let runtime = Box::pin(serve(
+            Factory::new(vec![camera()]),
+            &cfg,
+            None,
+            async {
+                let _ = stopped.await;
+            },
+            &mut out,
+        ));
+        let (result, ()) = tokio::join!(runtime, async {
+            ready_rx.await.unwrap();
+            let address = SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port);
+            let mut consumer = client::Client::open(address).await.unwrap();
+            let first = format!("rtsp://{address}{}", present[0]);
+            consumer.authenticate(&first).await.unwrap();
+            for path in present {
+                let uri = format!("rtsp://{address}{path}");
+                assert_eq!(
+                    consumer.request("DESCRIBE", &uri, "").await.unwrap().status,
+                    200
+                );
+            }
+            for path in absent {
+                let uri = format!("rtsp://{address}{path}");
+                assert_eq!(
+                    consumer.request("DESCRIBE", &uri, "").await.unwrap().status,
+                    404
+                );
+            }
+            drop(consumer);
+            stop.send(()).unwrap();
+        });
+        result.unwrap();
+    }
+}
+
+/// Fires on the "serving" line, i.e. once a camera defined the streams.
 struct Ready(Option<oneshot::Sender<()>>);
 impl Write for Ready {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if let Some(tx) = self.0.take() {
+        if bytes.starts_with(b"Serving")
+            && let Some(tx) = self.0.take()
+        {
             let _ = tx.send(());
         }
         Ok(bytes.len())
@@ -416,4 +573,84 @@ async fn discovery_worker_failures_and_prior_shutdown_are_joined() {
     );
     run_discovery(&control, Some(responder)).await.unwrap();
     run_discovery(&control, None).await.unwrap();
+}
+
+#[tokio::test]
+async fn first_frame_waits_for_a_frame_and_reports_an_actor_that_is_gone() {
+    // The supervisor was dropped: no frame can ever come.
+    assert_eq!(
+        first_frame(&control()).await.unwrap_err().to_string(),
+        "camera actor stopped before startup"
+    );
+    let (actor, control) = Supervisor::new(
+        Factory::new(vec![camera()]),
+        crate::sony::SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let work = async {
+        let frame = first_frame(&control).await.unwrap().unwrap();
+        assert!(frame.starts_with(&[0xff, 0xd8]));
+        control.shutdown();
+        // After a stop request there is nothing left to wait for.
+        assert!(first_frame(&control).await.unwrap().is_none());
+    };
+    let _ = tokio::join!(Box::pin(actor.run()), work);
+}
+
+#[tokio::test]
+async fn waiting_service_answers_rtsp_503_through_the_runtime_source() {
+    let cfg = cfg();
+    let (stop, stopped) = oneshot::channel();
+    let (listening, listening_rx) = oneshot::channel();
+    let mut out = Listening(Some(listening));
+    let runtime = Box::pin(serve(
+        Factory::new(Vec::new()),
+        &cfg,
+        None,
+        async {
+            let _ = stopped.await;
+        },
+        &mut out,
+    ));
+    let (result, ()) = tokio::join!(runtime, async {
+        listening_rx.await.unwrap();
+        let address = SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port);
+        let uri = format!("rtsp://{address}/live/main");
+        let mut consumer = client::Client::open(address).await.unwrap();
+        consumer.authenticate(&uri).await.unwrap();
+        let reply = consumer.request("DESCRIBE", &uri, "").await.unwrap();
+        assert_eq!(reply.status, 503);
+        assert_eq!(reply.header("retry-after"), Some("5"));
+        let setup = "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
+        let track = format!("{uri}/trackID=0");
+        assert_eq!(
+            consumer
+                .request("SETUP", &track, setup)
+                .await
+                .unwrap()
+                .status,
+            503
+        );
+        drop(consumer);
+        stop.send(()).unwrap();
+    });
+    result.unwrap();
+}
+
+/// Fires on the "waiting" line.
+struct Listening(Option<oneshot::Sender<()>>);
+impl Write for Listening {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.starts_with(b"Listening")
+            && let Some(tx) = self.0.take()
+        {
+            let _ = tx.send(());
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }

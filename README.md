@@ -98,13 +98,29 @@ camera session and streams up; any other still failure ends the session and reco
 without the key keep the default. A changed live-view resolution fails closed rather than
 advertising mismatched SDP/ONVIF metadata; restart to describe the new format.
 
-The actor waits for a camera and reconnects with capped backoff after unplug. One initial JPEG
-establishes actual stream dimensions before listeners start. Continuous capture and encoding begin
+The service starts with no camera. RTSP and ONVIF HTTP listen immediately; until the first
+live-view frame arrives, RTSP `DESCRIBE`/`SETUP` and every ONVIF Device/Media call answer `503`
+(`Retry-After` on RTSP) and WS-Discovery stays silent, because the stream size comes from that
+frame and is never guessed. The actor reconnects with capped backoff after unplug, and listeners
+stay up meanwhile. Continuous capture and encoding begin
 only after the first authenticated `PLAY`, and stop after the last subscriber leaves. `SIGINT` or
 `SIGTERM` waits for in-flight camera work, releases shutter buttons, closes the PTP session, sends
 WS-Discovery `Bye` when enabled, and joins network/CPU workers. With full-resolution snapshots
 enabled, a long still download can delay shutdown; force-killing the process skips this hygiene.
-A snapshot reply can time out independently without interrupting the camera operation.
+A snapshot reply can time out independently (10 s for live view, 360 s for stills) without
+interrupting the camera operation.
+
+Read the camera state with the generated credentials, e.g. `curl --digest -K client.conf
+http://192.0.2.10:8080/tethercam/status` (credentials in a `-K` file, not the command line):
+
+```json
+{"camera":"waiting"}
+{"camera":"ready","battery_percent":87,"power":"usb"}
+```
+
+`waiting` covers a camera that is off, asleep, not in PC Remote mode or unplugged; the log's
+`camera_open_failed` reason says which. A camera that returns with a different live-view size
+ends the run (restart picks up the new size) rather than being served under the old description.
 
 For an isolated hardware-free run:
 

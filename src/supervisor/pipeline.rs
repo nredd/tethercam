@@ -328,6 +328,26 @@ impl Pipeline {
             })
     }
 
+    /// Reject a frame whose declared size is not the one the streams were described with, even
+    /// while nobody streams: the camera changed mode, or another body replaced it. Serving it
+    /// under the old SDP and ONVIF profiles would be wrong. A frame without a readable header is
+    /// left to processing, which reports it.
+    fn check_size(&self, frame: &[u8]) -> Result<(), PipelineError> {
+        let (width, height) = self.processor.format;
+        match JpegDecoder::dimensions(frame) {
+            Ok(actual) if actual != (width, height) => {
+                Err(crate::media::EncodeError::FrameMismatch {
+                    width,
+                    height,
+                    actual_width: actual.0,
+                    actual_height: actual.1,
+                }
+                .into())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) async fn run(self) -> Result<(), PipelineError> {
         self.run_with_worker(spawn_worker).await
     }
@@ -349,6 +369,7 @@ impl Pipeline {
             if fresh {
                 let latest = self.frames.borrow_and_update().clone();
                 if let Some(frame) = latest {
+                    self.check_size(&frame)?;
                     pacer.push(frame);
                 } else {
                     // Never repeat a stale frame after unplug, even while clients stay subscribed.

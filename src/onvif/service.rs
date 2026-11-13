@@ -28,7 +28,7 @@
 //! - [WS-Security UsernameToken Profile 1.1](https://docs.oasis-open.org/wss/v1.1/wss-v1.1-spec-os-UsernameTokenProfile.pdf)
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 
@@ -36,7 +36,7 @@ use super::auth::digest::DigestAuth;
 use super::auth::wsse::{NS_WSSE, UsernameToken, WsseConfig, WsseVerifier};
 use super::auth::{AuthError, Credentials};
 use super::device::{self, DEVICE_PATH};
-use super::media::{self, MEDIA_PATH, SNAPSHOT_PREFIX};
+use super::media::{self, MEDIA_PATH, SNAPSHOT_PREFIX, STATUS_PATH};
 use super::model::{DeviceModel, StreamProfile};
 use super::soap::{Element, Envelope, Fault, NS_DEVICE, SoapError, SoapLimits, envelope};
 use super::time::Clock;
@@ -54,6 +54,13 @@ pub trait SnapshotSource: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`SnapshotError`] when no frame is available.
     fn snapshot(&self, profile_token: &str) -> Result<Vec<u8>, SnapshotError>;
+}
+
+/// Camera state for the status endpoint, implemented by the supervisor. It must carry no device
+/// identity (no serial, no address, no name): only whether a camera is serving and its power.
+pub trait StatusSource: Send + Sync + std::fmt::Debug {
+    /// A JSON document describing the camera state.
+    fn status_json(&self) -> String;
 }
 
 /// No snapshot could be produced right now.
@@ -138,6 +145,16 @@ impl ServiceResponse {
             www_authenticate: None,
         }
     }
+
+    /// `503` for a service that is up but has no camera yet; clients retry. Answered before
+    /// authentication on the SOAP services: a `401` would read as a credential failure to
+    /// WS-Security clients, which retry transport errors but stop and ask the user on auth ones.
+    fn not_ready() -> Self {
+        Self {
+            body: b"camera not ready".to_vec(),
+            ..Self::plain(503)
+        }
+    }
 }
 
 /// Per-request view handed to the handlers.
@@ -196,12 +213,26 @@ enum Endpoint {
 /// The ONVIF Device and Media services behind one request router.
 #[derive(Debug)]
 pub struct OnvifService {
-    model: DeviceModel,
+    model: Arc<OnceLock<DeviceModel>>,
     clock: Arc<dyn Clock>,
     wsse: WsseVerifier,
     digest: DigestAuth,
     snapshot: Option<Arc<dyn SnapshotSource>>,
+    status: Option<Arc<dyn StatusSource>>,
     limits: SoapLimits,
+}
+
+/// The one-shot right to publish a pending service's [`DeviceModel`]; see
+/// [`OnvifService::pending`].
+pub struct ModelPublisher(Arc<OnceLock<DeviceModel>>);
+
+impl ModelPublisher {
+    /// Start answering the Device and Media services and the snapshot endpoint with `model`.
+    /// Consumes the publisher, so the model is set at most once.
+    pub fn publish(self, model: DeviceModel) {
+        // Single use: `self` is consumed, so the cell is still empty and `set` cannot fail.
+        let _ = self.0.set(model);
+    }
 }
 
 enum Verdict {
@@ -227,6 +258,32 @@ impl OnvifService {
         Self::from_digest(model, credentials, clock, digest)
     }
 
+    /// A service with no model yet, e.g. while the camera that defines the profiles is absent.
+    /// Until the returned publisher supplies one, the Device and Media services answer `503`
+    /// and the snapshot endpoint answers `503` after authentication; only the status endpoint
+    /// (see [`OnvifService::with_status_source`]) reports anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SetupError`] when the system random source is unavailable.
+    pub fn pending(
+        credentials: Credentials, clock: Arc<dyn Clock>,
+    ) -> Result<(Self, ModelPublisher), SetupError> {
+        let digest = DigestAuth::new(credentials.clone(), REALM, clock.clone());
+        Self::pending_from_digest(credentials, clock, digest)
+    }
+
+    fn pending_from_digest(
+        credentials: Credentials, clock: Arc<dyn Clock>, digest: Result<DigestAuth, AuthError>,
+    ) -> Result<(Self, ModelPublisher), SetupError> {
+        let model = Arc::new(OnceLock::new());
+        let publisher = ModelPublisher(Arc::clone(&model));
+        Ok((
+            Self::assemble_with(model, credentials, clock, digest?),
+            publisher,
+        ))
+    }
+
     /// Like [`OnvifService::new`] with a fixed Digest secret, for deterministic tests.
     #[must_use]
     pub fn with_digest_secret(
@@ -246,12 +303,20 @@ impl OnvifService {
     fn assemble(
         model: DeviceModel, credentials: Credentials, clock: Arc<dyn Clock>, digest: DigestAuth,
     ) -> Self {
+        Self::assemble_with(Arc::new(OnceLock::from(model)), credentials, clock, digest)
+    }
+
+    fn assemble_with(
+        model: Arc<OnceLock<DeviceModel>>, credentials: Credentials, clock: Arc<dyn Clock>,
+        digest: DigestAuth,
+    ) -> Self {
         Self {
             model,
             wsse: WsseVerifier::new(credentials, clock.clone(), WsseConfig::default()),
             clock,
             digest,
             snapshot: None,
+            status: None,
             limits: SoapLimits::default(),
         }
     }
@@ -260,6 +325,13 @@ impl OnvifService {
     #[must_use]
     pub fn with_snapshot_source(mut self, source: Arc<dyn SnapshotSource>) -> Self {
         self.snapshot = Some(source);
+        self
+    }
+
+    /// Enable the authenticated status endpoint, `GET /tethercam/status`.
+    #[must_use]
+    pub fn with_status_source(mut self, source: Arc<dyn StatusSource>) -> Self {
+        self.status = Some(source);
         self
     }
 
@@ -281,8 +353,9 @@ impl OnvifService {
     pub fn handle(&self, req: &ServiceRequest<'_>) -> ServiceResponse {
         let path = req.target.split_once('?').map_or(req.target, |(p, _)| p);
         match path {
-            DEVICE_PATH => self.soap(Endpoint::Device, req),
-            MEDIA_PATH => self.soap(Endpoint::Media, req),
+            DEVICE_PATH => self.soap_when_ready(Endpoint::Device, req),
+            MEDIA_PATH => self.soap_when_ready(Endpoint::Media, req),
+            STATUS_PATH => self.status_request(req),
             _ => match path.strip_prefix(SNAPSHOT_PREFIX) {
                 Some(token) => self.snapshot_request(token, req),
                 None => ServiceResponse::plain(404),
@@ -308,6 +381,31 @@ impl OnvifService {
         }
     }
 
+    fn soap_when_ready(&self, endpoint: Endpoint, req: &ServiceRequest<'_>) -> ServiceResponse {
+        match self.model.get() {
+            Some(model) => self.soap(endpoint, model, req),
+            None => ServiceResponse::not_ready(),
+        }
+    }
+
+    fn status_request(&self, req: &ServiceRequest<'_>) -> ServiceResponse {
+        let Some(source) = &self.status else {
+            return ServiceResponse::plain(404);
+        };
+        if req.method != "GET" {
+            return ServiceResponse::plain(405);
+        }
+        if let Err(resp) = self.digest_verdict(req) {
+            return resp;
+        }
+        ServiceResponse {
+            status: 200,
+            content_type: "application/json",
+            body: source.status_json().into_bytes(),
+            www_authenticate: None,
+        }
+    }
+
     fn snapshot_request(&self, token: &str, req: &ServiceRequest<'_>) -> ServiceResponse {
         let Some(source) = &self.snapshot else {
             return ServiceResponse::plain(404);
@@ -318,7 +416,10 @@ impl OnvifService {
         if let Err(resp) = self.digest_verdict(req) {
             return resp;
         }
-        let Some(profile) = self.model.profile(token) else {
+        let Some(model) = self.model.get() else {
+            return ServiceResponse::not_ready();
+        };
+        let Some(profile) = model.profile(token) else {
             return ServiceResponse::plain(404);
         };
         match source.snapshot(&profile.token) {
@@ -332,7 +433,9 @@ impl OnvifService {
         }
     }
 
-    fn soap(&self, endpoint: Endpoint, req: &ServiceRequest<'_>) -> ServiceResponse {
+    fn soap(
+        &self, endpoint: Endpoint, model: &DeviceModel, req: &ServiceRequest<'_>,
+    ) -> ServiceResponse {
         if req.method != "POST" {
             return ServiceResponse::plain(405);
         }
@@ -357,7 +460,7 @@ impl OnvifService {
         }
 
         let ctx = Context {
-            model: &self.model,
+            model,
             local: req.local,
             now: self.clock.now_unix(),
             snapshot: self.snapshot.is_some(),
@@ -424,6 +527,24 @@ mod tests {
         let clock = Arc::new(ManualClock::new(0));
         let digest = DigestAuth::with_secret(credentials.clone(), REALM, clock.clone(), [9; 32]);
         assert!(OnvifService::from_digest(example_model(), credentials, clock, Ok(digest)).is_ok());
+    }
+
+    #[test]
+    fn pending_constructor_propagates_entropy_failure() {
+        let credentials = Credentials::new("synthetic-user", "synthetic-password").unwrap();
+        let clock = Arc::new(ManualClock::new(0));
+        let error = OnvifService::pending_from_digest(
+            credentials.clone(),
+            clock.clone(),
+            Err(AuthError::Entropy),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "authentication setup failed: random source unavailable"
+        );
+        assert!(OnvifService::pending(credentials, clock).is_ok());
     }
 
     #[test]

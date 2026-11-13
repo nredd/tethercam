@@ -64,8 +64,15 @@ mod suite {
             let stdout = child.0.as_mut().unwrap().stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let reader = std::thread::spawn(move || {
+                // The waiting line comes first; the serving line follows the first frame.
+                let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
-                BufReader::new(stdout).read_line(&mut line).unwrap();
+                while !line.contains("Serving") {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                }
                 tx.send(line).unwrap();
             });
             assert!(
