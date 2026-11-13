@@ -374,12 +374,7 @@ async fn failed_still_is_refused_and_the_stream_stays_up() {
         ..SonySimConfig::default()
     });
     // The warning's enabled branch only runs, and is only covered, under a live subscriber.
-    let logs = tempfile::NamedTempFile::new().unwrap();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(logs.reopen().unwrap())
-        .finish();
+    let logs = LogCapture::new();
     let (actor, control) = actor(Factory::new(vec![unsupported]));
     let actor = actor.with_still_snapshots(true);
     let released = Arc::clone(&actor.factory.released);
@@ -401,9 +396,9 @@ async fn failed_still_is_refused_and_the_stream_stays_up() {
         frames.changed().await.unwrap();
         control.shutdown();
     };
-    let (factory, ()) = tokio::join!(actor.run().with_subscriber(subscriber), work);
+    let (factory, ()) = tokio::join!(actor.run().with_subscriber(logs.dispatch()), work);
     assert_eq!(factory.released.lock().unwrap().len(), 1);
-    let logs = std::fs::read_to_string(logs.path()).unwrap();
+    let logs = logs.text();
     assert_eq!(logs.matches("snapshot_still_failed").count(), 1);
 }
 
