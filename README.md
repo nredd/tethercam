@@ -111,6 +111,8 @@ that cannot bind or join the multicast group is skipped with a logged warning; d
 only when none is usable. Set `interface` to an exact OS name to listen on that one interface
 only, loopback and link-local included, e.g. `interface = "en0"` on macOS or
 `interface = "eth0"` on Linux. A specific `onvif_address` likewise selects its own interface.
+Skipped interfaces are logged by position and OS interface index, and are not retried until the
+next start; pin `interface` to the one that matters if the warning names it.
 
 WS-Discovery infers the arrival interface from the sender's subnet, rather than receiving the
 interface from the socket. With overlapping subnets it chooses the most specific match; equal

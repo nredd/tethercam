@@ -913,6 +913,39 @@ fn shutdown_discards_queued_replies() {
 }
 
 #[test]
+fn an_unbound_interface_does_not_claim_its_subnet() {
+    // Wired and wireless on one /24; the first one could not join the group.
+    let both = config_with(vec![iface(10), iface(11)]);
+    assert_eq!(both.interfaces().len(), 2);
+    let healthy = both.with_usable_interfaces(&[false, true]);
+    assert_eq!(healthy.interfaces()[0].addr, iface(11).addr);
+    let mut r = rig_with(healthy);
+    r.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((peer(20), PROBE_ONVIF.as_bytes().to_vec()));
+    r.responder.step(POLL).unwrap();
+    r.clock.advance(MAX_DELAY);
+    r.responder.step(POLL).unwrap();
+    let wire = r.wire.0.borrow();
+    assert_eq!(wire.sent.len(), 1);
+    assert_eq!(wire.sent[0].0, 0);
+    assert_eq!(wire.sent[0].1, peer(20));
+    let reply = String::from_utf8_lossy(&wire.sent[0].2);
+    assert!(reply.contains("ProbeMatches"));
+    assert!(reply.contains("192.0.2.11:8080"));
+    assert_eq!(r.responder.stats().send_errors, 0);
+}
+
+#[test]
+fn a_short_usable_mask_drops_the_unlisted_interfaces() {
+    let kept = config_with(vec![iface(10), iface(11)]).with_usable_interfaces(&[true]);
+    assert_eq!(kept.interfaces().len(), 1);
+    assert_eq!(kept.interfaces()[0].addr, iface(10).addr);
+}
+
+#[test]
 fn send_failures_are_counted_not_fatal() {
     let mut r = rig();
     r.wire.0.borrow_mut().fail_sends = true;

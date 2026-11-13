@@ -134,6 +134,18 @@ fn unnamed_discovery_skips_loopback_and_ipv4_link_local_unless_asked_for() {
     assert_eq!(addrs(&cfg), ["127.0.0.1"]);
     cfg.onvif_address = "::1".parse().unwrap();
     assert_eq!(addrs(&cfg), ["::1"]);
+    cfg.onvif_address = "::".parse().unwrap();
+    let mut v6 = interfaces.clone();
+    v6.push(interface("v6", "2001:db8::1", true));
+    assert_eq!(
+        discovery(&cfg, v6)
+            .unwrap()
+            .interfaces()
+            .iter()
+            .map(|i| i.addr.to_string())
+            .collect::<Vec<_>>(),
+        ["2001:db8::1"]
+    );
     let only_unusable = vec![interface("lo", "127.0.0.1", true)];
     cfg.onvif_address = "0.0.0.0".parse().unwrap();
     assert_eq!(

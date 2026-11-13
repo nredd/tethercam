@@ -50,11 +50,13 @@ pub trait Transport {
 }
 
 /// One UDP socket per interface, bound to the wildcard address on the discovery port and
-/// joined to the group on its interface. An interface that could not be set up keeps its slot,
-/// empty, so interface numbers stay aligned with the responder's configuration.
+/// joined to the group on its interface. Interfaces that could not be set up are skipped; pass
+/// [`UdpTransport::usable`] to `Config::with_usable_interfaces` so the responder numbers
+/// interfaces like the sockets.
 #[derive(Debug)]
 pub struct UdpTransport {
-    sockets: Vec<Option<UdpSocket>>,
+    sockets: Vec<UdpSocket>,
+    usable: Vec<bool>,
     /// Socket polled first on the next receive; advances after every datagram so a flood on
     /// one interface cannot starve the others.
     next: usize,
@@ -76,24 +78,37 @@ impl UdpTransport {
     /// production bind without touching a multicast group.
     fn bind_inner(interfaces: &[Interface], port: u16, join: bool) -> Result<Self, Error> {
         let mut last_error = None;
-        let sockets: Vec<_> = interfaces
-            .iter()
-            .enumerate()
-            .map(|(n, i)| match open(i, port, join) {
-                Ok(socket) => Some(socket),
+        let mut sockets = Vec::new();
+        let mut usable = Vec::new();
+        for (n, i) in interfaces.iter().enumerate() {
+            let opened = open(i, port, join);
+            usable.push(opened.is_ok());
+            match opened {
+                Ok(socket) => sockets.push(socket),
                 Err(error) => {
                     let (family, kind) = (if i.addr.is_ipv4() { 4 } else { 6 }, error.kind());
-                    let (slot, total) = (n + 1, interfaces.len());
-                    log::warn!("Skipping IPv{family} discovery interface {slot}/{total}: {kind:?}");
+                    let (slot, total, os_index) = (n + 1, interfaces.len(), i.index);
+                    log::warn!(
+                        "Skipping IPv{family} discovery interface {slot}/{total} (OS index {os_index}): {kind:?}"
+                    );
                     last_error = Some(error);
-                    None
                 }
-            })
-            .collect();
-        match last_error {
-            Some(error) if sockets.iter().all(Option::is_none) => Err(error.into()),
-            _ => Ok(Self { sockets, next: 0 }),
+            }
         }
+        match last_error {
+            Some(error) if sockets.is_empty() => Err(error.into()),
+            _ => Ok(Self {
+                sockets,
+                usable,
+                next: 0,
+            }),
+        }
+    }
+
+    /// Per input interface, whether it bound; feed to `Config::with_usable_interfaces`.
+    #[must_use]
+    pub fn usable(&self) -> &[bool] {
+        &self.usable
     }
 }
 
@@ -284,7 +299,6 @@ impl UdpTransport {
                 .cycle()
                 .skip(self.next)
                 .take(count)
-                .filter_map(|(index, socket)| Some((index, socket.as_ref()?)))
             {
                 if let Some(datagram) = received(receive(socket, buf))? {
                     self.next = (index + 1) % count;
@@ -309,7 +323,6 @@ impl Transport for UdpTransport {
         let socket = self
             .sockets
             .get(interface)
-            .and_then(Option::as_ref)
             .ok_or(Error::NoSuchInterface(interface))?;
         socket
             .send_to(payload, dest)
@@ -323,7 +336,7 @@ mod tests {
     use super::*;
 
     fn sock(transport: &UdpTransport, index: usize) -> &UdpSocket {
-        transport.sockets[index].as_ref().unwrap()
+        &transport.sockets[index]
     }
 
     fn missing() -> Interface {
@@ -422,16 +435,16 @@ mod tests {
     }
 
     #[test]
-    fn one_unjoinable_interface_is_skipped_and_numbering_is_preserved() {
+    fn one_unjoinable_interface_is_skipped_and_reported_in_the_mask() {
         let mut t = UdpTransport::bind_inner(&[missing(), loopback()], 0, true).unwrap();
-        assert!(t.sockets[0].is_none());
-        assert!(t.sockets[1].is_some());
+        assert_eq!(t.usable(), [false, true]);
+        assert_eq!(t.sockets.len(), 1);
         let dest = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
         assert!(matches!(
-            t.send(0, dest, b"x"),
-            Err(Error::NoSuchInterface(0))
+            t.send(1, dest, b"x"),
+            Err(Error::NoSuchInterface(1))
         ));
-        t.send(1, dest, b"x").unwrap();
+        t.send(0, dest, b"x").unwrap();
         assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
     }
 
@@ -442,8 +455,7 @@ mod tests {
         let port = holder.local_addr().unwrap().port();
         assert!(UdpTransport::bind_inner(&[loopback()], port, false).is_err());
         let t = UdpTransport::bind_inner(&[loopback(), missing()], port, false).unwrap();
-        assert!(t.sockets[0].is_none());
-        assert!(t.sockets[1].is_some());
+        assert_eq!(t.usable(), [false, true]);
     }
 
     #[test]
@@ -562,7 +574,7 @@ mod tests {
         quiet.send_to(b"one", (Ipv4Addr::LOCALHOST, p1)).unwrap();
         let quiet_addr = quiet.local_addr().unwrap();
         // Make sure both queues are populated before receiving, whatever the host's timing.
-        for socket in t.sockets.iter().flatten() {
+        for socket in &t.sockets {
             socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
