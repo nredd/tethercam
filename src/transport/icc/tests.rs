@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
-use super::fake::{Call, Fake, Script, Shared, SimBoundary, Step, ok_reply};
+use super::fake::{Call, Fake, HOLD_LIMIT, Script, Shared, SimBoundary, Step, ok_reply};
 use super::{
     IccDeviceId, IccError, IccHandle, IccReply, IccSession, IccTimeout, MAX_DATA_BYTES,
     read_only_sample, run_with,
@@ -249,7 +249,9 @@ fn a_cancelled_caller_neither_backlogs_nor_overlaps_native_work() {
                 )
                 .await;
                 assert!(slow.is_err(), "the caller stopped waiting");
-                entered_rx.recv().expect("native work started");
+                entered_rx
+                    .recv_timeout(HOLD_LIMIT)
+                    .expect("native work started");
                 // The abandoned operation still runs: nothing else is admitted.
                 let during = (
                     handle.poll_event().await,
@@ -334,7 +336,9 @@ fn an_owner_that_dies_while_a_caller_is_gone_still_reports_disconnect() {
                 )
                 .await;
                 assert!(slow.is_err(), "the caller stopped waiting");
-                entered_rx.recv().expect("native work started");
+                entered_rx
+                    .recv_timeout(HOLD_LIMIT)
+                    .expect("native work started");
                 release_tx.send(()).expect("release");
                 // Nobody is waiting for the answer the dead owner never gives, so the gate
                 // alone must not strand the handle: the owner's end releases it.
@@ -808,7 +812,7 @@ fn a_gate_busy_close_can_be_retried_once_the_abandoned_work_settles() {
                 )
                 .await;
                 assert!(slow.is_err());
-                entered_rx.recv().expect("started");
+                entered_rx.recv_timeout(HOLD_LIMIT).expect("started");
                 let busy = s.close().await;
                 release_tx.send(()).expect("release");
                 let mut closed = Err(icc(IccError::Busy));
@@ -872,7 +876,7 @@ fn closing_with_an_unrepresentable_timeout_is_rejected() {
             block(async move {
                 let mut s = session(handle);
                 s.open().await.unwrap();
-                s.config.transaction_timeout = Duration::ZERO;
+                s.set_transaction_timeout(Duration::ZERO);
                 s.close().await
             })
         },
@@ -981,7 +985,7 @@ fn event_failures_fail_closed_with_the_right_effect() {
 
 #[test]
 fn polling_failures_from_the_bridge_apply_their_effect() {
-    let (out, _) = run(
+    let (out, shared) = run(
         |s| s.lease_events.push_back(Err(IccError::Disconnected)),
         |handle| {
             block(async move {
@@ -992,6 +996,92 @@ fn polling_failures_from_the_bridge_apply_their_effect() {
         },
     );
     assert_eq!(out, (Err(icc(IccError::Disconnected)), false));
+    // A retiring event failure gives the lease up, like a retiring command failure.
+    assert!(calls(&shared).contains(&Call::LeaseDropped));
+}
+
+#[test]
+fn a_cancelled_open_leaves_the_session_unresolved_until_close_confirms() {
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (out, shared) = run(
+        |s| s.hold_open = Some((entered_tx, release_rx)),
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                let slow = tokio::time::timeout(Duration::from_millis(50), s.open()).await;
+                assert!(slow.is_err(), "the caller stopped waiting");
+                entered_rx.recv_timeout(HOLD_LIMIT).expect("open started");
+                // The owner may still complete the open, so nothing is reused or reported closed.
+                let during = (
+                    s.is_open(),
+                    s.open().await,
+                    s.transaction(0x1009, &[], None).await.map(|_| ()),
+                    s.close().await,
+                );
+                release_tx.send(()).expect("release");
+                let mut closed = Err(icc(IccError::Busy));
+                for _ in 0..SETTLE_ATTEMPTS {
+                    closed = s.close().await;
+                    if closed != Err(icc(IccError::Busy)) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // Confirmed closed, so the same session can open again.
+                let reopened = s.open().await;
+                (during, closed, reopened)
+            })
+        },
+    );
+    assert_eq!(
+        out.0,
+        (
+            false,
+            Err(SessionError::AlreadyOpen),
+            Err(SessionError::NotOpen),
+            Err(icc(IccError::Busy))
+        )
+    );
+    assert_eq!((out.1, out.2), (Ok(()), Ok(())));
+    // The late success was closed with confirmation, not merely dropped.
+    let log = calls(&shared);
+    assert_eq!(log.iter().filter(|c| **c == Call::Close).count(), 1);
+    assert!(!log[..log.len() - 1].contains(&Call::LeaseDropped));
+}
+
+#[test]
+fn a_cancelled_open_that_never_opened_closes_as_a_no_op() {
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    let (out, shared) = run(
+        |s| {
+            s.hold_open = Some((entered_tx, release_rx));
+            s.open.push_back(Err(IccError::NativeFailure));
+        },
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                let slow = tokio::time::timeout(Duration::from_millis(50), s.open()).await;
+                assert!(slow.is_err());
+                entered_rx.recv_timeout(HOLD_LIMIT).expect("open started");
+                release_tx.send(()).expect("release");
+                let mut closed = Err(icc(IccError::Busy));
+                for _ in 0..SETTLE_ATTEMPTS {
+                    closed = s.close().await;
+                    if closed != Err(icc(IccError::Busy)) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (closed, s.open().await)
+            })
+        },
+    );
+    // The failed native open produced no lease: closing is trivially done and no close ran.
+    assert_eq!(out.0, Ok(()));
+    assert_eq!(out.1, Ok(()));
+    assert!(!calls(&shared).contains(&Call::Close));
 }
 
 // ---- end to end --------------------------------------------------------------------------

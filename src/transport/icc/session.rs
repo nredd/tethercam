@@ -10,7 +10,10 @@
 //! - events are advisory and bounded. Overflow, removal and any malformed event fail closed
 //!   and fault the session, so the Sony layer must close and reconnect to resynchronize
 //!
-//! Lifecycle: `Closed -> Open -> Closed`, with the failure states
+//! Lifecycle: `Closed -> Opening -> Open -> Closed`, with the failure states
+//! - `Opening`: an `open` is pending or was cancelled, so the owner may still complete it and
+//!   hold a lease. `open` is refused, `close` resolves it with confirmation, and a close that
+//!   finds no lease means the open never produced one
 //! - `Faulted`: no more transactions, but the lease remains and `close` confirms closure
 //! - `Retired`: the lease was given up; native cleanup settles it. Reuse is only probed
 //!   through `open`, which the native owner refuses while cleanup is unresolved
@@ -42,6 +45,7 @@ const MAX_ADVISORY: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Closed,
+    Opening,
     Open,
     Faulted,
     Retired,
@@ -53,7 +57,7 @@ enum State {
 pub struct IccSession {
     handle: IccHandle,
     device: IccDeviceId,
-    pub(super) config: SessionConfig,
+    config: SessionConfig,
     clock: fn() -> Instant,
     state: State,
 }
@@ -71,6 +75,12 @@ impl IccSession {
             clock,
             state: State::Closed,
         }
+    }
+
+    /// Change the whole-transaction timeout, to reach close-time validation after an open.
+    #[cfg(test)]
+    pub(super) fn set_transaction_timeout(&mut self, timeout: Duration) {
+        self.config.transaction_timeout = timeout;
     }
 
     /// Give the bridge handle back, for reuse after `close` or by a factory's `recover`.
@@ -99,7 +109,9 @@ impl IccSession {
         match self.state {
             State::Open => Ok(()),
             State::Quarantined => Err(IccError::Quarantined.into()),
-            State::Closed | State::Faulted | State::Retired => Err(SessionError::NotOpen),
+            State::Closed | State::Opening | State::Faulted | State::Retired => {
+                Err(SessionError::NotOpen)
+            }
         }
     }
 
@@ -161,10 +173,13 @@ impl PtpSession for IccSession {
     async fn open(&mut self) -> Result<(), SessionError> {
         match self.state {
             State::Quarantined => return Err(IccError::Quarantined.into()),
-            State::Open | State::Faulted => return Err(SessionError::AlreadyOpen),
+            State::Opening | State::Open | State::Faulted => return Err(SessionError::AlreadyOpen),
             State::Closed | State::Retired => {}
         }
         let timeout = Self::timeout(self.config.transaction_timeout)?;
+        // Set before the await so that a cancelled caller leaves the session unresolved, not
+        // closed: the owner can still complete the open and hold a lease.
+        let before = std::mem::replace(&mut self.state, State::Opening);
         match self.handle.open(self.device.clone(), timeout).await {
             Ok(()) => {
                 self.state = State::Open;
@@ -175,7 +190,10 @@ impl PtpSession for IccSession {
             Err(error) if matches!(error.effect(), Effect::Retire | Effect::Quarantine) => {
                 Err(self.settle(error))
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                self.state = before;
+                Err(error.into())
+            }
         }
     }
 
@@ -184,11 +202,16 @@ impl PtpSession for IccSession {
             State::Closed => return Ok(()),
             State::Quarantined => return Err(IccError::Quarantined.into()),
             State::Retired => return Err(IccError::Busy.into()),
-            State::Open | State::Faulted => {}
+            State::Opening | State::Open | State::Faulted => {}
         }
         let timeout = Self::timeout(self.config.transaction_timeout)?;
         match self.handle.close(timeout).await {
             Ok(()) => {
+                self.state = State::Closed;
+                Ok(())
+            }
+            // A cancelled open that never produced a lease leaves nothing to close.
+            Err(IccError::NotOpen) if self.state == State::Opening => {
                 self.state = State::Closed;
                 Ok(())
             }

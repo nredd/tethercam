@@ -11,6 +11,9 @@ use crate::ptp::session::{Session, SessionConfig, SessionError};
 use crate::ptp::{Container, ContainerKind};
 use crate::transport::sim::SimCamera;
 
+/// Longest a held native call waits for its test, so a regression fails instead of hanging.
+pub(super) const HOLD_LIMIT: Duration = Duration::from_secs(10);
+
 /// One recorded boundary call. Payload bytes and identifiers are not recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Call {
@@ -52,6 +55,8 @@ pub(super) struct Script {
     pub calls: Vec<Call>,
     pub live_leases: usize,
     pub panic_on_discover: bool,
+    /// Block the next `open` the way a slow native open does: signal, then wait for release.
+    pub hold_open: Option<(SyncSender<()>, Receiver<()>)>,
 }
 
 pub(super) type Shared = Arc<Mutex<Script>>;
@@ -123,12 +128,12 @@ impl Lease for FakeLease<'_> {
                 result,
             }) => {
                 entered.send(()).expect("test is listening");
-                release.recv().expect("test releases");
+                release.recv_timeout(HOLD_LIMIT).expect("test releases");
                 result
             }
             Some(Step::Die { entered, release }) => {
                 entered.send(()).expect("test is listening");
-                release.recv().expect("test releases");
+                release.recv_timeout(HOLD_LIMIT).expect("test releases");
                 std::panic::resume_unwind(Box::new("synthetic native owner failure"))
             }
         }
@@ -168,12 +173,17 @@ impl Boundary for Fake {
         &mut self, _id: &IccDeviceId, _timeout: IccTimeout,
     ) -> Result<Self::Lease<'_>, IccError> {
         let shared = Arc::clone(&self.shared);
-        {
+        let (held, outcome) = {
             let mut script = lock(&shared);
             script.calls.push(Call::Open);
-            script.open.pop_front().unwrap_or(Ok(()))?;
-            script.live_leases += 1;
+            (script.hold_open.take(), script.open.pop_front())
+        };
+        if let Some((entered, release)) = held {
+            entered.send(()).expect("test is listening");
+            release.recv_timeout(HOLD_LIMIT).expect("test releases");
         }
+        outcome.unwrap_or(Ok(()))?;
+        lock(&shared).live_leases += 1;
         Ok(FakeLease {
             shared,
             closed: false,

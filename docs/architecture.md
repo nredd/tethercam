@@ -78,7 +78,7 @@ Native dependency justification (required for any dependency that links native c
 on the registry crate `image-capture` `=0.1.0`, target-gated to macOS. It wraps Apple's `ImageCaptureCore`
 through the `objc2` family, so all `unsafe` lives there and this repository stays `unsafe`-free. It links
 only Apple system frameworks, vendors and compiles no C, and requires Rust 1.99 where enabled. The only
-`deny.toml` entry is a ban on every other version of it, because an unreviewed bump would change reviewed
+`deny.toml` entry is a ban on every newer version of it, because an unreviewed bump would change reviewed
 unsafe code. Its licenses are already allowed. Validation is an AI-assisted independent source review (not
 a certification) and one short real-camera sample; there is no production support claim. Linux USB,
 simulator behavior, cross builds and the existing security and CI contracts are unchanged.

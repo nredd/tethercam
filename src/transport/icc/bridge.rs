@@ -9,7 +9,8 @@
 //!   [`IccError::Busy`], and the queue is bounded to one by construction
 //! - dropping a caller future never cancels the native operation. Its result is discarded
 //! - a lease is released only through confirmed close or an error that retires it
-//!   ([`IccError::retires_lease`]); the native owner settles whatever remains
+//!   ([`IccError::retires_lease`]), from a command, close or event poll; the native owner
+//!   settles whatever remains
 //! - the owner exits when the handle is dropped
 //!
 //! References:
@@ -220,7 +221,14 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
                 inbox.answer(reply, lease.close(timeout).map_err(lease_failure));
                 return true;
             }
-            Request::Event { reply } => inbox.answer(reply, lease.poll_event()),
+            Request::Event { reply } => {
+                let result = lease.poll_event();
+                let retire = result.as_ref().is_err_and(|e| e.retires_lease());
+                inbox.answer(reply, result);
+                if retire {
+                    return true;
+                }
+            }
             Request::Open { reply, .. } => inbox.answer(reply, Err(IccError::Busy)),
             Request::Discover { reply, .. } => inbox.answer(reply, Err(IccError::Busy)),
         }

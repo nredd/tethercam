@@ -20,7 +20,7 @@ The feature depends on the registry crate [`image-capture`](https://crates.io/cr
 `=0.1.0` ([source](https://github.com/nredd/image-capture)), target-gated to macOS. All native
 interop and every `unsafe` block live in that crate. This repository stays `unsafe`-free and keeps
 `unsafe_code = "forbid"`. Default, Linux, simulator and cross builds are unchanged: the dependency
-is not compiled off macOS, and `deny.toml` bans any other version of it. The feature needs Rust
+is not compiled off macOS, `Cargo.toml` pins `=0.1.0` and `deny.toml` bans every newer version. The feature needs Rust
 1.99 on macOS because that crate does; the declared MSRV is unchanged for everything else.
 
 Layers, all in `src/transport/icc/`:
@@ -44,7 +44,8 @@ Session semantics, all following from "ICC owns the pipes":
 - A caller deadline ends only the wait. `IccError::AdmissionExpired` means nothing was submitted;
   `IccError::DeadlineExceeded` means native work continues. After a deadline the session is *retired*:
   it refuses work, never issues a second close, and a replacement `open` returns `IccError::Busy`
-  until the native owner has settled cleanup. A late open success is closed natively after it completes
+  until the native owner has settled cleanup. A cancelled `open` future leaves the session `Opening`:
+  the owner may still complete it, so `close` (not a second `open`) resolves it with confirmation. A late open success is closed natively after it completes
 - Failure categories are sanitized statics: permission, busy, removal, admission, deadline, malformed
   completion, event overflow, malformed event, cleanup failure, quarantine
 - Failures fault, retire or quarantine the session. A faulted session refuses transactions but `close`
@@ -144,8 +145,8 @@ ownership and maintenance, and the published `image-capture` crate carries its o
 and native contract (AI-assisted independent source review, not a certification). That review covered
 the pinned bindings and headers, callback ABI, object, block and buffer lifetimes, thread transitions,
 disconnect and teardown, and any change to them (SDK, toolchain, dependency versions, unsafe sites) needs
-a renewed review before hardware use. `deny.toml` therefore bans every version of the crate except the
-reviewed `0.1.0`, and `Cargo.toml` pins it with `=0.1.0`. It links only Apple system frameworks, vendors
+a renewed review before hardware use. `Cargo.toml` therefore pins the reviewed `0.1.0` with `=0.1.0`, and
+`deny.toml` bans every newer version, so a bump fails the gate until the review is renewed. It links only Apple system frameworks, vendors
 no C, and sits behind the off-by-default `macos-icc` feature (justification in `architecture.md`). Native
 objects are never marked `Send` here: the native owner has a real run loop, and the portable worker is joined.
 
@@ -159,7 +160,7 @@ It did not test real deadlines, late callbacks, disconnect, LaunchAgent, or scre
 
 | Case | Required evidence before support |
 |---|---|
-| Discovery, open, handshake, live view, close and same-process reopen | Actual Rust boundary with helpers untouched, repeated sessions and explicit close results. The `icc_sample` run above covers discovery, open, `GetDeviceInfo`, confirmed close and reopen only; handshake and live view are not yet run on hardware |
+| Discovery, open, handshake, live view, close and same-process reopen | Actual Rust boundary with helpers untouched, repeated sessions and explicit close results. The `icc_sample` run above would cover discovery, open, `GetDeviceInfo`, confirmed close and reopen only, once the hardware owner has run it: it has not been run. Handshake and live view are not yet run on hardware |
 | Deadline during open, command and close; late success/error | Deterministic callback scheduler plus real deadline/late-callback tests, ownership and quarantine verified |
 | Disconnect and reconnect at each lifecycle phase | Real device tests plus scheduler tests; no overlapping replacement or assumed cleanup |
 | Events, overflow and property refresh | Verify framing and event completeness; test bounded overflow and explicit resynchronization |
