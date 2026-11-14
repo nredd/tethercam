@@ -154,11 +154,56 @@ async fn serve_until<F: CameraFactory>(
         result
     };
     // Neither sibling is abandoned when the other finishes. Only the actor owns PTP.
-    let (factory, result) = tokio::join!(actor.run(), network);
+    let (factory, result, ()) = tokio::join!(
+        actor.run(),
+        network,
+        report_counters(&control, COUNTERS_INTERVAL)
+    );
+    log_counters(&control, "run_counters_final");
     result
         .inspect(|()| tracing::info!(event = "runtime_stopped"))
         .inspect_err(|_| tracing::error!(event = "runtime_failed"))
         .map(|()| factory)
+}
+
+/// Period of the counts-only log line: 288 lines a day, enough to see a stall or a restart
+/// loop afterwards without making the service log chatty.
+const COUNTERS_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Log the run counters, the camera state and its battery/power. Counts only: no device
+/// identity, address or payload. `n/a` marks a value the camera does not report.
+fn log_counters(control: &Control, event: &'static str) {
+    let status = control.status();
+    let counts = control.counters();
+    tracing::info!(
+        event,
+        camera = %status.state(),
+        battery_percent = %status.battery_percent().map_or_else(|| "n/a".to_owned(), |percent| percent.to_string()),
+        power = %status.power().unwrap_or("n/a"),
+        uptime_secs = counts.uptime_secs,
+        frames_fetched = counts.frames_fetched,
+        frames_served = counts.frames_served,
+        frames_dropped = counts.frames_dropped,
+        reconnects = counts.reconnects,
+        session_restarts = counts.session_restarts,
+        connect_misses = counts.connect_misses,
+        snapshots_served = counts.snapshots_served,
+        snapshots_refused = counts.snapshots_refused,
+    );
+}
+
+/// Log the counters every `period` until a stop is requested. The first line is one `period`
+/// after start, and the final line is the caller's, after the actor has finished.
+async fn report_counters(control: &Control, period: Duration) {
+    let mut stop = control.stop.subscribe();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    while !control.stopping() {
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {},
+            _ = ticker.tick() => log_counters(control, "run_counters"),
+        }
+    }
 }
 
 fn worker_result<T>(result: Result<T, tokio::task::JoinError>) -> Result<T, RunError> {

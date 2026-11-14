@@ -499,9 +499,12 @@ fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_b
     })
     .unwrap();
     assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
-    // 100 ms doubling to the 5 s cap reaches 300 s on about the 66th attempt.
+    // Retries are bounded: 100 ms doubling to the 5 s cap reaches the 300 s limit on about the 66th
+    // attempt at most. The lower end is not fixed: while the fake native thread answers, the paused
+    // clock may jump ahead to the next timer, which is the five-minute counts line, so a run can
+    // reach the limit after only a few attempts. The deterministic result is the quarantine above.
     let attempts = script(&shared).calls.len();
-    assert!((60..=70).contains(&attempts), "{attempts}");
+    assert!(attempts <= 70, "{attempts}");
     assert!(logs.text().contains("icc_busy_limit_exceeded"));
 }
 

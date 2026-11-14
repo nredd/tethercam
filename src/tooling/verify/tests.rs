@@ -345,7 +345,7 @@ fn every_verifier_io_failure_returns_a_failure_instead_of_a_partial_success() {
     assert!(run_with(&values, Err(std::io::Error::other("current executable"))).is_err());
 }
 
-fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+pub(super) fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temp = tempfile::tempdir().expect("temp");
     let program = temp.path().join("good");
     let status = Command::new("rustc")

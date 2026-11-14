@@ -260,7 +260,7 @@ Client-visible behavior:
 | ONVIF Device and Media services (every operation, including `GetProfiles`, `GetStreamUri`, `GetSnapshotUri`, `GetCapabilities`) | HTTP `503`, body `camera not ready`, before authentication | Normal |
 | ONVIF snapshot endpoint | `401` challenge, then `503` once authenticated | Newest live-view JPEG |
 | WS-Discovery | Socket bound at startup (a bad interface fails the run), but no `Hello`, no `ProbeMatch`: not announced | Announced; `Hello` goes out when the first frame arrives |
-| `GET /tethercam/status` on the ONVIF port | Digest-authenticated JSON, `{"camera":"waiting"}` | `{"camera":"ready","battery_percent":87,"power":"usb"}` (battery fields only when the camera reports them) |
+| `GET /tethercam/status` on the ONVIF port | Digest-authenticated JSON: `{"camera":"waiting"}` as before, with the run counters appended | `{"camera":"ready","battery_percent":87,"power":"usb"}` as before, with the run counters appended (battery fields only when the camera reports them) |
 
 Why `503` before authentication on the ONVIF services: Home Assistant's ONVIF integration retries
 transport errors and `503` with backoff but stops and prompts the user on authentication
@@ -332,7 +332,7 @@ They map to:
   nonce replay cache and a bounded clock-skew window. HTTP Digest is the alternative. Only
   `GetSystemDateAndTime`, `GetCapabilities` and `GetServices` are pre-auth
 - Discovery reveals only what ONVIF requires: at most one unicast reply per accepted probe (each at most 1400 bytes), on-link sources only, `MessageID` de-duplicated, a per-source token bucket and one global bucket (burst 20, 10 per second) charged before parsing, so reflected traffic is bounded by `refill * reply cap` (14000 bytes per second by default) regardless of the number of sources. IPv6 link-local subnets are served only when the same interface has a non-link-local IPv6 address to advertise; otherwise they are omitted and a warning is emitted through the `log` facade (applications must configure a logger to display it). A per-interface bind or multicast-join failure is likewise a warning; the responder's interface set is rebuilt from the sockets that actually bound (`UdpTransport::usable`, `Config::with_usable_interfaces`) so a skipped interface never claims a subnet, and discovery fails only when no interface is usable
-- The status endpoint (`GET /tethercam/status`, ONVIF port) requires HTTP Digest like the snapshot endpoint and returns only camera state, battery percentage and power source: no serial, address, name or credentials
+- The status endpoint (`GET /tethercam/status`, ONVIF port) requires HTTP Digest like the snapshot endpoint and returns only camera state, battery percentage, power source and the run counters (totals since the process started, see [`service.md`](service.md#run-counters)): no serial, address, name or credentials
 - Credentials: random, generated at first run, stored in a config file created with owner-only
   permissions. Compared in constant time. Never logged
 - The `config` layer loads an explicit path or resolves the platform default. On first run it

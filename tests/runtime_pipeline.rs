@@ -512,7 +512,12 @@ mod suite {
             assert_eq!(media_status(&cfg, "<trt:GetProfiles/>").await, 503);
             wait_for_state(&cfg, "waiting").await;
             let (waiting, body) = authed_get(&cfg, "/tethercam/status").await;
-            assert_eq!((waiting, body.as_str()), (200, "{\"camera\":\"waiting\"}"));
+            // Existing members first and unchanged, counts after them.
+            assert_eq!(waiting, 200);
+            assert!(
+                body.starts_with("{\"camera\":\"waiting\",\"uptime_secs\":"),
+                "{body}"
+            );
 
             // A camera appears: profiles, SDP and video come from its first frame.
             queue.lock().unwrap().push_back(first);
@@ -551,6 +556,17 @@ mod suite {
             queue.lock().unwrap().push_back(sony_camera(sim.clone()));
             wait_for_state(&cfg, "ready").await;
             let _ = timeout(WAIT, main.frame(96)).await.unwrap().unwrap();
+            // The run so far, as one authenticated HTTP call: one unplug and one return, a
+            // refused snapshot, and frames fetched and served to the stream client.
+            let (_, body) = authed_get(&cfg, "/tethercam/status").await;
+            let counts: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(counts["reconnects"], 1, "{body}");
+            assert_eq!(counts["session_restarts"], 1, "{body}");
+            assert_eq!(counts["snapshots_refused"], 1, "{body}");
+            assert_eq!(counts["snapshots_served"], 0, "{body}");
+            assert!(counts["frames_fetched"].as_u64().unwrap() >= 2, "{body}");
+            assert!(counts["frames_served"].as_u64().unwrap() >= 1, "{body}");
+            assert!(counts["connect_misses"].as_u64().unwrap() >= 1, "{body}");
             stop.send(()).unwrap();
         };
         let (result, ()) = timeout(Duration::from_secs(60), async {

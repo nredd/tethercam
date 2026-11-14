@@ -25,6 +25,7 @@ fn arguments_errors_and_stream_failures() {
         vec!["unknown"],
         vec!["usbip"],
         vec!["release-tag", "bad"],
+        vec!["soak"],
     ] {
         assert!(dispatch(&args(&values), &mut Vec::new(), &mut std::io::empty()).is_err());
     }

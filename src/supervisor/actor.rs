@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
+use super::counters::{CounterSnapshot, Counters};
 use crate::onvif::service::{SnapshotError, SnapshotSource, StatusSource};
 use crate::ptp::session::{PtpSession, SessionConfig};
 use crate::sony::{Battery, CapturedImage, PowerSource, SonyCamera, SonyConfig, SonyError};
@@ -90,33 +91,58 @@ pub enum CameraStatus {
 }
 
 impl CameraStatus {
+    /// `waiting`, `ready` or `stopped`.
+    #[must_use]
+    pub fn state(self) -> &'static str {
+        match self {
+            Self::Disconnected => "waiting",
+            Self::Ready { .. } => "ready",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    /// Remaining battery charge, when a ready camera reports one.
+    #[must_use]
+    pub fn battery_percent(self) -> Option<u8> {
+        self.battery().and_then(|battery| battery.percent)
+    }
+
+    /// `battery`, `usb`, `no_battery` or `unknown`, when a ready camera reports a battery.
+    #[must_use]
+    pub fn power(self) -> Option<&'static str> {
+        self.battery().map(|battery| match battery.source {
+            PowerSource::Battery => "battery",
+            PowerSource::Usb => "usb",
+            PowerSource::NoBattery => "no_battery",
+            PowerSource::Unknown => "unknown",
+        })
+    }
+
+    fn battery(self) -> Option<Battery> {
+        match self {
+            Self::Ready { battery } => battery,
+            Self::Disconnected | Self::Stopped => None,
+        }
+    }
+
     /// A JSON document for the status endpoint: `camera` is `waiting`, `ready` or `stopped`; a
     /// ready camera that reports a battery adds `battery_percent` and `power` (`battery`, `usb`,
     /// `no_battery` or `unknown`). Nothing here identifies the device.
     #[must_use]
     pub fn to_json(self) -> String {
-        let Self::Ready { battery } = self else {
-            let state = if self == Self::Stopped {
-                "stopped"
-            } else {
-                "waiting"
-            };
-            return format!("{{\"camera\":\"{state}\"}}");
-        };
-        let Some(battery) = battery else {
-            return "{\"camera\":\"ready\"}".into();
-        };
-        let percent = battery
-            .percent
+        format!("{{{}}}", self.json_members())
+    }
+
+    fn json_members(self) -> String {
+        let percent = self
+            .battery_percent()
             .map(|percent| format!(",\"battery_percent\":{percent}"))
             .unwrap_or_default();
-        let power = match battery.source {
-            PowerSource::Battery => "battery",
-            PowerSource::Usb => "usb",
-            PowerSource::NoBattery => "no_battery",
-            PowerSource::Unknown => "unknown",
-        };
-        format!("{{\"camera\":\"ready\"{percent},\"power\":\"{power}\"}}")
+        let power = self
+            .power()
+            .map(|power| format!(",\"power\":\"{power}\""))
+            .unwrap_or_default();
+        format!("\"camera\":\"{}\"{percent}{power}", self.state())
     }
 }
 
@@ -152,6 +178,7 @@ pub struct Control {
     pub(super) stop: watch::Sender<bool>,
     status: watch::Receiver<CameraStatus>,
     still_snapshots: Arc<AtomicBool>,
+    pub(super) counters: Arc<Counters>,
 }
 
 impl fmt::Debug for Control {
@@ -174,6 +201,12 @@ impl Control {
         *self.status.borrow()
     }
 
+    /// Run counters since the process started. Counts only.
+    #[must_use]
+    pub fn counters(&self) -> CounterSnapshot {
+        self.counters.snapshot()
+    }
+
     pub(super) fn stopping(&self) -> bool {
         *self.stop.borrow()
     }
@@ -181,13 +214,23 @@ impl Control {
 
 impl SnapshotSource for Control {
     fn snapshot(&self, _profile_token: &str) -> Result<Vec<u8>, SnapshotError> {
-        self.request_snapshot(self.snapshot_budget())
+        let result = self.request_snapshot(self.snapshot_budget());
+        if result.is_ok() {
+            self.counters.snapshot_served();
+        } else {
+            self.counters.snapshot_refused();
+        }
+        result
     }
 }
 
 impl StatusSource for Control {
     fn status_json(&self) -> String {
-        self.status().to_json()
+        format!(
+            "{{{},{}}}",
+            self.status().json_members(),
+            self.counters().json_members()
+        )
     }
 }
 
@@ -232,6 +275,7 @@ pub struct Supervisor<F: CameraFactory> {
     clock: fn() -> Instant,
     frame_interval: Duration,
     still_snapshots: Arc<AtomicBool>,
+    counters: Arc<Counters>,
     demand: watch::Receiver<[u64; 2]>,
     snapshots: mpsc::Receiver<SnapshotReply>,
     frames: watch::Sender<Option<Arc<[u8]>>>,
@@ -256,6 +300,7 @@ impl<F: CameraFactory> Supervisor<F> {
         let (status, status_rx) = watch::channel(CameraStatus::Disconnected);
         let (snapshots, snapshots_rx) = mpsc::channel(4);
         let still_flag = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(Counters::new());
         Ok((
             Self {
                 factory,
@@ -264,6 +309,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 clock: Instant::now,
                 frame_interval,
                 still_snapshots: Arc::clone(&still_flag),
+                counters: Arc::clone(&counters),
                 demand: demand_rx,
                 snapshots: snapshots_rx,
                 frames,
@@ -277,6 +323,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 status: status_rx,
                 snapshots,
                 still_snapshots: still_flag,
+                counters,
             },
         ))
     }
@@ -317,6 +364,9 @@ impl<F: CameraFactory> Supervisor<F> {
             if let Err(error) = &connected {
                 tracing::warn!(event = "camera_open_failed", reason = %error);
             }
+            if !matches!(connected, Ok(Some(_))) {
+                self.counters.connect_missed();
+            }
             let mut refusal = None;
             if let Ok(Some(camera)) = connected {
                 let mut session = self
@@ -330,11 +380,13 @@ impl<F: CameraFactory> Supervisor<F> {
                             return Ok(());
                         }
                         let first = camera.next_live_view_frame().await?;
+                        self.counters.frame_fetched();
                         self.frames.send_replace(Some(Arc::from(first)));
                         self.status.send_replace(CameraStatus::Ready {
                             battery: camera.battery(),
                         });
                         was_ready = true;
+                        self.counters.session_ready();
                         tracing::info!(event = "camera_ready");
                         self.connected(camera).await
                     })
@@ -343,6 +395,7 @@ impl<F: CameraFactory> Supervisor<F> {
                         delay = Duration::from_millis(100);
                     }
                     if result.is_err() {
+                        self.counters.session_restarted();
                         tracing::warn!(event = "camera_disconnected");
                     }
                     if matches!(result, Err(SonyError::SdioUnsupported)) {
@@ -422,6 +475,7 @@ impl<F: CameraFactory> Supervisor<F> {
         &self, camera: &mut SonyCamera<'_, F::Session>, last_frame: &mut tokio::time::Instant,
     ) -> Result<(), SonyError> {
         let frame = camera.next_live_view_frame().await?;
+        self.counters.frame_fetched();
         self.frames.send_replace(Some(Arc::from(frame)));
         *last_frame = tokio::time::Instant::now();
         Ok(())
