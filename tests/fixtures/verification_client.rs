@@ -6,6 +6,9 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 
+/// A synthetic status document for the soak sampler's curl client.
+const STATUS: &str = "{\"camera\":\"ready\",\"battery_percent\":80,\"power\":\"usb\",\"uptime_secs\":5,\"frames_fetched\":10,\"frames_served\":9,\"frames_dropped\":1,\"reconnects\":0,\"session_restarts\":0,\"connect_misses\":2,\"snapshots_served\":0,\"snapshots_refused\":0}";
+
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let exe = std::env::current_exe()?;
@@ -50,7 +53,12 @@ fn main() -> io::Result<()> {
                 && flag == "-o"
                 && path != "/dev/null"
             {
-                std::fs::write(Path::new(path), [1, 2, 3])?;
+                let body: &[u8] = if name.contains("status") {
+                    STATUS.as_bytes()
+                } else {
+                    &[1, 2, 3]
+                };
+                std::fs::write(Path::new(path), body)?;
             }
         }
         write!(out, "{status}")?;

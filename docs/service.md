@@ -98,8 +98,8 @@ The Linux system scope requires root for all three operations, including reading
 macOS uses `gui/<uid>`'s per-user launchd agent, `KeepAlive`, `RunAtLoad`, a ten-second restart
 throttle, an owner-only umask, and separate stdout/stderr files under `~/Library/Logs`. No root
 LaunchDaemon is installed. A GUI login/domain is required; an unavailable domain is an error.
-Logs are not rotated by this installer: arrange normal host log rotation or remove old logs
-while stopped. Reinstallation checks existing logs only through protected metadata, never by
+Logs are not rotated by this installer, see [Run counters and the log bound](#run-counters-and-the-log-bound).
+Reinstallation checks existing logs only through protected metadata, never by
 reading or truncating their contents. Unit/rule/control-file comparisons use a bounded reader
 and reject files above 65,535 bytes; a growing or unrelated file cannot cause an unbounded read. The foreground runtime logs only sanitized lifecycle categories.
 
@@ -151,6 +151,73 @@ with status 75, and `KeepAlive` restarts it after the throttle. Under `icc` a st
 join, which can wait forever if the framework never calls back; `ExitTimeOut` 0 keeps launchd from
 sending `SIGKILL`. LaunchAgent execution, camera consent and signing, and screen lock are not validated
 on hardware.
+
+## Run counters
+
+The runtime counts what happened, so "what happened in the last 24 hours" is answerable from the
+log and one HTTP call. Counts only: totals since the process started, never a device identity,
+address or payload. Each counter is a relaxed atomic, so the frame path takes no lock.
+
+| Counter | Counts | Incremented |
+| --- | --- | --- |
+| `uptime_secs` | Wall-clock seconds since the process started, host sleep included | Read from the start time |
+| `frames_fetched` | Live-view frames fetched from the camera | `Supervisor::refresh` and the first frame of each session, `src/supervisor/actor.rs` |
+| `frames_served` | Paced frames handed to subscribers' RTP queues, duplicates that hold the frame rate included | After each processed frame in `Pipeline::run_with_worker`, `src/supervisor/pipeline.rs` |
+| `frames_dropped` | Fetched frames replaced in the pacer before they were emitted, plus frames whose packets met a full client queue (once per stream) | `account_drops` and `publish`, `src/supervisor/pipeline.rs`. Pacer overruns count only while a client streams |
+| `reconnects` | Sessions that reached live view after an earlier one | `Counters::session_ready`, when a session's first frame arrives |
+| `session_restarts` | Sessions that ended with an error (unplug, power-off, transport failure) | The `camera_disconnected` branch of `Supervisor::run` |
+| `connect_misses` | Connection attempts that found no usable camera (absent, busy, not in PC Remote mode) | After each `connect`, in `Supervisor::run`. About one per five seconds while the camera is away |
+| `snapshots_served` / `snapshots_refused` | Snapshot requests answered with an image / refused or failed | `Control::snapshot`, the seam the ONVIF snapshot endpoint calls |
+
+Nothing is fetched or served while no client streams, apart from snapshot refreshes, so the frame
+counters stay flat with no subscriber. The counters reset when the process restarts, so a decrease
+between two readings is a restart. `tethercam-tools soak` detects that and keeps totals across it
+([`soak.md`](soak.md)).
+
+The status endpoint reports them after the camera members, which are unchanged:
+
+```json
+{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0}
+```
+
+Before this, the document was only the camera members, e.g.
+`{"camera":"ready","battery_percent":87,"power":"usb"}`. A parser that reads those keys keeps working.
+
+The runtime also logs one line every five minutes (288 a day, about 350 bytes each) and a final
+`run_counters_final` line once shutdown has joined the camera actor. `n/a` marks a value the camera
+does not report; the numbers are the status document's:
+
+```text
+2026-11-13T18:00:00.000000Z  INFO event="run_counters" camera=ready battery_percent=87 power=usb uptime_secs=3700 frames_fetched=51210 frames_served=50877 frames_dropped=3 reconnects=1 session_restarts=1 connect_misses=2 snapshots_served=12 snapshots_refused=0
+```
+
+### Run counters and the log bound
+
+The service writes no log file of its own. launchd appends stdout and stderr to
+`~/Library/Logs/tethercam/stdout.log` and `stderr.log`; systemd writes to the journal. This
+project adds no rotation and no logging daemon.
+
+- Volume: steady state is the counts line, about 100 KB a day. The chattiest source is a camera that
+  is present but cannot be opened (`camera_open_failed`, one warning per attempt). Attempts back off
+  to one per five seconds, so the worst case is about 17,000 lines (a few MB) a day. An absent camera
+  logs nothing per attempt
+- macOS, no root: launchd opens the files in append mode, so truncating them while the agent runs is
+  safe and they restart at offset zero (checked with a throwaway launchd job on macOS):
+
+  ```sh
+  du -h ~/Library/Logs/tethercam/*.log
+  : > ~/Library/Logs/tethercam/stderr.log
+  ```
+
+  Copy the file first if you need its history. `newsyslog` rotation by rename needs root and does
+  not help, because launchd keeps writing to the renamed file
+- Linux: the journal rotates itself. Cap it with `SystemMaxUse=` in `journald.conf`, or
+  `journalctl --vacuum-size=100M`
+
+## Unattended run and soak
+
+`tethercam-tools soak` samples a running service for a long run and writes a counts-only report.
+The 24-hour procedure and the recovery checklist are in [`soak.md`](soak.md).
 
 ## Shutdown and validation
 

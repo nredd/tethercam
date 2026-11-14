@@ -27,12 +27,75 @@ async fn shutdown_arriving_at_ready_output_stops_before_the_first_rtsp_poll() {
     assert!(logs.contains("runtime_ready"));
     assert_eq!(logs.matches("runtime_stopped").count(), 1);
     assert!(!logs.contains("runtime_failed"));
+    // One final counts line, after the actor finished, and none from the five-minute reporter.
+    assert_eq!(logs.matches("event=\"run_counters_final\"").count(), 1);
+    assert_eq!(logs.matches("event=\"run_counters\"").count(), 0);
+    assert!(logs.contains("camera=stopped"));
     assert!(!logs.contains(cfg.credentials.username.expose()));
     assert!(!logs.contains(cfg.credentials.password.expose()));
     // The ready notification is one-shot, but subsequent diagnostic writes remain valid.
     out.write_all(b"secondary diagnostic").unwrap();
     assert!(std::net::TcpListener::bind((cfg.rtsp_address, cfg.rtsp_port)).is_ok());
     assert!(std::net::TcpListener::bind((cfg.onvif_address, cfg.onvif_port)).is_ok());
+}
+
+fn actor_control() -> (Supervisor<Factory>, Control) {
+    Supervisor::new(
+        Factory::new(vec![camera()]),
+        crate::sony::SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn counters_are_logged_on_a_fixed_period_until_stop() {
+    let logs = LogCapture::new();
+    let (_actor, control) = actor_control();
+    let work = async {
+        tokio::time::sleep(Duration::from_secs(650)).await;
+        control.shutdown();
+    };
+    async { tokio::join!(report_counters(&control, COUNTERS_INTERVAL), work) }
+        .with_subscriber(logs.dispatch())
+        .await;
+    let logs = logs.text();
+    // The first line is one period after start, not at start: 300 s and 600 s, not 650 s.
+    assert_eq!(logs.matches("event=\"run_counters\"").count(), 2);
+    assert!(logs.contains("camera=waiting"));
+    assert!(logs.contains("battery_percent=n/a power=n/a"));
+    assert!(logs.contains("frames_fetched=0 frames_served=0 frames_dropped=0"));
+    assert!(logs.contains("reconnects=0 session_restarts=0 connect_misses=0"));
+    assert!(logs.contains("snapshots_served=0 snapshots_refused=0"));
+    assert_eq!(COUNTERS_INTERVAL, Duration::from_secs(300));
+
+    // Already stopped: no wait for a period, no line.
+    let quiet = LogCapture::new();
+    let (_actor, control) = actor_control();
+    control.shutdown();
+    report_counters(&control, COUNTERS_INTERVAL)
+        .with_subscriber(quiet.dispatch())
+        .await;
+    assert_eq!(quiet.text(), "");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_counts_line_reports_battery_and_power_without_identity() {
+    let logs = LogCapture::new();
+    let (actor, control) = actor_control();
+    let work = async {
+        // Ready at once, and past the first telemetry refresh, which reads a settled battery.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        log_counters(&control, "run_counters");
+        control.shutdown();
+    };
+    let _ = tokio::join!(Box::pin(actor.run()), work.with_subscriber(logs.dispatch()));
+    let logs = logs.text();
+    assert!(logs.contains("camera=ready"), "{logs}");
+    assert!(!logs.contains("battery_percent=n/a"), "{logs}");
+    assert!(!logs.contains("power=n/a"), "{logs}");
+    assert!(logs.contains("frames_fetched=1"), "{logs}");
 }
 
 #[tokio::test]

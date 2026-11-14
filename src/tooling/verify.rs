@@ -5,8 +5,10 @@
 //! - <https://curl.se/docs/manpage.html>
 //! - <https://doc.rust-lang.org/std/process/struct.Child.html>
 
+mod soak;
 mod timed;
 use super::{Error, clients};
+pub(super) use soak::run as soak;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;

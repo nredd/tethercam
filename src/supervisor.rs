@@ -8,11 +8,13 @@
 //! - [RTP, RFC 3550](https://www.rfc-editor.org/rfc/rfc3550)
 
 mod actor;
+mod counters;
 mod pipeline;
 mod runtime;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use actor::{CameraFactory, CameraStatus, Control, OpenError, Supervisor, SupervisorError};
+pub use counters::CounterSnapshot;
 pub use pipeline::{PipelineError, RuntimeSource};
 pub use runtime::{RunError, serve};

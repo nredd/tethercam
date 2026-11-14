@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, watch};
 
 use super::Control;
+use super::counters::Counters;
 
 #[cfg(test)]
 #[path = "pipeline_tests.rs"]
@@ -111,6 +112,7 @@ struct Processor {
     pool: PacketPool,
     outputs: [mpsc::Sender<Queued>; 2],
     epochs: [u64; 2],
+    counters: Arc<Counters>,
 }
 
 impl Processor {
@@ -140,7 +142,7 @@ impl Processor {
         let [main_tx, _] = &self.outputs;
         self.h264
             .packetize(&self.annex_b, timestamp, &mut self.pool)
-            .map(|()| publish(main_tx, epoch, &self.pool))
+            .map(|()| publish(main_tx, epoch, &self.pool, &self.counters))
             .map_err(PipelineError::from)
     }
 
@@ -161,18 +163,28 @@ impl Processor {
         let [_, jpeg_tx] = &self.outputs;
         self.jpeg
             .packetize(jpeg, timestamp, &mut self.pool)
-            .map(|()| publish(jpeg_tx, epoch, &self.pool))
+            .map(|()| publish(jpeg_tx, epoch, &self.pool, &self.counters))
             .map_err(PipelineError::from)
     }
 }
 
-fn publish(tx: &mpsc::Sender<Queued>, epoch: u64, pool: &PacketPool) {
+fn publish(tx: &mpsc::Sender<Queued>, epoch: u64, pool: &PacketPool, counters: &Counters) {
     // Never wait for network clients. Once a queue fills, drop the rest of this frame.
     for packet in pool.iter() {
         if tx.try_send((epoch, Packet::new(packet.to_vec()))).is_err() {
+            counters.frames_dropped(1);
             break;
         }
     }
+}
+
+/// Count the pacer's overrun drops since `seen`. They only count while someone streams: with no
+/// subscriber every refreshed frame replaces an unemitted one, which is not a loss.
+fn account_drops(counters: &Counters, active: bool, dropped: u64, seen: &mut u64) {
+    if active {
+        counters.frames_dropped(dropped.saturating_sub(*seen));
+    }
+    *seen = dropped;
 }
 
 type Processed = (Processor, Result<(), PipelineError>);
@@ -311,6 +323,7 @@ impl Pipeline {
                             pool: PacketPool::new(),
                             outputs: [h264_tx, jpeg_tx],
                             epochs: [0; 2],
+                            counters: Arc::clone(&control.counters),
                         };
                         (
                             Self {
@@ -359,6 +372,7 @@ impl Pipeline {
         let mut demand = self.control.demand.subscribe();
         let mut stop = self.control.stop.subscribe();
         let mut fresh = true;
+        let mut seen_dropped = 0;
         loop {
             if self.control.stopping() {
                 return Ok(());
@@ -371,6 +385,12 @@ impl Pipeline {
                 if let Some(frame) = latest {
                     self.check_size(&frame)?;
                     pacer.push(frame);
+                    account_drops(
+                        &self.control.counters,
+                        active,
+                        pacer.stats().dropped,
+                        &mut seen_dropped,
+                    );
                 } else {
                     // Never repeat a stale frame after unplug, even while clients stay subscribed.
                     pacer.clear();
@@ -391,6 +411,7 @@ impl Pipeline {
                 let result = worker_result(result)?;
                 self.processor = result.0;
                 result.1?;
+                self.control.counters.frame_served();
             }
             clock.advance_to(origin.elapsed());
             let wait = pacer.time_until_due().unwrap_or(Duration::from_secs(1));

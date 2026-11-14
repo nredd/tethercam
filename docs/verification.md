@@ -197,6 +197,7 @@ The developer binary provides:
 tethercam-tools prepare-clients CONFIG NEW_CLIENT_DIRECTORY
 tethercam-tools verify MODE BIN CONFIG NEW_OUTPUT_DIRECTORY FFMPEG FFPROBE CURL JPEG_OR_DASH
 tethercam-tools profile-summary FRAMEHASH PACKETS METRICS_OR_DASH SOURCE_CSV_OR_DASH H264
+tethercam-tools soak CONFIG NEW_OUTPUT_DIRECTORY FFPROBE CURL DURATION_SECS SEGMENT_SECS GAP_MS
 tethercam-tools release-tag TAG
 ```
 
@@ -226,6 +227,10 @@ an early verifier failure. No force-kill deadline shortens camera session cleanu
 accounting includes the small controller and its waited-for server, **not** the separate media
 clients; compare measurements only with matching accounting scope. BSD byte RSS and GNU KiB RSS
 are normalized explicitly.
+
+`soak` samples an already running service for a long run and is documented in [`soak.md`](soak.md).
+It reuses `prepare-clients`' protected inputs, but accepts a wildcard listener (reached through loopback)
+or a configured host address, which `verify` refuses.
 
 `profile-summary` consumes aggregate artifacts only and emits numerical JSON. Image SHA is CSV
 field 5 (zero-based), never trailing PRFT side-data hashes. It reports output and distinct-

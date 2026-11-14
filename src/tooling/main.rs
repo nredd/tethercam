@@ -41,6 +41,7 @@ fn main() -> ExitCode {
 fn dispatch(args: &[OsString], out: &mut dyn Write, input: &mut dyn io::Read) -> Result<(), Error> {
     match args {
         [cmd, rest @ ..] if cmd == "verify" => verify::run(rest),
+        [cmd, rest @ ..] if cmd == "soak" => verify::soak(rest),
         [cmd, rest @ ..] if cmd == "serve-owned" => verify::serve(rest, input),
         [cmd, cfg, output] if cmd == "prepare-clients" => {
             clients::prepare(Path::new(cfg), Path::new(output)).map(drop)

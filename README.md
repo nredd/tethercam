@@ -116,9 +116,13 @@ Read the camera state with the generated credentials, e.g. `curl --digest -K cli
 http://192.0.2.10:8080/tethercam/status` (credentials in a `-K` file, not the command line):
 
 ```json
-{"camera":"waiting"}
-{"camera":"ready","battery_percent":87,"power":"usb"}
+{"camera":"waiting","uptime_secs":12,"frames_fetched":0,"frames_served":0,"frames_dropped":0,"reconnects":0,"session_restarts":0,"connect_misses":2,"snapshots_served":0,"snapshots_refused":0}
+{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0}
 ```
+
+The camera members come first and are unchanged; the counters are appended after them
+([`docs/service.md`](docs/service.md#run-counters) defines each one). `tethercam-tools soak` samples
+this endpoint and an RTSP client for a long run ([`docs/soak.md`](docs/soak.md)).
 
 `waiting` covers a camera that is off, asleep, not in PC Remote mode or unplugged; the log's
 `camera_open_failed` reason says which. (`stopped` appears only while shutting down.) A camera that returns with a different live-view size

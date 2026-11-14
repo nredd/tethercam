@@ -289,6 +289,7 @@ fn validates_intervals_and_debug_only_reports_telemetry() {
     assert_eq!(control.status(), CameraStatus::Disconnected);
     assert!(format!("{control:?}").contains("Disconnected"));
     assert_eq!(control.snapshot("main"), Err(SnapshotError));
+    assert_eq!(control.counters().snapshots_refused, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -325,6 +326,17 @@ async fn reconnects_with_capped_backoff_and_closes_failed_handshakes() {
         control.shutdown();
     };
     let (factory, ()) = tokio::join!(actor.run().with_subscriber(logs.dispatch()), work);
+    let counts = control.counters();
+    // Eight absent cameras and one open error, then a handshake that fails, then a good one.
+    assert_eq!(
+        (
+            counts.connect_misses,
+            counts.session_restarts,
+            counts.reconnects
+        ),
+        (9, 1, 0)
+    );
+    assert!(counts.frames_fetched >= 1);
     let logs = logs.text();
     assert_eq!(logs.matches("camera_open_failed").count(), 1);
     assert!(logs.contains("reason=camera disconnected"));
@@ -534,6 +546,8 @@ async fn live_snapshots_never_release_the_shutter_or_stall_streaming() {
         shutter_or_still_commands(&factory.released.lock().unwrap()[0]),
         0
     );
+    let counts = control.counters();
+    assert_eq!((counts.snapshots_served, counts.snapshots_refused), (5, 0));
 }
 
 #[tokio::test]
@@ -707,15 +721,85 @@ fn status_json_reports_state_and_power_without_identity() {
     );
 }
 
+const COUNT_KEYS: [&str; 9] = [
+    "uptime_secs",
+    "frames_fetched",
+    "frames_served",
+    "frames_dropped",
+    "reconnects",
+    "session_restarts",
+    "connect_misses",
+    "snapshots_served",
+    "snapshots_refused",
+];
+
+/// The status document with every count verified as a number and removed, so the camera state
+/// members can be compared exactly.
+fn state_members(control: &Control) -> (String, serde_json::Map<String, serde_json::Value>) {
+    let json = control.status_json();
+    let mut document: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&json).unwrap();
+    for key in COUNT_KEYS {
+        assert!(document.remove(key).unwrap().is_u64(), "{key}");
+    }
+    // Existing members stay first, in their original order, so older parsers are unaffected.
+    assert!(json.starts_with(r#"{"camera":""#));
+    (json, document)
+}
+
 #[tokio::test]
 async fn control_serves_status_json_through_the_status_source_seam() {
     let (actor, control) = actor(Factory::new(vec![camera()]));
-    assert_eq!(control.status_json(), r#"{"camera":"waiting"}"#);
+    let (_, waiting) = state_members(&control);
+    assert_eq!(
+        serde_json::Value::from(waiting),
+        serde_json::json!({"camera": "waiting"})
+    );
     let work = async {
         ready(&control).await;
-        assert!(control.status_json().starts_with(r#"{"camera":"ready""#));
+        let (json, ready) = state_members(&control);
+        assert_eq!(ready["camera"], "ready");
+        assert!(json.contains("\"frames_fetched\":1"));
         control.shutdown();
     };
     let _ = tokio::join!(Box::pin(actor.run()), work);
-    assert_eq!(control.status_json(), r#"{"camera":"stopped"}"#);
+    let (_, stopped) = state_members(&control);
+    assert_eq!(
+        serde_json::Value::from(stopped),
+        serde_json::json!({"camera": "stopped"})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_lost_after_ready_counts_a_restart_and_the_next_ready_a_reconnect() {
+    use crate::transport::sim::sony::Priority;
+    use crate::transport::{Endpoint, sim::Fault};
+    let cfg = SonySimConfig {
+        priority: Priority::Absent,
+        warmup_reads: 0,
+        live_view_jpeg: crate::supervisor::testing::jpeg(32, 32),
+        ..SonySimConfig::default()
+    };
+    let mut first = sony_camera(cfg.clone());
+    first.inject(Endpoint::InterruptIn, 0, Fault::Disconnect);
+    let (actor, control) = actor(Factory::new(vec![first, sony_camera(cfg)]));
+    let work = async {
+        ready(&control).await;
+        let mut status = control.status.clone();
+        status.borrow_and_update();
+        status.changed().await.unwrap();
+        assert_eq!(*status.borrow(), CameraStatus::Disconnected);
+        ready(&control).await;
+        control.shutdown();
+    };
+    let _ = tokio::join!(Box::pin(actor.run()), work);
+    let counts = control.counters();
+    assert_eq!(
+        (
+            counts.reconnects,
+            counts.session_restarts,
+            counts.frames_fetched
+        ),
+        (1, 1, 2)
+    );
 }

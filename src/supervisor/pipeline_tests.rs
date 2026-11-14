@@ -90,6 +90,21 @@ async fn input_updates_and_timer_underruns_emit_real_constant_rate_frames() {
         control.shutdown();
     });
     result.unwrap();
+    assert!(control.counters().frames_served > 0);
+}
+
+#[test]
+fn pacer_overruns_count_as_drops_only_while_someone_streams() {
+    let counters = Counters::new();
+    let mut seen = 0;
+    account_drops(&counters, true, 3, &mut seen);
+    assert_eq!((counters.snapshot().frames_dropped, seen), (3, 3));
+    account_drops(&counters, false, 5, &mut seen);
+    assert_eq!((counters.snapshot().frames_dropped, seen), (3, 5));
+    account_drops(&counters, true, 6, &mut seen);
+    assert_eq!((counters.snapshot().frames_dropped, seen), (4, 6));
+    account_drops(&counters, true, 2, &mut seen);
+    assert_eq!((counters.snapshot().frames_dropped, seen), (4, 2));
 }
 
 fn cancelled_worker(
@@ -240,6 +255,8 @@ async fn per_frame_paths_reject_bad_jpeg_and_size_changes_and_drop_on_full() {
     for timestamp in 0..600 {
         processor.process(&jpeg(32, 32), timestamp, [1, 1]).unwrap();
     }
+    // Once a queue is full the rest of each frame is discarded and counted, per stream.
+    assert!(processor.counters.snapshot().frames_dropped > 0);
     assert_eq!(sources[0].rx.lock().await.len(), 512);
     assert_eq!(sources[1].rx.lock().await.len(), 512);
     drop(sources);
