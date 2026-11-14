@@ -17,6 +17,9 @@ pub const MEDIA_PATH: &str = "/onvif/media_service";
 /// Path prefix of the snapshot endpoint; the profile token follows.
 pub const SNAPSHOT_PREFIX: &str = "/onvif/snapshot/";
 
+/// Path of the authenticated camera status endpoint (`GET`, JSON).
+pub const STATUS_PATH: &str = "/tethercam/status";
+
 const SOURCE_TOKEN: &str = "video_source_0";
 const SOURCE_CONFIG_TOKEN: &str = "video_source_config_0";
 

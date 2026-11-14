@@ -164,8 +164,8 @@ No local unsafe code, platform-number constants, or new license exception is nee
 - `Supervisor<F>` owns the only runtime `Session<F::Camera>`. `CameraFactory` opens a transport,
   never a PTP session. Native selection reuses `usb::camera::pick` or matches the configured
   serial exactly. Factory-built unopened sessions preserve caller timeouts/limits while using
-  the endpoint's actual 512/1024-byte geometry, including for `probe`. One initial JPEG
-  determines actual dimensions before listeners start; ongoing capture is demanded by the first `PLAY` across either stream and stops after both streams'
+  the endpoint's actual 512/1024-byte geometry, including for `probe`. The first live-view JPEG
+  determines actual dimensions and is the only source of them (see "Waiting for the camera"); ongoing capture is demanded by the first `PLAY` across either stream and stops after both streams'
   last subscriber leaves. Missing/unplugged cameras reconnect with exponential 100 ms to 5 s
   backoff, and battery/power telemetry is refreshed while idle too
 - Every handshake, frame fetch, capture, download and close is awaited to completion. Only
@@ -184,7 +184,7 @@ No local unsafe code, platform-number constants, or new license exception is nee
 - ONVIF profiles advertise actual dimensions, configured frame rate/bitrate, H.264 Baseline
   `/live/main` and/or JPEG `/live/mjpeg` on that one RTSP port. A changed camera resolution is
   rejected, not silently sent under stale SDP. Enabled JPEG is validated against RFC 2435
-  before opening listeners; unsupported layouts are not silently omitted. Bridge identity
+  from the first frame, before any profile is advertised or stream served; unsupported layouts are not silently omitted and end the run. Bridge identity
   comes from the persisted UUID, including a stable locally administered logical MAC, not a fabricated physical-host MAC
 - Authenticated snapshot requests use a four-entry bounded actor channel and execute between
   complete live-view transactions. Default: the reply is the newest live-view frame from the
@@ -202,8 +202,8 @@ No local unsafe code, platform-number constants, or new license exception is nee
   unsupported (nothing pressed), no image within the wait budget (the release succeeded, e.g. an
   AF miss) or a RAW/malformed object after a clean capture. The driver only attempts both
   releases, so any other still error (a failed press or release, a transport or download error)
-  ends the session as before, and the close cleans up. A snapshot caller's 360 s reply budget never cancels the actor's
-  in-flight work. Shutdown drains queued replies as unavailable
+  ends the session as before, and the close cleans up. A snapshot caller's reply budget (10 s for live-view snapshots, 360 s only for opt-in stills,
+  which can download for minutes) never cancels the actor's in-flight work. Shutdown drains queued replies as unavailable
 - `supervisor::serve` joins actor, media and network cleanup even after startup or media errors.
   A shutdown future requests a stop; callers must keep polling `serve` until completion rather
   than aborting/dropping it. SIGINT/SIGTERM registrations are installed before any CLI PTP
@@ -224,6 +224,76 @@ profile/URI calls and snapshots, reassemble H.264 FU-A and JPEG scan data from a
 and reconnect the simulator, and reopen the cleanly closed camera without a reset. Fault tests
 cover malformed media after a valid startup frame, bounded queues, native worker failures,
 clock/permission/port diagnostics and shutdown during Sony waits and shutter release.
+
+## Waiting for the camera
+
+Owner decision (issue #83): no stream resolution is advertised until a real live-view frame has
+established it. A configured, declared or guessed resolution is rejected, and so is a remembered
+one: without a frame there is no proof it is the same body in the same mode. The first frame is
+also the only way to validate the JPEG layout for RFC 2435 and to build the H.264 SPS that goes
+into the SDP, so those cannot be produced earlier either.
+
+Options considered:
+
+- Start listeners with a declared or remembered resolution: rejected by the owner. A wrong guess
+  puts a wrong SPS and wrong ONVIF dimensions in front of Protect, which caches them, and would
+  need a mismatch path that tears the service down anyway
+- Keep everything fail-closed until the first frame, exposing state only in logs: rejected, a
+  service with no camera has no listener for a client to ask, and the user gets no explanation
+- Bind everything now, advertise nothing media-shaped, answer "not ready" on every media surface
+  and publish format and profiles from the first frame: chosen. Smallest change, no guess
+
+Binding RTSP and ONVIF HTTP at startup also fails a busy port or bad address immediately rather
+than whenever a camera appears, and holds the ports while it is absent.
+
+Client-visible behavior:
+
+| Surface | Waiting (no frame yet) | Ready |
+|---|---|---|
+| RTSP `OPTIONS` | `200`, after Digest | `200` |
+| RTSP `DESCRIBE` / `SETUP` | `503` with `Retry-After: 5`, after Digest auth. No SDP, no stream | SDP built from the first frame, streams as before |
+| ONVIF Device and Media services (every operation, including `GetProfiles`, `GetStreamUri`, `GetSnapshotUri`, `GetCapabilities`) | HTTP `503`, body `camera not ready`, before authentication | Normal |
+| ONVIF snapshot endpoint | `401` challenge, then `503` once authenticated | Newest live-view JPEG |
+| WS-Discovery | Socket bound at startup (a bad interface fails the run), but no `Hello`, no `ProbeMatch`: not announced | Announced; `Hello` goes out when the first frame arrives |
+| `GET /tethercam/status` on the ONVIF port | Digest-authenticated JSON, `{"camera":"waiting"}` | `{"camera":"ready","battery_percent":87,"power":"usb"}` (battery fields only when the camera reports them) |
+
+Why `503` before authentication on the ONVIF services: Home Assistant's ONVIF integration retries
+transport errors and `503` with backoff but stops and prompts the user on authentication
+failures, and WS-Security clients cannot answer a Digest challenge. The cost is that anyone on the
+LAN can see the bridge has no camera; the status endpoint, with battery and power, is
+authenticated. RTSP keeps authentication first because Digest is mandatory there. A `503` with
+`Retry-After` is RTSP 1.0's and HTTP's "up, not yet"; an empty profile list or a fake SDP would
+be a wrong answer instead. Discovery is withheld because an adopted-but-unserviceable device is
+worse than a late one: Protect would list a camera it cannot pull a stream from. This is not
+verified against a real Protect deployment, tracked with issue #13.
+
+Transitions:
+
+- The status reads `ready` when the camera session reaches live view, a moment before the
+  runtime has published the streams and model from that frame; RTSP and ONVIF answer `503`
+  (retry) for that gap. `stopped` appears only during shutdown
+- Waiting to ready: the first frame builds the pipeline, publishes the RTSP streams and the ONVIF
+  model, writes the `Serving authenticated RTSP and ONVIF` line, then starts discovery. The discovery
+  socket is bound at startup but not read until then, so a probe sent while waiting sits in the
+  socket buffer and is answered when the responder starts. That ordering (discovery only after the
+  publish) is by construction in `serve_live` and is not asserted by a network test
+- Ready to waiting (unplug, camera power-cycle): listeners stay up and the published format is
+  kept. The frame slot is cleared, so snapshots fail at once (`503`), the status reads
+  `waiting`, streams carry no stale frames and RTSP clients keep their connection. ONVIF
+  Device and Media keep answering with the profiles and dimensions already described, which is
+  right because the resolution rule below ends the run on any other size. RTSP `DESCRIBE` keeps
+  returning the original SDP. Discovery keeps announcing and sends no `Bye`: the device is still
+  the same device, only without video
+- Waiting to ready again: the camera's new frame resumes the same streams, but only if it has the
+  size the streams were described with. Every frame that reaches the pipeline has its JPEG
+  header size checked, whether or not anyone is streaming. A different size is a
+  `FrameMismatch`: the run fails with the camera closed cleanly, the service manager restarts
+  the process and the new size is described from scratch. Nothing is served under the old SDP or
+  profiles. A frame without a readable header is left to processing, which reports it
+
+Logs carry static events: `waiting_camera` and `runtime_listening` at startup, `camera_ready` on
+every session that reaches live view, `camera_disconnected`, `runtime_ready` for the first frame.
+The foreground command prints `Listening for RTSP and ONVIF; waiting for a camera.` first.
 
 ## Streams
 
@@ -257,6 +327,7 @@ They map to:
   nonce replay cache and a bounded clock-skew window. HTTP Digest is the alternative. Only
   `GetSystemDateAndTime`, `GetCapabilities` and `GetServices` are pre-auth
 - Discovery reveals only what ONVIF requires: at most one unicast reply per accepted probe (each at most 1400 bytes), on-link sources only, `MessageID` de-duplicated, a per-source token bucket and one global bucket (burst 20, 10 per second) charged before parsing, so reflected traffic is bounded by `refill * reply cap` (14000 bytes per second by default) regardless of the number of sources. IPv6 link-local subnets are served only when the same interface has a non-link-local IPv6 address to advertise; otherwise they are omitted and a warning is emitted through the `log` facade (applications must configure a logger to display it). A per-interface bind or multicast-join failure is likewise a warning; the responder's interface set is rebuilt from the sockets that actually bound (`UdpTransport::usable`, `Config::with_usable_interfaces`) so a skipped interface never claims a subnet, and discovery fails only when no interface is usable
+- The status endpoint (`GET /tethercam/status`, ONVIF port) requires HTTP Digest like the snapshot endpoint and returns only camera state, battery percentage and power source: no serial, address, name or credentials
 - Credentials: random, generated at first run, stored in a config file created with owner-only
   permissions. Compared in constant time. Never logged
 - The `config` layer loads an explicit path or resolves the platform default. On first run it

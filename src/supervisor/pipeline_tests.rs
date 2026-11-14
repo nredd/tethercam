@@ -285,3 +285,24 @@ async fn invalid_media_and_encoder_configuration_and_worker_failure_are_typed() 
     let (pipeline, _) = prepared(true);
     pipeline.run().await.unwrap(); // a closed camera frame channel is EOF, not a busy loop
 }
+
+#[tokio::test]
+async fn a_changed_live_view_size_fails_the_pipeline_even_with_no_subscriber() {
+    let (mut pipeline, _sources) = prepared(true);
+    let (tx, rx) = watch::channel(Some(Arc::from(jpeg(32, 32))));
+    pipeline.frames = rx;
+    let control = pipeline.control.clone();
+    let (result, ()) = tokio::join!(pipeline.run(), async {
+        // Same size: served as before. A frame that is not even a JPEG is left to processing.
+        tx.send_replace(Some(Arc::from(jpeg(32, 32))));
+        tx.send_replace(Some(Arc::from(b"not a jpeg".as_slice())));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!control.stopping());
+        // A different camera or mode: nothing may be served under the old SDP and profiles.
+        tx.send_replace(Some(Arc::from(jpeg(48, 32))));
+    });
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "frame is '48x32', encoder expects '32x32'"
+    );
+}

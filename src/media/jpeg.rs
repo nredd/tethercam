@@ -85,6 +85,22 @@ impl JpegDecoder {
         }
     }
 
+    /// The width and height declared in the JPEG header, without decoding or validating the
+    /// scan. Cheap enough to run on every frame, e.g. to notice a changed live-view size.
+    ///
+    /// # Errors
+    /// [`JpegError::Malformed`] when no frame header can be read. Never panics.
+    pub fn dimensions(jpeg: &[u8]) -> Result<(u32, u32), JpegError> {
+        let mut decoder = ZuneDecoder::new(ZCursor::new(jpeg));
+        decoder.decode_headers().map_err(|e| malformed(&e))?;
+        required(decoder.dimensions(), "no frame header").map(|(w, h)| {
+            (
+                u32::try_from(w).unwrap_or(u32::MAX),
+                u32::try_from(h).unwrap_or(u32::MAX),
+            )
+        })
+    }
+
     /// Decode `jpeg` into `out`, resizing `out` to the image dimensions.
     ///
     /// # Errors
@@ -585,7 +601,21 @@ mod tests {
         assert_eq!(decoder.scratch.len(), 0);
     }
 
+    #[test]
+    fn dimensions_reads_the_header_without_decoding() {
+        assert_eq!(JpegDecoder::dimensions(&QUADRANTS_420).unwrap(), (32, 32));
+        // A cut stream still has its header: the size is known before the scan is checked.
+        assert!(JpegDecoder::dimensions(&QUADRANTS_420[..QUADRANTS_420.len() - 10]).is_ok());
+        assert!(JpegDecoder::dimensions(b"not a jpeg").is_err());
+        assert!(JpegDecoder::dimensions(&[]).is_err());
+    }
+
     proptest! {
+        #[test]
+        fn dimensions_never_panics_on_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = JpegDecoder::dimensions(&data);
+        }
+
         #[test]
         fn never_panics_on_arbitrary_bytes(data in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let mut frame = I420Frame::new(2, 2).unwrap();

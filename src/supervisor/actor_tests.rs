@@ -193,7 +193,7 @@ async fn shutdown_does_not_cancel_a_shutter_wait_or_skip_release() {
         ..SonySimConfig::default()
     });
     let (mut actor, control) = actor(Factory::new(vec![no_image]));
-    actor.still_snapshots = true;
+    actor.still_snapshots.store(true, Ordering::Relaxed);
     actor.sony.capture_timeout = Duration::from_millis(100);
     actor.sony.poll_interval = Duration::from_millis(10);
     let (factory, ()) = tokio::join!(
@@ -329,6 +329,7 @@ async fn reconnects_with_capped_backoff_and_closes_failed_handshakes() {
     assert_eq!(logs.matches("camera_open_failed").count(), 1);
     assert!(logs.contains("reason=camera disconnected"));
     assert_eq!(logs.matches("camera_disconnected").count(), 1);
+    assert_eq!(logs.matches("camera_ready").count(), 1);
     assert!(!logs.contains("synthetic-private-model"));
     let cameras = factory.released.lock().unwrap();
     assert_eq!(cameras.len(), 2);
@@ -410,7 +411,7 @@ async fn a_still_that_times_out_after_a_clean_release_keeps_the_session() {
         ..SonySimConfig::default()
     });
     let (mut actor, control) = actor(Factory::new(vec![no_image]));
-    actor.still_snapshots = true;
+    actor.still_snapshots.store(true, Ordering::Relaxed);
     actor.sony.capture_timeout = Duration::from_millis(50);
     actor.sony.poll_interval = Duration::from_millis(10);
     let work = async {
@@ -658,4 +659,63 @@ async fn snapshot_admission_is_bounded_and_shutdown_drains_replies() {
     for reply in replies {
         assert_eq!(reply.recv().unwrap(), Err(SnapshotError));
     }
+}
+
+#[test]
+fn live_view_snapshots_get_a_short_reply_budget_and_stills_the_long_one() {
+    let (actor, control) = actor(Factory::new(Vec::new()));
+    assert_eq!(control.snapshot_budget(), Duration::from_secs(10));
+    let _ = actor.with_still_snapshots(true);
+    assert_eq!(control.snapshot_budget(), Duration::from_secs(360));
+    let (actor, control) = super::tests::actor(Factory::new(Vec::new()));
+    let _ = actor.with_still_snapshots(true).with_still_snapshots(false);
+    assert_eq!(control.snapshot_budget(), Duration::from_secs(10));
+}
+
+#[test]
+fn status_json_reports_state_and_power_without_identity() {
+    use crate::sony::{Battery, PowerSource};
+    let ready = |battery| CameraStatus::Ready { battery };
+    let battery = |percent, source| {
+        Some(Battery {
+            percent,
+            indicator: Some(0x0b),
+            source,
+        })
+    };
+    assert_eq!(
+        CameraStatus::Disconnected.to_json(),
+        r#"{"camera":"waiting"}"#
+    );
+    assert_eq!(CameraStatus::Stopped.to_json(), r#"{"camera":"stopped"}"#);
+    assert_eq!(ready(None).to_json(), r#"{"camera":"ready"}"#);
+    assert_eq!(
+        ready(battery(Some(87), PowerSource::Usb)).to_json(),
+        r#"{"camera":"ready","battery_percent":87,"power":"usb"}"#
+    );
+    assert_eq!(
+        ready(battery(None, PowerSource::Battery)).to_json(),
+        r#"{"camera":"ready","power":"battery"}"#
+    );
+    assert_eq!(
+        ready(battery(Some(0), PowerSource::NoBattery)).to_json(),
+        r#"{"camera":"ready","battery_percent":0,"power":"no_battery"}"#
+    );
+    assert_eq!(
+        ready(battery(None, PowerSource::Unknown)).to_json(),
+        r#"{"camera":"ready","power":"unknown"}"#
+    );
+}
+
+#[tokio::test]
+async fn control_serves_status_json_through_the_status_source_seam() {
+    let (actor, control) = actor(Factory::new(vec![camera()]));
+    assert_eq!(control.status_json(), r#"{"camera":"waiting"}"#);
+    let work = async {
+        ready(&control).await;
+        assert!(control.status_json().starts_with(r#"{"camera":"ready""#));
+        control.shutdown();
+    };
+    let _ = tokio::join!(Box::pin(actor.run()), work);
+    assert_eq!(control.status_json(), r#"{"camera":"stopped"}"#);
 }

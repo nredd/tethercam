@@ -9,7 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -138,10 +138,16 @@ async fn accept_ready(
     }
 }
 
-/// State shared by every connection.
-pub(crate) struct Shared<S: MediaSource> {
+/// The published streams: the primary mount (at `ServerConfig::mount_path`) and the extras.
+pub(crate) struct Streams<S: MediaSource> {
     pub(crate) fanout: Arc<Fanout<S>>,
     pub(crate) mounts: Vec<Mount<S>>,
+}
+
+/// State shared by every connection. `streams` is empty until the streams are published;
+/// until then every `DESCRIBE` and `SETUP` is answered `503`.
+pub(crate) struct Shared<S: MediaSource> {
+    pub(crate) streams: OnceLock<Streams<S>>,
     pub(crate) auth: Authenticator,
     pub(crate) config: ServerConfig,
     pub(crate) sessions: Arc<Semaphore>,
@@ -152,6 +158,99 @@ pub(crate) struct Shared<S: MediaSource> {
 pub(crate) struct Mount<S: MediaSource> {
     pub(crate) path: String,
     pub(crate) fanout: Arc<Fanout<S>>,
+}
+
+/// Reject unusable limits and durations.
+fn validate_limits(config: &ServerConfig) -> Result<(), ServerError> {
+    if !valid_path(&config.mount_path) {
+        return Err(ServerError::Config("mount_path must look like /name"));
+    }
+    if config.max_connections == 0 || config.max_sessions == 0 {
+        return Err(ServerError::Config(
+            "connection and session limits must be non-zero",
+        ));
+    }
+    // Deadlines are `Instant + duration`, which panics on overflow: bound every duration.
+    let durations = [
+        config.session_timeout,
+        config.idle_timeout,
+        config.write_timeout,
+        config.nonce_lifetime,
+        config.rtcp_interval,
+    ];
+    if durations
+        .iter()
+        .any(|d| d.is_zero() || *d > MAX_CONFIGURED_DURATION)
+    {
+        return Err(ServerError::Config(
+            "timeouts and intervals must be non-zero and at most one year",
+        ));
+    }
+    // Tokio panics above this bound; reject it instead.
+    let ceiling = Semaphore::MAX_PERMITS;
+    if config.max_connections > ceiling || config.max_sessions > ceiling {
+        return Err(ServerError::Config(
+            "connection and session limits exceed the supported maximum",
+        ));
+    }
+    if config.client_queue == 0 || config.client_queue > ceiling {
+        return Err(ServerError::Config(
+            "client_queue must be in 1..=MAX_PERMITS",
+        ));
+    }
+    Ok(())
+}
+
+/// An absolute mount path without a trailing slash, whitespace or control characters.
+fn valid_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// The one-shot right to publish a pending server's streams; see [`RtspServer::bind_pending`].
+pub struct StreamPublisher<S: MediaSource>(Arc<Shared<S>>);
+
+impl<S: MediaSource> StreamPublisher<S> {
+    /// Start serving the primary source at `config.mount_path` and `additional` mounts. Paths
+    /// must be distinct, non-nested and absolute. Consumes the publisher: streams are published
+    /// at most once, and a failure leaves the server answering `503`.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] for invalid paths or tracks.
+    pub fn publish(
+        self, source: Arc<S>, additional: Vec<(String, Arc<S>)>,
+    ) -> Result<(), ServerError> {
+        let config = &self.0.config;
+        source.track().validate()?;
+        let mut paths = vec![config.mount_path.clone()];
+        let mut mounts = Vec::new();
+        for (path, source) in additional {
+            if !valid_path(&path)
+                || paths.iter().any(|p| {
+                    p == &path
+                        || path.starts_with(&format!("{p}/"))
+                        || p.starts_with(&format!("{path}/"))
+                })
+            {
+                return Err(ServerError::Config(
+                    "mounts must be distinct non-nested absolute paths",
+                ));
+            }
+            source.track().validate()?;
+            paths.push(path.clone());
+            mounts.push(Mount {
+                path,
+                fanout: Fanout::new(source, config.client_queue),
+            });
+        }
+        // Single use: `self` is consumed, so the cell is still empty and `set` cannot fail.
+        let _ = self.0.streams.set(Streams {
+            fanout: Fanout::new(source, config.client_queue),
+            mounts,
+        });
+        Ok(())
+    }
 }
 
 /// An RTSP 1.0 server over one or more independently addressed media sources.
@@ -183,86 +282,32 @@ impl<S: MediaSource> RtspServer<S> {
         addr: SocketAddr, source: Arc<S>, additional: Vec<(String, Arc<S>)>,
         credentials: Credentials, config: ServerConfig,
     ) -> Result<Self, ServerError> {
-        if !config.mount_path.starts_with('/')
-            || config.mount_path.ends_with('/')
-            || config
-                .mount_path
-                .chars()
-                .any(|c| c.is_control() || c.is_whitespace())
-        {
-            return Err(ServerError::Config("mount_path must look like /name"));
-        }
-        if config.max_connections == 0 || config.max_sessions == 0 {
-            return Err(ServerError::Config(
-                "connection and session limits must be non-zero",
-            ));
-        }
-        // Deadlines are `Instant + duration`, which panics on overflow: bound every duration.
-        let durations = [
-            config.session_timeout,
-            config.idle_timeout,
-            config.write_timeout,
-            config.nonce_lifetime,
-            config.rtcp_interval,
-        ];
-        if durations
-            .iter()
-            .any(|d| d.is_zero() || *d > MAX_CONFIGURED_DURATION)
-        {
-            return Err(ServerError::Config(
-                "timeouts and intervals must be non-zero and at most one year",
-            ));
-        }
-        // Tokio panics above this bound; reject it instead.
-        let ceiling = Semaphore::MAX_PERMITS;
-        if config.max_connections > ceiling || config.max_sessions > ceiling {
-            return Err(ServerError::Config(
-                "connection and session limits exceed the supported maximum",
-            ));
-        }
-        if config.client_queue == 0 || config.client_queue > ceiling {
-            return Err(ServerError::Config(
-                "client_queue must be in 1..=MAX_PERMITS",
-            ));
-        }
-        let track = source.track();
-        track.validate()?;
-        let mut paths = vec![config.mount_path.clone()];
-        let mut mounts = Vec::new();
-        for (path, source) in additional {
-            if !path.starts_with('/')
-                || path.ends_with('/')
-                || path.chars().any(|c| c.is_control() || c.is_whitespace())
-                || paths.iter().any(|p| {
-                    p == &path
-                        || path.starts_with(&format!("{p}/"))
-                        || p.starts_with(&format!("{path}/"))
-                })
-            {
-                return Err(ServerError::Config(
-                    "mounts must be distinct non-nested absolute paths",
-                ));
-            }
-            source.track().validate()?;
-            paths.push(path.clone());
-            mounts.push(Mount {
-                path,
-                fanout: Fanout::new(source, config.client_queue),
-            });
-        }
+        let (server, publisher) = Self::bind_pending(addr, credentials, config).await?;
+        publisher.publish(source, additional)?;
+        Ok(server)
+    }
+
+    /// Bind the listener before any stream exists, e.g. while the camera that defines the
+    /// stream's format is absent. Clients connect and authenticate as usual, but `DESCRIBE` and
+    /// `SETUP` get `503` with `Retry-After` until the returned publisher supplies the streams.
+    /// The port is held and the limits are validated now, so a bad address fails at startup.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] for invalid limits or listener failures.
+    pub async fn bind_pending(
+        addr: SocketAddr, credentials: Credentials, config: ServerConfig,
+    ) -> Result<(Self, StreamPublisher<S>), ServerError> {
+        validate_limits(&config)?;
         let listener = TcpListener::bind(addr).await?;
-        let shared = Shared {
-            fanout: Fanout::new(source, config.client_queue),
-            mounts,
+        let shared = Arc::new(Shared {
+            streams: OnceLock::new(),
             auth: Authenticator::new(credentials, config.nonce_lifetime),
             sessions: Arc::new(Semaphore::new(config.max_sessions)),
             next_connection: std::sync::atomic::AtomicU64::new(1),
             config,
-        };
-        Ok(Self {
-            listener,
-            shared: Arc::new(shared),
-        })
+        });
+        let publisher = StreamPublisher(Arc::clone(&shared));
+        Ok((Self { listener, shared }, publisher))
     }
 
     /// The bound address.
@@ -274,10 +319,11 @@ impl<S: MediaSource> RtspServer<S> {
         local_address(self.listener.local_addr())
     }
 
-    /// The primary mount's fan-out, e.g. to read [`Fanout::dropped_packets`].
+    /// The primary mount's fan-out, e.g. to read [`Fanout::dropped_packets`]. `None` while the
+    /// streams of a pending server are unpublished.
     #[must_use]
-    pub fn fanout(&self) -> &Arc<Fanout<S>> {
-        &self.shared.fanout
+    pub fn fanout(&self) -> Option<&Arc<Fanout<S>>> {
+        self.shared.streams.get().map(|streams| &streams.fanout)
     }
 
     /// Accept connections until `shutdown` resolves, then close every connection and return.

@@ -11,15 +11,16 @@
 mod tests;
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc as blocking};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 
-use crate::onvif::service::{SnapshotError, SnapshotSource};
+use crate::onvif::service::{SnapshotError, SnapshotSource, StatusSource};
 use crate::ptp::session::{PtpSession, SessionConfig};
-use crate::sony::{Battery, CapturedImage, SonyCamera, SonyConfig, SonyError};
+use crate::sony::{Battery, CapturedImage, PowerSource, SonyCamera, SonyConfig, SonyError};
 
 /// Sanitized transport-factory failures. Each category is safe to log; device strings, USB
 /// serials and operating-system error text deliberately do not cross this boundary.
@@ -77,6 +78,37 @@ pub enum CameraStatus {
     Stopped,
 }
 
+impl CameraStatus {
+    /// A JSON document for the status endpoint: `camera` is `waiting`, `ready` or `stopped`; a
+    /// ready camera that reports a battery adds `battery_percent` and `power` (`battery`, `usb`,
+    /// `no_battery` or `unknown`). Nothing here identifies the device.
+    #[must_use]
+    pub fn to_json(self) -> String {
+        let Self::Ready { battery } = self else {
+            let state = if self == Self::Stopped {
+                "stopped"
+            } else {
+                "waiting"
+            };
+            return format!("{{\"camera\":\"{state}\"}}");
+        };
+        let Some(battery) = battery else {
+            return "{\"camera\":\"ready\"}".into();
+        };
+        let percent = battery
+            .percent
+            .map(|percent| format!(",\"battery_percent\":{percent}"))
+            .unwrap_or_default();
+        let power = match battery.source {
+            PowerSource::Battery => "battery",
+            PowerSource::Usb => "usb",
+            PowerSource::NoBattery => "no_battery",
+            PowerSource::Unknown => "unknown",
+        };
+        format!("{{\"camera\":\"ready\"{percent},\"power\":\"{power}\"}}")
+    }
+}
+
 /// Actor configuration errors.
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -89,6 +121,15 @@ pub enum SupervisorError {
 /// the slot every frame interval (at most one second), so this only lapses while nobody streams.
 const SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
 
+/// Longest a live-view snapshot caller waits for its reply. A healthy request is one frame (a
+/// transaction, or at worst the driver's 2.5 s frame retry), so a stuck camera must not hold an
+/// HTTP worker for minutes. Expiry abandons only the reply, never the actor's work.
+const LIVE_SNAPSHOT_BUDGET: Duration = Duration::from_secs(10);
+
+/// Longest a full-resolution still caller waits: capture wait plus the driver's five-minute
+/// download timeout, with slack.
+const STILL_SNAPSHOT_BUDGET: Duration = Duration::from_secs(360);
+
 type SnapshotReply = blocking::SyncSender<Result<Vec<u8>, SnapshotError>>;
 
 /// Handles shared with the network and media tasks. Debug never exposes image bytes.
@@ -99,6 +140,7 @@ pub struct Control {
     snapshots: mpsc::Sender<SnapshotReply>,
     pub(super) stop: watch::Sender<bool>,
     status: watch::Receiver<CameraStatus>,
+    still_snapshots: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Control {
@@ -128,13 +170,29 @@ impl Control {
 
 impl SnapshotSource for Control {
     fn snapshot(&self, _profile_token: &str) -> Result<Vec<u8>, SnapshotError> {
-        self.request_snapshot(Duration::from_secs(360))
+        self.request_snapshot(self.snapshot_budget())
+    }
+}
+
+impl StatusSource for Control {
+    fn status_json(&self) -> String {
+        self.status().to_json()
     }
 }
 
 impl Control {
+    /// Reply budget for the configured snapshot mode, see [`LIVE_SNAPSHOT_BUDGET`].
+    fn snapshot_budget(&self) -> Duration {
+        if self.still_snapshots.load(Ordering::Relaxed) {
+            STILL_SNAPSHOT_BUDGET
+        } else {
+            LIVE_SNAPSHOT_BUDGET
+        }
+    }
+
     fn request_snapshot(&self, timeout: Duration) -> Result<Vec<u8>, SnapshotError> {
-        // The slot is empty exactly while no camera session is serving; fail now, not in 360 s.
+        // The slot is empty exactly while no camera session is serving; fail now, not after
+        // the reply budget.
         if self.frames.borrow().is_none() {
             return Err(SnapshotError);
         }
@@ -162,7 +220,7 @@ pub struct Supervisor<F: CameraFactory> {
     session: SessionConfig,
     clock: fn() -> Instant,
     frame_interval: Duration,
-    still_snapshots: bool,
+    still_snapshots: Arc<AtomicBool>,
     demand: watch::Receiver<[u64; 2]>,
     snapshots: mpsc::Receiver<SnapshotReply>,
     frames: watch::Sender<Option<Arc<[u8]>>>,
@@ -186,6 +244,7 @@ impl<F: CameraFactory> Supervisor<F> {
         let (frames, frames_rx) = watch::channel(None);
         let (status, status_rx) = watch::channel(CameraStatus::Disconnected);
         let (snapshots, snapshots_rx) = mpsc::channel(4);
+        let still_flag = Arc::new(AtomicBool::new(false));
         Ok((
             Self {
                 factory,
@@ -193,7 +252,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 session,
                 clock: Instant::now,
                 frame_interval,
-                still_snapshots: false,
+                still_snapshots: Arc::clone(&still_flag),
                 demand: demand_rx,
                 snapshots: snapshots_rx,
                 frames,
@@ -206,6 +265,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 frames: frames_rx,
                 status: status_rx,
                 snapshots,
+                still_snapshots: still_flag,
             },
         ))
     }
@@ -222,8 +282,8 @@ impl<F: CameraFactory> Supervisor<F> {
     /// leaving the shutter pressed (unsupported, or no image in time) is answered with an
     /// error and leaves the session up; any other still failure ends the session.
     #[must_use]
-    pub fn with_still_snapshots(mut self, enabled: bool) -> Self {
-        self.still_snapshots = enabled;
+    pub fn with_still_snapshots(self, enabled: bool) -> Self {
+        self.still_snapshots.store(enabled, Ordering::Relaxed);
         self
     }
 
@@ -263,6 +323,7 @@ impl<F: CameraFactory> Supervisor<F> {
                             battery: camera.battery(),
                         });
                         was_ready = true;
+                        tracing::info!(event = "camera_ready");
                         self.connected(camera).await
                     })
                     .await;
@@ -310,7 +371,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 _ = self.stop.changed() => return Ok(()),
                 reply = self.snapshots.recv() => {
                     let Some(reply) = reply else { return Ok(()); };
-                    if self.still_snapshots {
+                    if self.still_snapshots.load(Ordering::Relaxed) {
                         let outcome = Self::still(camera).await;
                         let outcome = outcome.inspect_err(|_| {
                             let _ = reply.send(Err(SnapshotError));

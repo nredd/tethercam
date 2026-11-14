@@ -80,7 +80,9 @@ impl CameraFactory for Factory {
 struct Ready(mpsc::SyncSender<()>);
 impl Write for Ready {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let _ = self.0.try_send(());
+        if bytes.starts_with(b"Serving") {
+            let _ = self.0.try_send(());
+        }
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {

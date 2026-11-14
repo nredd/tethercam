@@ -25,9 +25,9 @@ use crate::onvif::http::{HttpLimits, HttpServer};
 use crate::onvif::model::{
     DeviceDescription, DeviceModel, H264Profile, NetworkInterface, StreamProfile, VideoCodec,
 };
-use crate::onvif::service::OnvifService;
+use crate::onvif::service::{ModelPublisher, OnvifService};
 use crate::ptp::session::SessionConfig;
-use crate::rtsp::{RtspServer, ServerConfig};
+use crate::rtsp::{RtspServer, ServerConfig, StreamPublisher};
 
 /// Startup, serving and cleanup errors. Log only a static event for these: nested transport
 /// errors can contain untrusted device text. CLI diagnostics use their category, not Debug.
@@ -199,46 +199,66 @@ async fn finish_discovery(
     worker_result(result)?.map_err(|_| RunError::Discovery)
 }
 
-async fn first_frame(
-    frames: &mut tokio::sync::watch::Receiver<Option<Arc<[u8]>>>,
-) -> Result<Arc<[u8]>, RunError> {
+/// Wait for the first live-view frame, which defines the stream format. `None` means a stop was
+/// requested first.
+async fn first_frame(control: &Control) -> Result<Option<Arc<[u8]>>, RunError> {
+    let mut frames = control.frames.clone();
+    let mut stop = control.stop.subscribe();
     loop {
-        if let Some(frame) = frames.borrow_and_update().clone() {
-            return Ok(frame);
+        if control.stopping() {
+            return Ok(None);
         }
-        frames
-            .changed()
-            .await
-            .map_err(|_| RunError::CameraStopped)?;
+        if let Some(frame) = frames.borrow_and_update().clone() {
+            return Ok(Some(frame));
+        }
+        // Stop first: the actor drops the frame slot on its way out of a stop request, and a
+        // closed slot during shutdown is not an error.
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {},
+            changed = frames.changed() => changed.map_err(|_| RunError::CameraStopped)?,
+        }
     }
 }
 
 type Shutdown<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
+/// Listeners bound before any camera exists, and the one-shot publishers that give them their
+/// streams and model once the first frame defines the format.
+struct Listeners {
+    rtsp: RtspServer<super::RuntimeSource>,
+    streams: StreamPublisher<super::RuntimeSource>,
+    model: ModelPublisher,
+}
+
 async fn serve_network(
     cfg: &Config, control: &Control, discovery_cfg: Option<discovery::Config>,
     shutdown: &mut Shutdown<'_>, out: &mut dyn Write,
 ) -> Result<(), RunError> {
-    let mut frames = control.frames.clone();
-    let first = tokio::select! {
-        biased;
-        () = &mut *shutdown => return Ok(()),
-        first = first_frame(&mut frames) => first?,
-    };
-    let (pipeline, rtsp, http) = start_servers(cfg, control, &first).await?;
-    let result = serve_started(control, discovery_cfg, shutdown, out, pipeline, rtsp).await;
+    let (listeners, http) = start_listeners(cfg, control).await?;
+    let result = serve_started(cfg, control, discovery_cfg, shutdown, out, listeners).await;
     control.shutdown();
     // HTTP connections may be waiting for an actor snapshot. Join them off the executor so
     // the actor remains runnable through shutter release and CloseSession, even on an error.
     worker_result(tokio::task::spawn_blocking(move || drop(http)).await).and(result)
 }
 
-async fn start_servers(
-    cfg: &Config, control: &Control, first: &[u8],
-) -> Result<(Pipeline, RtspServer<super::RuntimeSource>, HttpServer), RunError> {
-    let (pipeline, sources) = Pipeline::prepare(first, &cfg.streams, control.clone())?;
-    let description = model(cfg, pipeline.width, pipeline.height)?;
-    let [main, jpeg] = sources;
+/// The path of the primary RTSP mount.
+fn primary_path(cfg: &Config) -> &'static str {
+    if cfg.streams.h264 {
+        "/live/main"
+    } else {
+        "/live/mjpeg"
+    }
+}
+
+/// Bind RTSP and ONVIF HTTP now, with no stream or model. Their format comes from the first
+/// frame, never a guess, so until then RTSP answers `503` to `DESCRIBE`/`SETUP`, the ONVIF
+/// Device and Media services answer `503`, and only the status endpoint reports state. Binding
+/// early also fails a busy port or bad address at startup instead of whenever a camera appears.
+async fn start_listeners(
+    cfg: &Config, control: &Control,
+) -> Result<(Listeners, HttpServer), RunError> {
     let onvif_credentials = crate::onvif::auth::Credentials::new(
         cfg.credentials.username.expose(),
         cfg.credentials.password.expose(),
@@ -248,54 +268,51 @@ async fn start_servers(
         cfg.credentials.password.expose(),
         "tethercam",
     )?;
-    let (primary, additional, path) = if cfg.streams.h264 {
-        let additional = if cfg.streams.mjpeg {
-            vec![("/live/mjpeg".into(), jpeg)]
-        } else {
-            Vec::new()
-        };
-        (main, additional, "/live/main")
-    } else {
-        (jpeg, Vec::new(), "/live/mjpeg")
-    };
-    let rtsp = RtspServer::bind_mounts(
+    let (rtsp, streams) = RtspServer::bind_pending(
         SocketAddr::new(cfg.rtsp_address, cfg.rtsp_port),
-        primary,
-        additional,
         credentials,
         ServerConfig {
-            mount_path: path.into(),
+            mount_path: primary_path(cfg).into(),
             ..ServerConfig::default()
         },
     )
     .await?;
-    let service = OnvifService::new(
-        description,
-        onvif_credentials,
-        Arc::new(crate::onvif::time::SystemClock),
-    );
-    let http = start_http(cfg, control, service)?;
-    Ok((pipeline, rtsp, http))
+    let pending =
+        OnvifService::pending(onvif_credentials, Arc::new(crate::onvif::time::SystemClock));
+    let (http, model) = start_http(cfg, control, pending)?;
+    Ok((
+        Listeners {
+            rtsp,
+            streams,
+            model,
+        },
+        http,
+    ))
 }
 
 fn start_http(
     cfg: &Config, control: &Control,
-    service: Result<OnvifService, crate::onvif::service::SetupError>,
-) -> Result<HttpServer, RunError> {
-    let service = service?.with_snapshot_source(Arc::new(control.clone()));
-    HttpServer::start(
+    pending: Result<(OnvifService, ModelPublisher), crate::onvif::service::SetupError>,
+) -> Result<(HttpServer, ModelPublisher), RunError> {
+    let (service, model) = pending?;
+    let service = service
+        .with_snapshot_source(Arc::new(control.clone()))
+        .with_status_source(Arc::new(control.clone()));
+    let http = HttpServer::start(
         SocketAddr::new(cfg.onvif_address, cfg.onvif_port),
         Arc::new(service),
         HttpLimits::default(),
-    )
-    .map_err(RunError::from)
+    )?;
+    Ok((http, model))
 }
 
-async fn serve_started(
-    control: &Control, discovery_cfg: Option<discovery::Config>, shutdown: &mut Shutdown<'_>,
-    out: &mut dyn Write, pipeline: Pipeline, rtsp: RtspServer<super::RuntimeSource>,
-) -> Result<(), RunError> {
-    let discovery = discovery_cfg
+type DiscoveryResponder =
+    Responder<discovery::UdpTransport, discovery::SystemEntropy, discovery::SystemClock>;
+
+fn bind_discovery(
+    discovery_cfg: Option<discovery::Config>,
+) -> Result<Option<DiscoveryResponder>, RunError> {
+    discovery_cfg
         .map(|cfg| {
             discovery::UdpTransport::bind(cfg.interfaces())
                 .map(|transport| {
@@ -310,13 +327,28 @@ async fn serve_started(
                 })
                 .map_err(|_| RunError::Discovery)
         })
-        .transpose()?;
+        .transpose()
+}
+
+async fn serve_started(
+    cfg: &Config, control: &Control, discovery_cfg: Option<discovery::Config>,
+    shutdown: &mut Shutdown<'_>, out: &mut dyn Write, listeners: Listeners,
+) -> Result<(), RunError> {
+    let Listeners {
+        rtsp,
+        streams,
+        model,
+    } = listeners;
+    // Bound now so a bad interface fails at startup, but announced only once there is a camera
+    // to adopt: a device Protect lists before it can serve video would fail adoption.
+    let discovery = bind_discovery(discovery_cfg)?;
     writeln!(
         out,
-        "Serving authenticated RTSP and ONVIF; interrupt to stop."
+        "Listening for RTSP and ONVIF; waiting for a camera. Status: GET {}",
+        crate::onvif::media::STATUS_PATH
     )?;
     out.flush()?;
-    tracing::info!(event = "runtime_ready");
+    tracing::info!(event = "runtime_listening");
     let mut stop = control.stop.subscribe();
     let stop_signal = async {
         tokio::select! {
@@ -330,12 +362,52 @@ async fn serve_started(
             let _ = rtsp_stop.changed().await;
         }
     });
+    let live = async {
+        let result = serve_live(cfg, control, out, (streams, model), discovery).await;
+        control.shutdown();
+        result
+    };
+    let ((), (), live) = tokio::join!(stop_signal, rtsp, live);
+    live
+}
+
+/// Wait for the camera, publish the streams and model its first frame defines, start
+/// discovery, and run the media pipeline until stopped.
+async fn serve_live(
+    cfg: &Config, control: &Control, out: &mut dyn Write,
+    publishers: (StreamPublisher<super::RuntimeSource>, ModelPublisher),
+    discovery: Option<DiscoveryResponder>,
+) -> Result<(), RunError> {
+    let (streams, model_slot) = publishers;
+    let Some(first) = first_frame(control).await? else {
+        return Ok(());
+    };
+    let (pipeline, sources) = Pipeline::prepare(&first, &cfg.streams, control.clone())?;
+    let description = model(cfg, pipeline.width, pipeline.height)?;
+    let [main, jpeg] = sources;
+    let (primary, additional) = if cfg.streams.h264 {
+        let additional = if cfg.streams.mjpeg {
+            vec![("/live/mjpeg".into(), jpeg)]
+        } else {
+            Vec::new()
+        };
+        (main, additional)
+    } else {
+        (jpeg, Vec::new())
+    };
+    streams.publish(primary, additional)?;
+    model_slot.publish(description);
+    writeln!(
+        out,
+        "Serving authenticated RTSP and ONVIF; interrupt to stop."
+    )?;
+    out.flush()?;
+    tracing::info!(event = "runtime_ready");
     let media = async {
         let result = pipeline.run().await;
         control.shutdown();
         result
     };
-    let discovery = run_discovery(control, discovery);
-    let ((), (), media, discovery) = tokio::join!(stop_signal, rtsp, media, discovery);
+    let (media, discovery) = tokio::join!(media, run_discovery(control, discovery));
     media.map_err(RunError::from).and(discovery)
 }

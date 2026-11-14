@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::future::poll_fn;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::task::Poll;
 
@@ -16,7 +17,7 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::rtsp::digest::{Algorithm, Authenticator, ClientDigest, Credentials};
-use crate::rtsp::server::ServerConfig;
+use crate::rtsp::server::{ServerConfig, Streams};
 use crate::rtsp::source::testing::{TestSource, close_queue};
 use crate::rtsp::source::{Fanout, ScriptedSource};
 
@@ -28,14 +29,22 @@ async fn mounts_select_distinct_sources_without_rebinding_a_session() {
     let (mut connection, _peer, _stop) = connection(Arc::clone(&source)).await;
     Arc::get_mut(&mut connection.shared)
         .unwrap()
+        .streams
+        .get_mut()
+        .unwrap()
         .mounts
         .push(crate::rtsp::server::Mount {
             path: "/jpeg".into(),
             fanout: Fanout::new(Arc::clone(&source), 8),
         });
-    assert!(connection.mount("http://192.0.2.1/stream", false).is_none());
-    assert!(connection.mount("/jpeg", false).is_some());
-    assert!(connection.mount("/jpeg/trackID=0", true).is_some());
+    let streams = connection.shared.streams.get().unwrap();
+    assert!(
+        connection
+            .mount(streams, "http://192.0.2.1/stream", false)
+            .is_none()
+    );
+    assert!(connection.mount(streams, "/jpeg", false).is_some());
+    assert!(connection.mount(streams, "/jpeg/trackID=0", true).is_some());
     let describe = request(b"DESCRIBE /jpeg RTSP/1.0\r\nCSeq: 1\r\n\r\n");
     assert_eq!(connection.describe(&describe).status, 200);
     let setup = request(b"SETUP /stream/trackID=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
@@ -43,6 +52,17 @@ async fn mounts_select_distinct_sources_without_rebinding_a_session() {
     let id = connection.session.as_ref().unwrap().id.clone();
     let other = request(format!("SETUP /jpeg/trackID=0 RTSP/1.0\r\nCSeq: 3\r\nSession: {id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n").as_bytes());
     assert_eq!(connection.setup(&other).await.status, 455);
+}
+
+#[tokio::test]
+async fn unpublished_streams_answer_503_with_a_retry_hint() {
+    let (mut connection, _peer, _stop) = connection(Arc::clone(&TestSource::new())).await;
+    Arc::get_mut(&mut connection.shared).unwrap().streams = OnceLock::new();
+    let describe = connection.describe(&request(b"DESCRIBE /stream RTSP/1.0\r\nCSeq: 1\r\n\r\n"));
+    assert_eq!(describe.status, 503);
+    assert_eq!(describe.headers.get("retry-after"), Some("5"));
+    let setup = request(b"SETUP /stream/trackID=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
+    assert_eq!(connection.setup(&setup).await.status, 503);
 }
 
 async fn connection(
@@ -56,8 +76,10 @@ async fn connection(
     let local = stream.local_addr().unwrap();
     let config = ServerConfig::default();
     let shared = Arc::new(Shared {
-        mounts: Vec::new(),
-        fanout: Fanout::new(source, config.client_queue),
+        streams: OnceLock::from(Streams {
+            mounts: Vec::new(),
+            fanout: Fanout::new(source, config.client_queue),
+        }),
         auth: Authenticator::new(
             Credentials::new("camera", "synthetic-password", "test").unwrap(),
             config.nonce_lifetime,
@@ -124,7 +146,16 @@ fn play(connection: &mut Connection<ScriptedSource>) {
     assert_eq!(connection.play(&request).status, 200);
     // Repeated PLAY is idempotent and must retain the existing subscription.
     assert_eq!(connection.play(&request).status, 200);
-    assert_eq!(connection.shared.fanout.subscribers(), 1);
+    assert_eq!(
+        connection
+            .shared
+            .streams
+            .get()
+            .unwrap()
+            .fanout
+            .subscribers(),
+        1
+    );
 }
 
 fn packet(size: usize) -> Packet {
