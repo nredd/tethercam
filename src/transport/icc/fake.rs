@@ -12,11 +12,11 @@ use crate::ptp::{Container, ContainerKind};
 use crate::transport::sim::SimCamera;
 
 /// Longest a held native call waits for its test, so a regression fails instead of hanging.
-pub(super) const HOLD_LIMIT: Duration = Duration::from_secs(10);
+pub(crate) const HOLD_LIMIT: Duration = Duration::from_secs(10);
 
 /// One recorded boundary call. Payload bytes and identifiers are not recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Call {
+pub(crate) enum Call {
     Discover,
     Open,
     Transact { operation: u16, params: Vec<u32> },
@@ -26,7 +26,7 @@ pub(super) enum Call {
 }
 
 /// A scripted transaction outcome.
-pub(super) enum Step {
+pub(crate) enum Step {
     /// Return at once.
     Done(Result<IccReply, IccError>),
     /// Signal `entered`, block until `release` fires, then return. Models a native operation
@@ -45,7 +45,7 @@ pub(super) enum Step {
 
 /// What the fake answers, in order. An exhausted queue answers success.
 #[derive(Default)]
-pub(super) struct Script {
+pub(crate) struct Script {
     pub discover: VecDeque<Result<Vec<IccDeviceId>, IccError>>,
     pub open: VecDeque<Result<(), IccError>>,
     pub transact: VecDeque<Step>,
@@ -63,14 +63,14 @@ pub(super) struct Script {
     pub hold_open: Option<(SyncSender<()>, Receiver<()>)>,
 }
 
-pub(super) type Shared = Arc<Mutex<Script>>;
+pub(crate) type Shared = Arc<Mutex<Script>>;
 
 fn lock(shared: &Shared) -> MutexGuard<'_, Script> {
     shared.lock().expect("script lock")
 }
 
 /// The OK reply an exhausted script answers.
-pub(super) fn ok_reply() -> IccReply {
+pub(crate) fn ok_reply() -> IccReply {
     IccReply {
         code: 0x2001,
         params: Vec::new(),
@@ -79,12 +79,12 @@ pub(super) fn ok_reply() -> IccReply {
 }
 
 /// A scripted boundary.
-pub(super) struct Fake {
+pub(crate) struct Fake {
     shared: Shared,
 }
 
 impl Fake {
-    pub(super) fn new() -> (Self, Shared) {
+    pub(crate) fn new() -> (Self, Shared) {
         let shared = Shared::default();
         (
             Self {
@@ -95,7 +95,7 @@ impl Fake {
     }
 }
 
-pub(super) struct FakeLease<'a> {
+pub(crate) struct FakeLease<'a> {
     shared: Shared,
     closed: bool,
     _borrow: &'a mut Fake,
@@ -206,29 +206,45 @@ impl Boundary for Fake {
     }
 }
 
+/// Native failures a [`SimBoundary`] injects on top of the simulated body.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SimFaults {
+    /// Fail every command of this operation (and, when given, first parameter) with this error.
+    pub(crate) transact: Option<(u16, Option<u32>, IccError)>,
+    /// Fail the close, after the real one ran.
+    pub(crate) close: Option<IccError>,
+}
+
 /// A boundary that carries the simulated Sony body behind the ICC seam: it runs the real raw
 /// PTP engine against `SimCamera`, but only ever sees what ICC would forward.
-pub(super) struct SimBoundary {
+pub(crate) struct SimBoundary {
     runtime: tokio::runtime::Runtime,
     camera: Option<SimCamera>,
+    faults: SimFaults,
 }
 
 impl SimBoundary {
-    pub(super) fn new(camera: SimCamera) -> Self {
+    pub(crate) fn new(camera: SimCamera) -> Self {
+        Self::with_faults(camera, SimFaults::default())
+    }
+
+    pub(crate) fn with_faults(camera: SimCamera, faults: SimFaults) -> Self {
         Self {
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_time()
                 .build()
                 .expect("runtime"),
             camera: Some(camera),
+            faults,
         }
     }
 }
 
-pub(super) struct SimLease<'a> {
+pub(crate) struct SimLease<'a> {
     runtime: &'a tokio::runtime::Runtime,
     session: Session<SimCamera>,
     home: &'a mut Option<SimCamera>,
+    faults: SimFaults,
 }
 
 impl Drop for SimLease<'_> {
@@ -244,6 +260,12 @@ impl Lease for SimLease<'_> {
     fn transact(
         &mut self, operation: u16, params: &[u32], outgoing: Vec<u8>, _timeout: IccTimeout,
     ) -> Result<IccReply, IccError> {
+        if let Some((wanted, first, error)) = self.faults.transact
+            && wanted == operation
+            && first.is_none_or(|first| params.first() == Some(&first))
+        {
+            return Err(error);
+        }
         let data = (!outgoing.is_empty()).then_some(outgoing.as_slice());
         let result = self
             .runtime
@@ -264,9 +286,11 @@ impl Lease for SimLease<'_> {
     }
 
     fn close(mut self, _timeout: IccTimeout) -> Result<(), IccError> {
-        self.runtime
+        let closed = self
+            .runtime
             .block_on(self.session.close())
-            .map_err(|_| IccError::NativeFailure)
+            .map_err(|_| IccError::NativeFailure);
+        self.faults.close.map_or(closed, Err)
     }
 
     fn poll_event(&mut self) -> Result<Option<Vec<u8>>, IccError> {
@@ -302,7 +326,11 @@ impl Boundary for SimBoundary {
     }
 
     fn open(&mut self, _id: &IccDeviceId, _timeout: IccTimeout) -> Result<SimLease<'_>, IccError> {
-        let Self { runtime, camera } = self;
+        let Self {
+            runtime,
+            camera,
+            faults,
+        } = self;
         // The bridge holds one lease at a time, and a lease returns the camera when dropped.
         let taken = camera.take().expect("camera is home between leases");
         // ICC negotiates the session itself, so the simulated raw handshake lives here.
@@ -314,6 +342,7 @@ impl Boundary for SimBoundary {
             runtime,
             session,
             home: camera,
+            faults: *faults,
         })
     }
 

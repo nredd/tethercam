@@ -22,6 +22,8 @@ Next release: `0.0.2`.
 
 ### Added
 
+- Add `camera_backend = "usb" | "icc"` (default `usb`, serde-defaulted, never an automatic fallback). With a `macos-icc` build, `icc` runs `probe`, `doctor` and `run` over `ImageCaptureCore`: the main thread owns the native run loop and the whole application runs joined beside it, discovery must return exactly one camera, a quarantined native runtime shuts the application down in order and exits with status 75 for the LaunchAgent to restart, and anywhere unsupported the commands fail before any camera access. `camera_serial` is rejected with `icc`. `--simulate` bypasses it. Not validated on a live camera
+- Add `icc_sample --live-view`, a gated hardware probe over the production stack (Sony handshake, decoded live-view frames, confirmed close and reopen, counts and dimensions only)
 - Add the experimental, off-by-default, macOS-only `macos-icc` feature: `transport::icc::IccSession` runs Sony over `ImageCaptureCore` via the pinned `image-capture` `=0.1.0` crate with single-flight native work, typed deadline/quarantine/event failure categories and a gated read-only `icc_sample` example. No runtime selects it and there is no production support claim
 - Protected-source, OIDC-only crates.io publishing with verified Cargo archives, staged immutable GitHub releases, release-tag integrity policy, and explicit owner bootstrap/recovery instructions
 - Off-by-default, importable `test-support` API with a generic USB/IP engine, Sony/SICDD and synthetic non-Sony personalities, fault/resource/deadline/re-import/cancellation verification and hosted native integration
@@ -36,6 +38,10 @@ Next release: `0.0.2`.
 - Give live-view snapshots a 10 s reply budget; only opt-in full-resolution stills keep 360 s
 - Print `Listening ... waiting for a camera.` first; `Serving authenticated RTSP and ONVIF` now follows the first frame
 - `RtspServer::fanout` returns `Option`, and `RtspServer::bind_pending` with `StreamPublisher` and `OnvifService::pending` with `ModelPublisher` allow late stream and model publication
+- Keep the access-restriction state across the `ImageCaptureCore` open-time event drain: a restriction that still holds fails `open` with the permission category (lease closed with confirmation) instead of a later generic native failure
+- Over `ImageCaptureCore`, treat a native failure of the 3.00 `SDIOGetExtDeviceInfo` request as a refusal (close with confirmation, reopen, replay, ask for 2.00) and a caller deadline as not one; the Sony fallback now closes a no-longer-open session before reopening it, a no-op for raw USB
+- Write the CLI's output through an unlocked stdout so the `icc` worker can print while the main thread runs the native run loop
+
 - Serve the newest live-view JPEG as the ONVIF snapshot instead of firing the shutter for every request, fetching one frame when the last is over 2 s old and failing at once with no camera
 - Add opt-in `streams.full_resolution_snapshot` (default off) for full-resolution stills; a still that fails without leaving the shutter pressed (no image, unsupported) no longer ends the camera session
 - Keep WS-Discovery running when one interface cannot bind or join: skip it with a warning and fail only when none is usable; skip loopback and IPv4 link-local addresses when neither `interface` nor a specific `onvif_address` is set, and keep a skipped interface from claiming its subnet in the responder

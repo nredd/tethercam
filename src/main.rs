@@ -4,5 +4,7 @@ use std::io;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    tethercam::cli::run(&mut io::stdout().lock())
+    // Not locked: with `camera_backend = "icc"` this thread parks in the native run loop and the
+    // worker writes to stdout.
+    tethercam::cli::run(&mut io::stdout())
 }

@@ -121,6 +121,18 @@ pub struct Streams {
     pub full_resolution_snapshot: bool,
 }
 
+/// How the camera is reached. Selected explicitly; there is never an automatic fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CameraBackend {
+    /// Raw USB through `nusb`: the default, and the only backend off macOS.
+    #[default]
+    Usb,
+    /// Experimental macOS `ImageCaptureCore` (`docs/macos-camera.md`): needs a build with the
+    /// `macos-icc` feature, and selects the one camera it discovers.
+    Icc,
+}
+
 /// Complete validated configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,7 +147,11 @@ pub struct Config {
     pub onvif_port: u16,
     /// Optional network interface name.
     pub interface: Option<String>,
-    /// Optional USB serial; absent selects a camera automatically.
+    /// Camera access path. Defaults to raw USB when absent.
+    #[serde(default)]
+    pub camera_backend: CameraBackend,
+    /// Optional USB serial; absent selects a camera automatically. Raw USB only: `icc` selects
+    /// its sole discovered camera and rejects a serial rather than ignore it.
     pub camera_serial: Option<String>,
     /// Device name advertised to clients.
     pub device_name: String,
@@ -188,6 +204,7 @@ impl Config {
             onvif_address: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             onvif_port: 8080,
             interface: None,
+            camera_backend: CameraBackend::Usb,
             camera_serial: None,
             device_name: "tethercam".into(),
             log_level: "info".into(),
@@ -268,6 +285,11 @@ impl Config {
                 check(!value.trim().is_empty(), key, value)?;
             }
         }
+        check(
+            self.camera_backend == CameraBackend::Usb || self.camera_serial.is_none(),
+            "camera_serial",
+            &"unused with camera_backend = \"icc\"",
+        )?;
         check(
             !self.credentials.username.expose().is_empty(),
             "credentials.username",

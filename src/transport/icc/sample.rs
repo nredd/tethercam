@@ -21,7 +21,7 @@ use super::{IccDeviceId, IccError, IccHandle, IccSession, IccTimeout};
 use crate::ptp::session::{PtpSession, SessionConfig, SessionError, code};
 
 /// How long discovery observes the framework.
-const DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
+pub const DISCOVERY_WINDOW: Duration = Duration::from_secs(2);
 
 /// Why a sample cycle failed. Every variant is a sanitized category.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -115,7 +115,7 @@ pub enum Selector {
 
 impl Selector {
     /// Choose from `found`: [`IccError::NotFound`] for none, [`IccError::Ambiguous`] for several.
-    fn choose(&self, found: &[IccDeviceId]) -> Result<IccDeviceId, IccError> {
+    pub(crate) fn choose(&self, found: &[IccDeviceId]) -> Result<IccDeviceId, IccError> {
         let matching: Vec<&IccDeviceId> = match self {
             Self::Exact(wanted) => found.iter().filter(|id| *id == wanted).collect(),
             Self::SoleCandidate => found.iter().collect(),

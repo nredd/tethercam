@@ -141,6 +141,17 @@ announcing when the camera is ready. Unplugging or power-cycling the camera retu
 `waiting` without a restart; a camera that returns with a different live-view size ends the run,
 and the manager's restart policy picks up the new size. See [`architecture.md`](architecture.md#waiting-for-the-camera).
 
+### macOS and the `icc` backend
+
+An installed agent runs `run --config` like a foreground run, so selecting `camera_backend = "icc"`
+in the service's config file is all that changes: the agent's main thread runs the `ImageCaptureCore`
+run loop and the application runs joined beside it ([macOS camera](macos-camera.md)). A camera removal
+quarantines the native runtime for the rest of the process. The process then shuts down in order and exits
+with status 75, and `KeepAlive` restarts it after the throttle. Under `icc` a stop waits for the native
+join, which can wait forever if the framework never calls back; `ExitTimeOut` 0 keeps launchd from
+sending `SIGKILL`. LaunchAgent execution, camera consent and signing, and screen lock are not validated
+on hardware.
+
 ## Shutdown and validation
 
 Stopping a service sends `SIGTERM` and waits for joined runtime cleanup. systemd uses

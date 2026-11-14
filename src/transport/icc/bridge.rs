@@ -239,19 +239,34 @@ fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
 /// Most polls per open drain: a full native queue, one poll that clears the overflow flag and one
 /// that finds the queue empty.
 const MAX_STALE: usize = EVENT_QUEUE + 2;
+/// Tag of the delegate observation "access restriction removed".
+const TAG_RESTRICTION_LIFTED: u8 = 9;
+/// Tag of the delegate observation "access restriction enabled".
+const TAG_RESTRICTION_ENABLED: u8 = 10;
 
 /// Discard what the boundary's one process-wide event queue held before this session opened:
-/// stale PTP events, a predecessor's native error or access restriction, and the sticky overflow
-/// flag, which a poll clears. Without this the first poll of a new session would fault on, or
-/// act on, another session's history. Removal is not lost: the native owner keeps its own sticky
-/// removal state that quarantines independently of the queue.
-fn discard_stale<L: Lease>(lease: &mut L) {
+/// stale PTP events, a predecessor's native error and the sticky overflow flag, which a poll
+/// clears. Without this the first poll of a new session would fault on, or act on, another
+/// session's history. Removal is not lost: the native owner keeps its own sticky removal state
+/// that quarantines independently of the queue.
+///
+/// Access restriction is *state*, not history, so the last of "enabled" and "lifted" decides
+/// the return value: `true` when a restriction still holds. Dropping it would let the failure
+/// surface later as a generic native failure instead of the permission category.
+fn discard_stale<L: Lease>(lease: &mut L) -> bool {
+    let mut restricted = false;
     for _ in 0..MAX_STALE {
         match lease.poll_event() {
-            Ok(None) | Err(IccError::Disconnected) => return,
-            Ok(Some(_)) | Err(_) => {}
+            Ok(None) | Err(IccError::Disconnected) => break,
+            Ok(Some(event)) => match event.first().copied() {
+                Some(TAG_RESTRICTION_ENABLED) => restricted = true,
+                Some(TAG_RESTRICTION_LIFTED) => restricted = false,
+                _ => {}
+            },
+            Err(_) => {}
         }
     }
+    restricted
 }
 
 /// Serve requests until the handle is dropped. The inbox is owned so that an owner that
@@ -266,7 +281,14 @@ fn serve<B: Boundary>(boundary: &mut B, inbox: Inbox) {
             } => inbox.answer(reply, boundary.discover(window, timeout)),
             Request::Open { id, timeout, reply } => match boundary.open(&id, timeout) {
                 Ok(mut lease) => {
-                    discard_stale(&mut lease);
+                    if discard_stale(&mut lease) {
+                        // Nothing may be submitted under a restriction. Give the lease back
+                        // with a confirmed close and report the category; a failed close is
+                        // the worse news and wins.
+                        let closed = lease.close(timeout);
+                        inbox.answer(reply, Err(closed.err().unwrap_or(IccError::Permission)));
+                        continue;
+                    }
                     inbox.answer(reply, Ok(()));
                     if !hold(lease, &inbox) {
                         return;

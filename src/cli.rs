@@ -6,6 +6,21 @@
 #[cfg(test)]
 mod diagnostic_tests;
 mod diagnostics;
+#[cfg(feature = "macos-icc")]
+mod icc;
+#[cfg(not(feature = "macos-icc"))]
+mod icc {
+    //! Without the `macos-icc` feature the native backend cannot be selected.
+
+    use super::{Error, Options};
+    use crate::config::Config;
+
+    pub(super) fn launch(
+        _options: &Options, _cfg: &Config, _dispatch: &tracing::Dispatch,
+    ) -> Result<(), Error> {
+        Err(Error::IccUnavailable)
+    }
+}
 mod native;
 mod options;
 #[cfg(test)]
@@ -66,6 +81,14 @@ pub enum Error {
     /// No selected network interface can advertise this listener.
     #[error("no usable network interface for discovery")]
     Interface,
+    /// `camera_backend = "icc"` cannot run here. Nothing was started or opened.
+    #[error(
+        "camera_backend `icc` is unavailable: it needs macOS, a build with the `macos-icc` feature and a free native runtime"
+    )]
+    IccUnavailable,
+    /// The one native runtime is quarantined for the life of the process.
+    #[error("native camera runtime quarantined; it cannot be reused, restart the process")]
+    Quarantined,
     /// The simulator input is not a supported JPEG.
     #[error("simulator JPEG rejected")]
     Simulator,
@@ -155,13 +178,19 @@ fn execute_with_service(
         return Ok(());
     }
     let cfg = Config::load(&path)?;
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(diagnostics::level(&cfg.log_level))
-        .with_target(false)
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(diagnostics::level(&cfg.log_level))
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .finish(),
+    );
+    tracing::dispatcher::with_default(&dispatch, || {
+        if options.simulate.is_none() && cfg.camera_backend == config::CameraBackend::Icc {
+            // Selected, never a fallback: it fails before any camera access where unsupported.
+            return icc::launch(&options, &cfg, &dispatch);
+        }
         dispatch_runtime(
             &options,
             &cfg,
