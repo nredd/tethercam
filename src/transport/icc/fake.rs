@@ -60,6 +60,8 @@ pub(crate) struct Script {
     /// The exact identifier of every `open`, in order, so a test can prove which device was
     /// (or was never) opened. Test-only: production code never records an identifier.
     pub opened: Vec<IccDeviceId>,
+    /// The caller deadline of every `open`, `transact` and `close`, in order.
+    pub timeouts: Vec<IccTimeout>,
     pub live_leases: usize,
     pub panic_on_discover: bool,
     /// Block the next `open` the way a slow native open does: signal, then wait for release.
@@ -116,10 +118,11 @@ impl Drop for FakeLease<'_> {
 
 impl Lease for FakeLease<'_> {
     fn transact(
-        &mut self, operation: u16, params: &[u32], _outgoing: Vec<u8>, _timeout: IccTimeout,
+        &mut self, operation: u16, params: &[u32], _outgoing: Vec<u8>, timeout: IccTimeout,
     ) -> Result<IccReply, IccError> {
         let step = {
             let mut script = lock(&self.shared);
+            script.timeouts.push(timeout);
             script.calls.push(Call::Transact {
                 operation,
                 params: params.to_vec(),
@@ -146,9 +149,10 @@ impl Lease for FakeLease<'_> {
         }
     }
 
-    fn close(mut self, _timeout: IccTimeout) -> Result<(), IccError> {
+    fn close(mut self, timeout: IccTimeout) -> Result<(), IccError> {
         self.closed = true;
         let mut script = lock(&self.shared);
+        script.timeouts.push(timeout);
         script.calls.push(Call::Close);
         script.close.pop_front().unwrap_or(Ok(()))
     }
@@ -180,12 +184,11 @@ impl Boundary for Fake {
         answer
     }
 
-    fn open(
-        &mut self, id: &IccDeviceId, _timeout: IccTimeout,
-    ) -> Result<Self::Lease<'_>, IccError> {
+    fn open(&mut self, id: &IccDeviceId, timeout: IccTimeout) -> Result<Self::Lease<'_>, IccError> {
         let shared = Arc::clone(&self.shared);
         let (held, outcome) = {
             let mut script = lock(&shared);
+            script.timeouts.push(timeout);
             script.calls.push(Call::Open);
             script.opened.push(id.clone());
             (script.hold_open.take(), script.open.pop_front())

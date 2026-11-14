@@ -13,7 +13,8 @@
 //! that refuses or fails is reported as "not a supported camera" with a category and the listing
 //! goes on. The work is bounded: at most [`MAX_DEVICES`] devices, [`DESCRIBE_WAIT`] per step.
 //! After a failure that leaves native cleanup unsettled the remaining devices are listed but not
-//! described, because a replacement session would only be refused as busy. A quarantine is the
+//! described, because a replacement session would only be refused as busy. With `camera_id` set
+//! only that device is described: the others are ignored here as they are by the service. A quarantine is the
 //! same terminal condition as everywhere: the process reports it and exits for a restart.
 //!
 //! References:
@@ -160,11 +161,6 @@ fn write_line(
     Ok(())
 }
 
-/// What to print beside a device that was not opened: nothing without `--describe`.
-fn skipped(describe: bool, reason: &'static str) -> Option<String> {
-    describe.then(|| format!("not described ({reason})"))
-}
-
 /// Discover and print the cameras. `describe` opens each one (see the module docs).
 ///
 /// # Errors
@@ -192,8 +188,15 @@ pub(super) async fn list(
         if pause.is_none() && describe && stopped(&mut stop).await {
             pause = Some("stopped");
         }
+        let selected = wanted.is_some_and(|wanted| wanted == device.as_str());
+        matched |= selected;
         let description = match pause {
-            Some(reason) => skipped(describe, reason),
+            // Only ever set while describing.
+            Some(reason) => Some(format!("not described ({reason})")),
+            // With a key set the other devices are ignored, here as in the service.
+            None if describe && wanted.is_some() && !selected => {
+                Some("not described (not selected by camera_id)".to_owned())
+            }
             None if describe => {
                 let (described, health, next) = describe_one(handle, device).await;
                 handle = next;
@@ -212,8 +215,6 @@ pub(super) async fn list(
             }
             None => None,
         };
-        let selected = wanted.is_some_and(|wanted| wanted == device.as_str());
-        matched |= selected;
         write_line(
             out,
             position.saturating_add(1),

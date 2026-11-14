@@ -202,7 +202,9 @@ Set camera_id in the configuration to one of these identifiers; --describe opens
   a device can raise a trust prompt on it, which is why a phone is only touched when asked. A device that
   refuses or fails is printed as `not a supported camera (<category>)` with `access restricted`, `timed out`,
   `refused`, `failed` or `no device information`, and the listing goes on. Make and model are cleaned of
-  control characters and cut to 64 characters
+  control characters and cut to 64 characters. With `camera_id` set only the selected device is described
+  (the others show `not described (not selected by camera_id)` and are never opened), as the service
+  ignores them; unset the key to describe them all
 - Bounded: at most 64 devices (the native limit, more is an error), and 10 s per step (open,
   `GetDeviceInfo`, close) per device. A deadline or failed close leaves native cleanup unsettled, so the
   remaining devices are listed as `not described (native cleanup pending)` rather than opened into a busy
@@ -235,7 +237,7 @@ camera_id = "0F6A2C1E-0000-4000-8000-000000000002"   # exact, as printed by `tet
   errors raised before any camera access, and they never print the value. An existing configuration
   without the key keeps working. `setup` does not write or require it
 - The same selection serves `run`, `probe` and `doctor`, and the gated `icc_sample` example (exact
-  identifier in `TETHERCAM_ICC_DEVICE_ID`, or `--sole-candidate`), which share one selection function
+  identifier in `TETHERCAM_ICC_DEVICE_ID`, or `--sole-candidate`), which share one `Selector` and its choice logic
 - Stability of the identifier is NOT established. `image-capture` documents it only as the exact
   framework identifier and takes it from the camera object's `UUIDString`; Apple documents that as "a
   string representation of the Universally Unique ID of the device" and promises nothing about it across

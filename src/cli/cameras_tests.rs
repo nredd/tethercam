@@ -221,17 +221,21 @@ fn describe_prints_make_and_model_never_the_serial_and_confirms_every_close() {
         s.transact.push_back(info("Synthetic Maker", "Model One"));
         s.transact.push_back(info("Synthetic Maker", "Model Two"));
     });
-    let listing = run(fake, &config(Some(B)), true, false);
+    let listing = run(fake, &config(None), true, false);
     listing.result.as_ref().unwrap();
     assert_eq!(
         listing.out.lines().collect::<Vec<_>>(),
         [
             "Cameras found: 2",
             "1  synthetic-secret-a  Synthetic Maker Model One",
-            "2  synthetic-secret-b  Synthetic Maker Model Two  (selected by camera_id)",
+            "2  synthetic-secret-b  Synthetic Maker Model Two",
+            "Set camera_id in the configuration to one of these identifiers.",
         ]
     );
     assert_eq!(script(&shared).opened, [device(A), device(B)]);
+    // Bounded: every native step of every device carries the describe deadline.
+    let step = IccTimeout::new(Duration::from_secs(5), DESCRIBE_WAIT).unwrap();
+    assert_eq!(script(&shared).timeouts, [step; 6]);
     let operations: Vec<u16> = script(&shared)
         .calls
         .iter()
@@ -248,6 +252,39 @@ fn describe_prints_make_and_model_never_the_serial_and_confirms_every_close() {
     assert_quiet(&listing);
     // With the descriptions shown there is no hint to add them.
     assert!(!listing.out.contains("--describe"));
+}
+
+#[test]
+fn describe_with_a_key_set_opens_only_the_selected_device() {
+    let (fake, shared) = scripted(&[A, B, C], |s| {
+        s.transact.push_back(info("Synthetic Maker", "Model Two"));
+    });
+    let listing = run(fake, &config(Some(B)), true, false);
+    listing.result.as_ref().unwrap();
+    assert_eq!(
+        listing.out.lines().collect::<Vec<_>>(),
+        [
+            "Cameras found: 3",
+            "1  synthetic-secret-a  not described (not selected by camera_id)",
+            "2  synthetic-secret-b  Synthetic Maker Model Two  (selected by camera_id)",
+            "3  synthetic-secret-c  not described (not selected by camera_id)",
+        ]
+    );
+    // The others are ignored entirely, as they are by the service.
+    assert_eq!(script(&shared).opened, [device(B)]);
+    assert_eq!(closes(&shared), 1);
+    assert_quiet(&listing);
+
+    // A key that matches nothing opens nothing at all.
+    let (fake, shared) = scripted(&[A, C], |_| {});
+    let listing = run(fake, &config(Some(B)), true, false);
+    listing.result.as_ref().unwrap();
+    assert_eq!(script(&shared).calls, [Call::Discover]);
+    assert!(
+        listing.out.contains("camera_id is set but matches none"),
+        "{}",
+        listing.out
+    );
 }
 
 #[test]
@@ -319,9 +356,6 @@ fn a_deadline_leaves_cleanup_unsettled_so_the_rest_are_listed_but_not_opened() {
             .contains("2  synthetic-secret-b  not described (native cleanup pending)")
     );
     assert_eq!(script(&shared).opened, [device(A)]);
-
-    // Not describing at all: the stop reason only shows next to descriptions.
-    assert_eq!(skipped(false, "x"), None);
 }
 
 #[test]

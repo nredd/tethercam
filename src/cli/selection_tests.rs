@@ -171,13 +171,16 @@ fn the_selector_follows_the_configuration_and_never_echoes_the_key() {
     cfg.camera_id = Some(Secret::new("synthetic-secret-b".into()));
     assert_eq!(selector(&cfg).unwrap(), exact("synthetic-secret-b"));
     // Unvalidated values are refused under the same key, with the value redacted.
-    for bad in [String::new(), "a\0b".into(), "x".repeat(1025)] {
+    for bad in [String::new(), "SYNTHETIC\0ID".into(), "S".repeat(1025)] {
         cfg.camera_id = Some(Secret::new(bad));
         let error = selector(&cfg).unwrap_err();
         assert!(matches!(error, Error::Config(_)), "{error:?}");
         let shown = format!("{error} {error:?}");
         assert!(shown.contains("camera_id"), "{shown}");
-        assert!(!shown.contains("xxxx"), "{shown}");
+        assert!(
+            !shown.contains("SYNTHETIC") && !shown.contains("SSSS"),
+            "{shown}"
+        );
     }
 }
 
@@ -220,15 +223,17 @@ fn probe_and_doctor_use_the_configured_key() {
                 .contains("Camera: PC Remote")
         );
 
-        // The only attached camera is not the selected one: nothing is opened, not even it.
-        let absent = plan(command, Some("synthetic-other"), &logs);
+        // The only attached camera is not the selected one: it waits and nothing is opened.
+        let absent = plan(command, Some("synthetic-selected"), &logs);
+        let (fake, shared) = Fake::new();
+        script(&shared)
+            .discover
+            .push_back(Ok(vec![device("synthetic-other")]));
         let mut out = Vec::new();
-        let result = run_with(SimBoundary::new(camera()), |handle| {
-            worker(handle, &absent, &mut out)
-        })
-        .unwrap();
+        let result = run_with(fake, |handle| worker(handle, &absent, &mut out)).unwrap();
         assert!(matches!(result, Err(Error::NoCamera)), "{result:?}");
         assert_eq!(out, Vec::<u8>::new());
+        assert_eq!(script(&shared).calls, [Call::Discover]);
         assert!(!logs.text().contains("synthetic-"));
     }
 }
