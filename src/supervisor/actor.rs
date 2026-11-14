@@ -63,6 +63,12 @@ pub trait CameraFactory: Send {
     fn release(&mut self, camera: Self::Camera);
     /// Wait before another connection attempt.
     fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send;
+    /// How long to wait after the camera refused the Sony handshake (not a Sony camera, or not in
+    /// PC Remote mode), instead of the short reconnect backoff. Reopening such a device is not
+    /// free on every backend. `None`, the default, keeps the ordinary backoff.
+    fn refusal_delay(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Safe, nonidentifying camera telemetry.
@@ -356,6 +362,7 @@ impl<F: CameraFactory> Supervisor<F> {
             if !matches!(connected, Ok(Some(_))) {
                 self.counters.connect_missed();
             }
+            let mut refusal = None;
             if let Ok(Some(camera)) = connected {
                 let mut session = self
                     .factory
@@ -386,6 +393,9 @@ impl<F: CameraFactory> Supervisor<F> {
                         self.counters.session_restarted();
                         tracing::warn!(event = "camera_disconnected");
                     }
+                    if matches!(result, Err(SonyError::SdioUnsupported)) {
+                        refusal = self.factory.refusal_delay();
+                    }
                 }
                 let camera = self.factory.recover(session);
                 self.factory.release(camera);
@@ -398,7 +408,7 @@ impl<F: CameraFactory> Supervisor<F> {
             }
             tokio::select! {
                 _ = self.stop.changed() => break,
-                () = self.factory.pause(delay) => {},
+                () = self.factory.pause(refusal.unwrap_or(delay)) => {},
             }
             delay = (delay * 2).min(Duration::from_secs(5));
         }

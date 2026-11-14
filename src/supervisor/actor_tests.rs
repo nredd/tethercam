@@ -354,6 +354,99 @@ async fn reconnects_with_capped_backoff_and_closes_failed_handshakes() {
     }
 }
 
+/// The shared factory with a backend-specific pause after a refused handshake.
+struct Refusing(Factory);
+
+impl CameraFactory for Refusing {
+    type Camera = <Factory as CameraFactory>::Camera;
+    type Session = <Factory as CameraFactory>::Session;
+
+    fn connect(&mut self) -> impl Future<Output = Result<Option<Self::Camera>, OpenError>> + Send {
+        self.0.connect()
+    }
+    fn session(
+        &self, camera: Self::Camera, cfg: SessionConfig, clock: fn() -> Instant,
+    ) -> Self::Session {
+        self.0.session(camera, cfg, clock)
+    }
+    fn recover(&self, session: Self::Session) -> Self::Camera {
+        self.0.recover(session)
+    }
+    fn release(&mut self, camera: Self::Camera) {
+        self.0.release(camera);
+    }
+    fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send {
+        self.0.pause(delay)
+    }
+    fn refusal_delay(&self) -> Option<Duration> {
+        Some(Duration::from_secs(60))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_handshake_waits_the_backends_refusal_delay_not_the_short_backoff() {
+    let logs = LogCapture::new();
+    let refused = || {
+        sony_camera(SonySimConfig {
+            advertise_sdio: false,
+            ..SonySimConfig::default()
+        })
+    };
+    let factory = Factory::new(vec![refused(), refused(), camera()]);
+    let pauses = Arc::clone(&factory.pauses);
+    let (actor, control) = Supervisor::new(
+        Refusing(factory),
+        SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let work = async {
+        ready(&control).await;
+        control.shutdown();
+    };
+    let (_, ()) = tokio::join!(actor.run().with_subscriber(logs.dispatch()), work);
+    // Two refusals paused the full delay; the ordinary backoff did not apply to them.
+    assert_eq!(
+        pauses.lock().unwrap()[..2],
+        [Duration::from_secs(60), Duration::from_secs(60)]
+    );
+    assert_eq!(logs.text().matches("camera_disconnected").count(), 2);
+    // A refused handshake is a session that ended with an error, not a missed connection, and
+    // the first session that reaches live view afterwards is not a reconnect.
+    let counts = control.counters();
+    assert_eq!(
+        (
+            counts.session_restarts,
+            counts.connect_misses,
+            counts.reconnects
+        ),
+        (2, 0, 0)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failure_that_is_not_a_refusal_keeps_the_ordinary_backoff() {
+    // A backend refusal delay applies only to a refused handshake, never to a lost camera.
+    let factory = Factory::new(vec![camera()]);
+    let pauses = Arc::clone(&factory.pauses);
+    let mut factory = factory;
+    factory.steps.push_front(Err(OpenError::Disconnected));
+    let (actor, control) = Supervisor::new(
+        Refusing(factory),
+        SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let work = async {
+        ready(&control).await;
+        control.shutdown();
+    };
+    tokio::join!(actor.run(), work);
+    assert_eq!(pauses.lock().unwrap()[0], Duration::from_millis(100));
+}
+
 #[tokio::test]
 async fn serializes_live_frames_and_full_resolution_snapshots_then_reads_power() {
     let (actor, control) = actor(Factory::new(vec![camera()]));

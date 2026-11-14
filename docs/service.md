@@ -147,7 +147,9 @@ An installed agent runs `run --config` like a foreground run, so selecting `came
 in the service's config file is all that changes: the agent's main thread runs the `ImageCaptureCore`
 run loop and the application runs joined beside it ([macOS camera](macos-camera.md)). A camera removal
 quarantines the native runtime for the rest of the process. The process then shuts down in order and exits
-with status 75, and `KeepAlive` restarts it after the throttle. Under `icc` a stop waits for the native
+with status 75, and `KeepAlive` restarts it after the throttle. So does a native command that never
+completes: if every discovery is answered busy for 300 s, the service restarts the same way
+(`icc_busy_limit_exceeded` in the log) instead of sitting at `waiting` until killed by hand. Under `icc` a stop waits for the native
 join, which can wait forever if the framework never calls back; `ExitTimeOut` 0 keeps launchd from
 sending `SIGKILL`. LaunchAgent execution, camera consent and signing, and screen lock are not validated
 on hardware.
@@ -165,7 +167,7 @@ address or payload. Each counter is a relaxed atomic, so the frame path takes no
 | `frames_served` | Paced frames processed for subscribers (decoded, encoded and offered to the RTP queues), duplicates that hold the frame rate included. A frame whose queue was full counts here and in `frames_dropped` | After each processed frame in `Pipeline::run_with_worker`, `src/supervisor/pipeline.rs` |
 | `frames_dropped` | Fetched frames replaced in the pacer before they were emitted, plus frames whose packets met a full client queue (once per stream) | `account_drops` and `publish`, `src/supervisor/pipeline.rs`. Pacer overruns count only while a client streams |
 | `reconnects` | Sessions that reached live view after an earlier one | `Counters::session_ready`, when a session's first frame arrives |
-| `session_restarts` | Sessions that ended with an error (unplug, power-off, transport failure) | The `camera_disconnected` branch of `Supervisor::run` |
+| `session_restarts` | Sessions that ended with an error (unplug, power-off, transport failure, a refused handshake) | The `camera_disconnected` branch of `Supervisor::run` |
 | `connect_misses` | Connection attempts that found no usable camera (absent, busy, not in PC Remote mode) | After each `connect`, in `Supervisor::run`. About one per five seconds while the camera is away |
 | `snapshots_served` / `snapshots_refused` | Snapshot requests answered with an image / refused or failed | `Control::snapshot`, the seam the ONVIF snapshot endpoint calls |
 
