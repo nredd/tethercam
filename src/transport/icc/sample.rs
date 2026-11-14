@@ -106,20 +106,38 @@ impl Receipt {
 /// How the sample picks its one camera. It never picks "the first of several".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selector {
-    /// Exactly this identifier, which discovery must return exactly once.
+    /// Exactly this identifier, which discovery must return (a repeat of it is the same device).
     Exact(IccDeviceId),
-    /// Whatever camera discovery returns, but only if it returns exactly one. Lets the hardware
-    /// owner run without ever handling the identifier.
+    /// Whatever camera discovery returns, but only if it returns exactly one distinct device. Lets
+    /// the hardware owner run without ever handling the identifier.
     SoleCandidate,
 }
 
+/// The distinct identifiers in `found`, in first-seen order, each with how often it was reported.
+/// The framework can list one device more than once; that is one device, not several.
+pub(crate) fn distinct(found: &[IccDeviceId]) -> Vec<(&IccDeviceId, usize)> {
+    let mut seen: Vec<(&IccDeviceId, usize)> = Vec::new();
+    for id in found {
+        match seen.iter_mut().find(|(known, _)| *known == id) {
+            Some((_, count)) => *count = count.saturating_add(1),
+            None => seen.push((id, 1)),
+        }
+    }
+    seen
+}
+
 impl Selector {
-    /// Choose from `found`: [`IccError::NotFound`] for none, [`IccError::Ambiguous`] for several.
+    /// Choose from `found`, de-duplicated first: [`IccError::NotFound`] for none,
+    /// [`IccError::Ambiguous`] for several different devices.
     pub(crate) fn choose(&self, found: &[IccDeviceId]) -> Result<IccDeviceId, IccError> {
-        let matching: Vec<&IccDeviceId> = match self {
-            Self::Exact(wanted) => found.iter().filter(|id| *id == wanted).collect(),
-            Self::SoleCandidate => found.iter().collect(),
-        };
+        let matching: Vec<&IccDeviceId> = distinct(found)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| match self {
+                Self::Exact(wanted) => *id == wanted,
+                Self::SoleCandidate => true,
+            })
+            .collect();
         match matching.as_slice() {
             [] => Err(IccError::NotFound),
             [only] => Ok((*only).clone()),

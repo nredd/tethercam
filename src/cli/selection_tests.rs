@@ -157,9 +157,21 @@ fn an_absent_key_waits_and_never_falls_back_to_another_device() {
 }
 
 #[test]
-fn a_key_listed_twice_is_ambiguous_not_a_free_choice() {
+fn a_key_listed_twice_is_still_the_one_selected_device() {
+    let logs = LogCapture::new();
     let twice = ["synthetic-secret-b", "synthetic-secret-b"];
-    let (outcome, shared) = connect(exact("synthetic-secret-b"), &twice, &LogCapture::new());
+    let (outcome, shared) = connect(exact("synthetic-secret-b"), &twice, &logs);
+    assert_eq!(outcome, Outcome::Selected);
+    assert_eq!(script(&shared).opened, [device("synthetic-secret-b")]);
+    // Without a key the repeated device is the sole candidate, two different ones are not.
+    let (outcome, _) = connect(Selector::SoleCandidate, &twice, &logs);
+    assert_eq!(outcome, Outcome::Selected);
+    let mixed = [
+        "synthetic-secret-b",
+        "synthetic-secret-a",
+        "synthetic-secret-b",
+    ];
+    let (outcome, shared) = connect(Selector::SoleCandidate, &mixed, &logs);
     assert_eq!(outcome, Outcome::Refused(OpenError::Ambiguous));
     assert_eq!(script(&shared).opened, Vec::new());
 }

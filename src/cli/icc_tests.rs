@@ -5,14 +5,16 @@
 //! - `docs/macos-camera.md`, Ownership and deadlines
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::cli::Command;
 use crate::sony::op;
 use crate::supervisor::testing::{LogCapture, camera};
-use crate::transport::icc::fake::{Call, Fake, Script, Shared, SimBoundary, SimFaults};
+use crate::transport::icc::Boundary;
+use crate::transport::icc::fake::{Call, Fake, Script, Shared, SimBoundary, SimFaults, Unsettled};
 use crate::transport::icc::run_with;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -630,6 +632,7 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
         &logs.dispatch(),
         sink.clone(),
         |entry| run_with(SimBoundary::new(camera()), entry),
+        Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
     result.unwrap();
@@ -638,6 +641,25 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
             .unwrap()
             .starts_with("Camera: PC Remote")
     );
+    assert_eq!(UNEXPECTED.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn launch_without_a_settle_bound_runs_unwatched() {
+    // The service's policy: no watcher, so nothing can end it but its own shutdown.
+    record_unexpected_termination(0);
+    let sink = Sink::default();
+    launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        sink.clone(),
+        |entry| run_with(SimBoundary::new(camera()), entry),
+        None,
+        record_unexpected_termination,
+    )
+    .unwrap();
+    assert!(written(&sink).starts_with("Camera: PC Remote"));
     assert_eq!(UNEXPECTED.load(Ordering::SeqCst), 0);
 }
 
@@ -658,6 +680,7 @@ fn launch_terminates_with_the_restart_status_after_a_quarantine() {
             };
             run_with(SimBoundary::with_faults(camera(), faults), entry)
         },
+        Some(SETTLE_LIMIT),
         record_termination,
     );
     assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
@@ -679,6 +702,7 @@ fn launch_reports_an_unavailable_runtime_without_running_anything() {
         &LogCapture::new().dispatch(),
         Sink::default(),
         |_entry| Err(IccError::Runtime),
+        Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
     assert!(matches!(result, Err(Error::IccUnavailable)));
@@ -699,6 +723,7 @@ fn launch_does_not_blame_the_platform_when_the_worker_failed_after_it_ran() {
                 std::panic::resume_unwind(Box::new("synthetic worker failure"))
             })
         },
+        Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
     let error = result.unwrap_err();
@@ -709,6 +734,187 @@ fn launch_does_not_blame_the_platform_when_the_worker_failed_after_it_ran() {
             .unwrap()
             .starts_with("Camera: PC Remote")
     );
+}
+
+/// The two in-process hung-runtime tests share `SETTLE` and `EXITED`: they run one at a time even
+/// when the lib tests share a process.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Releases the hung native side, standing in for the process ending.
+static SETTLE: Mutex<Option<Sender<()>>> = Mutex::new(None);
+static EXITED: AtomicU8 = AtomicU8::new(0);
+
+/// Records the status `terminate` was given, then lets the native side return so the test ends.
+fn exit_and_settle(code: u8) {
+    EXITED.store(code, Ordering::SeqCst);
+    SETTLE.lock().unwrap_or_else(PoisonError::into_inner).take();
+}
+
+/// `native::run` over `boundary` whose cleanup settles only once `terminate` is called.
+fn hung<B: Boundary + Send>(
+    boundary: impl FnOnce(Receiver<()>) -> B, entry: Entry,
+) -> Result<Result<(), Error>, IccError> {
+    let (release, settle) = mpsc::channel();
+    *SETTLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(release);
+    run_with(boundary(settle), entry)
+}
+
+fn hung_with_camera(entry: Entry) -> Result<Result<(), Error>, IccError> {
+    hung(
+        |settle| Unsettled::new(SimBoundary::new(camera()), settle),
+        entry,
+    )
+}
+
+fn hung_without_camera(entry: Entry) -> Result<Result<(), Error>, IccError> {
+    hung(|settle| Unsettled::new(Fake::new().0, settle), entry)
+}
+
+fn written(sink: &Sink) -> String {
+    String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_distinct_status() {
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let logs = LogCapture::new();
+    let sink = Sink::default();
+    EXITED.store(0, Ordering::SeqCst);
+    let result = launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &logs.dispatch(),
+        sink.clone(),
+        hung_with_camera,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    result.unwrap();
+    assert_eq!(EXITED.load(Ordering::SeqCst), UNSETTLED_EXIT);
+    assert_ne!(UNSETTLED_EXIT, QUARANTINE_EXIT);
+    let text = written(&sink);
+    // The command's own result is written first, the counts-only notice after it.
+    let (before, notice) = text.split_once("Camera: PC Remote").unwrap();
+    assert!(before.is_empty(), "{text}");
+    assert!(
+        notice.contains("Native cleanup did not settle within 50ms; exiting with status 69."),
+        "{text}"
+    );
+    assert!(!text.contains("synthetic"), "{text}");
+    assert!(
+        logs.text()
+            .contains(r#"event="icc_cleanup_unsettled" limit=50ms"#),
+        "{}",
+        logs.text()
+    );
+}
+
+#[test]
+fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit() {
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let sink = Sink::default();
+    EXITED.store(0, Ordering::SeqCst);
+    let result = launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        sink.clone(),
+        hung_without_camera,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    // Reached only because the stand-in `terminate` returns; the real one never does.
+    assert!(matches!(result, Err(Error::NoCamera)), "{result:?}");
+    assert_eq!(EXITED.load(Ordering::SeqCst), UNSETTLED_EXIT);
+    let text = written(&sink);
+    let error = text.find("Error: no selected camera").unwrap();
+    assert!(
+        text.find("Native cleanup did not settle").unwrap() > error,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_watcher_that_cannot_start_fails_the_command_before_any_native_work() {
+    let sink = Sink::default();
+    let result = launch_spawning(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        sink.clone(),
+        hung_with_camera,
+        Some(SETTLE_LIMIT),
+        record_unexpected_termination,
+        |_task| Err(io::Error::other("synthetic thread limit")),
+    );
+    assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+    // The application never ran, so nothing was printed or opened.
+    assert_eq!(written(&sink), "");
+}
+
+#[test]
+fn the_unsettled_boundary_serves_like_its_inner_one_until_released() {
+    let (release, settle) = mpsc::channel();
+    let (fake, _) = Fake::new();
+    let polled = run_with(Unsettled::new(fake, settle), |mut handle| {
+        let polled = runtime().block_on(handle.poll_event());
+        drop(release);
+        polled
+    });
+    assert_eq!(polled, Ok(Ok(None)));
+}
+
+#[test]
+fn the_settle_bound_covers_one_shot_commands_but_never_the_service() {
+    assert_eq!(settle_bound(Command::Run), None);
+    for command in [
+        Command::Probe,
+        Command::Doctor,
+        Command::Cameras { describe: false },
+        Command::Cameras { describe: true },
+    ] {
+        assert_eq!(settle_bound(command), Some(SETTLE_LIMIT));
+    }
+    // Longer than the longest single step any one-shot command waits on, `probe` and `doctor`'s
+    // 60 s whole-transaction deadline, and shorter than the service's busy limit.
+    assert!(SETTLE_LIMIT >= SessionConfig::default().transaction_timeout);
+    assert!(SETTLE_LIMIT < BUSY_LIMIT);
+}
+
+#[test]
+fn a_hung_one_shot_command_really_exits_with_the_distinct_status() {
+    const CHILD: &str = "TETHERCAM_TEST_UNSETTLED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // `terminate` is the real one: it ends this process before the `Ok` below is reached.
+        let result = launch_with(
+            &options(Command::Probe),
+            &free_cfg(),
+            &LogCapture::new().dispatch(),
+            io::stdout(),
+            hung_with_camera,
+            Some(Duration::from_millis(200)),
+            terminate,
+        );
+        result.unwrap();
+        return;
+    }
+    let (_, module) = module_path!().split_once("::").unwrap();
+    let started = Instant::now();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("{module}::a_hung_one_shot_command_really_exits_with_the_distinct_status"),
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(i32::from(UNSETTLED_EXIT)));
+    // The fake would have held for its whole limit: the exit was the bound, not the hang ending.
+    assert!(started.elapsed() < crate::transport::icc::fake::HOLD_LIMIT);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Camera: PC Remote"), "{stdout}");
+    assert!(stdout.contains("Native cleanup did not settle"), "{stdout}");
 }
 
 #[test]

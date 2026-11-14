@@ -137,6 +137,23 @@ target/release/tethercam run --config ./camera.toml
   75 after printing `native camera runtime quarantined`. The LaunchAgent's `KeepAlive` restarts it after
   its ten-second throttle. This `exit` is the one deliberate departure from joined shutdown, taken only
   once the native owner has declared its state unresolvable. It is not validated on hardware
+- One-shot commands (`cameras`, `probe`, `doctor`) must also always exit. The native entry point
+  returns only once native cleanup settles, which after a step that hit its deadline may be never, and
+  only a quarantine called `exit`: a command could print its answer and then hang with no status. So
+  once the command's work is done and its output is written and flushed, the process waits 60 s for the
+  native side to settle. If it does, the exit is joined and clean, status 0 (or the command's own failure
+  status 1). If it does not, the process logs `icc_cleanup_unsettled`, prints a counts-only notice
+  (`Native cleanup did not settle within 60s; exiting with status 69. The result above is complete.`,
+  after the command's own error line if it failed) and exits with status 69 through the same `exit` path,
+  nothing cancelled. 69 is distinct from 75 (restart me) and from 1 (the command failed): the output is
+  complete and trustworthy, but this process's native runtime is spent, so run the command again in a
+  fresh process. 60 s is a heuristic, not a guarantee: the longest single step any one-shot command waits
+  on, `probe` and `doctor`'s 60 s whole-transaction deadline, and six of the 10 s `cameras` steps. A step
+  that hit its deadline leaves one retired command to complete and then the confirming close, so a merely
+  slow camera is expected to settle within a few such steps; one slower than that exits with 69 and can
+  be run again. It is well under the service's 300 s busy limit.
+  The service (`run`) keeps its own policy and is not watched this way. Verified through an injected
+  runtime whose cleanup never settles, and a subprocess exit; not validated on hardware
 - Sony protocol generation: a non-OK response to the 3.00 request falls back to 2.00 on the same session,
   as over USB. A native failure of that request faults the session but leaves it closable, so the driver
   closes with confirmation, reopens, replays the handshake and asks for 2.00. A caller *deadline* is not
@@ -226,7 +243,11 @@ Set camera_id in the configuration to one of these identifiers; --describe opens
   a device can raise a trust prompt on it, which is why a phone is only touched when asked. A device that
   refuses or fails is printed as `not a supported camera (<category>)` with `access restricted`, `timed out`,
   `refused`, `failed` or `no device information`, and the listing goes on. Make and model are cleaned of
-  control characters and cut to 64 characters. With `camera_id` set only the selected device is described
+  control characters, Unicode format characters (right-to-left and other bidirectional overrides,
+  zero-width and joiner characters, the BOM, tag characters) and the line and paragraph separators
+  (U+2028, U+2029), each shown as `?`, and cut to 64 characters. The format characters are an explicit
+  list for Unicode 17.0 rather than a new dependency; one a later version adds is not covered until the
+  list is extended. With `camera_id` set only the selected device is described
   (the others show `not described (not selected by camera_id)` and are never opened), as the service
   ignores them; unset the key to describe them all
 - Bounded: at most 64 devices (the native limit, more is an error), and 10 s per step (open,
@@ -235,6 +256,14 @@ Set camera_id in the configuration to one of these identifiers; --describe opens
   refusal. A stop (SIGINT, SIGTERM) is honoured between devices, never mid-command. A quarantine ends the
   command as `native camera runtime quarantined` and exit status 75, like every other command
 - Without `--describe` nothing is opened, so listing never touches a phone
+- A device the framework lists more than once is one device: the listing shows one line with
+  `(reported N times)` (a count, never more), `Cameras found` counts distinct devices, and exact selection
+  of it works. Two different devices are still several
+- An identifier that `camera_id` validation would refuse (control characters such as a newline or an
+  escape, format characters or a separator such as a right-to-left override or U+2028, padding, over 1024
+  bytes) is never printed: its line keeps its index and reads `(identifier not selectable)`, it is never
+  opened, even with `--describe`, and a hostile value cannot forge list lines or rewrite the terminal.
+  The hint to set `camera_id` appears only when at least one listed identifier is selectable
 - With `camera_id` set, the listing marks that device `(selected by camera_id)`, or says it matches none
 - On `camera_backend = "usb"` it prints the same counts and modes as `probe`, and a note that raw USB
   selects by `camera_serial`; serial numbers are not printed and `--describe` is ignored. Listing USB
@@ -257,7 +286,7 @@ camera_id = "0F6A2C1E-0000-4000-8000-000000000002"   # exact, as printed by `tet
 | exactly one other device | that device is used | waits; the other device is never opened |
 
 - `camera_id` is rejected with `camera_backend = "usb"` (as `camera_serial` is with `icc`), and when empty,
-  padded with whitespace, over 1024 bytes or containing control characters. These are config validation
+  padded with whitespace, over 1024 bytes or containing control, format or separator characters. These are config validation
   errors raised before any camera access, and they never print the value. An existing configuration
   without the key keeps working. `setup` does not write or require it
 - The same selection serves `run`, `probe` and `doctor`, and the gated `icc_sample` example (exact

@@ -357,3 +357,46 @@ impl Boundary for SimBoundary {
         Ok(None)
     }
 }
+
+/// A boundary whose native cleanup never settles on its own: it behaves as `inner` and, when the
+/// owner drops it, which is where `image_capture::native::run` blocks until the driver is idle,
+/// it waits for `settle` to be released (its sender sent to or dropped). Bounded by
+/// [`HOLD_LIMIT`] so a regression fails instead of hanging the suite.
+pub(crate) struct Unsettled<B> {
+    inner: B,
+    settle: Receiver<()>,
+}
+
+impl<B> Unsettled<B> {
+    pub(crate) fn new(inner: B, settle: Receiver<()>) -> Self {
+        Self { inner, settle }
+    }
+}
+
+impl<B> Drop for Unsettled<B> {
+    fn drop(&mut self) {
+        // Released, dropped or timed out: all end the wait, which is the hang being modelled.
+        self.settle.recv_timeout(HOLD_LIMIT).ok();
+    }
+}
+
+impl<B: Boundary> Boundary for Unsettled<B> {
+    type Lease<'a>
+        = B::Lease<'a>
+    where
+        Self: 'a;
+
+    fn discover(
+        &mut self, window: Duration, timeout: IccTimeout,
+    ) -> Result<Vec<IccDeviceId>, IccError> {
+        self.inner.discover(window, timeout)
+    }
+
+    fn open(&mut self, id: &IccDeviceId, timeout: IccTimeout) -> Result<Self::Lease<'_>, IccError> {
+        self.inner.open(id, timeout)
+    }
+
+    fn poll_event(&mut self) -> Result<Option<Vec<u8>>, IccError> {
+        self.inner.poll_event()
+    }
+}

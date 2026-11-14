@@ -1475,9 +1475,11 @@ fn the_sample_stops_at_the_first_failure_and_still_closes() {
     let (none, shared) = selection(Vec::new());
     assert_eq!(none.failure, Some(IccError::NotFound.into()));
     assert!(!calls(&shared).contains(&Call::Open));
-    let (many, _) = selection(vec![id(), id()]);
-    assert_eq!(many.failure, Some(IccError::Ambiguous.into()));
-    assert_eq!(many.candidates, 2);
+    let other = IccDeviceId::new("synthetic-other".into()).expect("valid");
+    // The exact selector never sees "several": the key is there once or not at all.
+    let (absent, _) = selection(vec![other.clone(), other]);
+    assert_eq!(absent.failure, Some(IccError::NotFound.into()));
+    assert_eq!(absent.candidates, 2);
 
     let (failed, _) = sample(|s| s.discover.push_back(Err(IccError::Busy)), 1);
     assert_eq!(
@@ -1566,6 +1568,33 @@ fn sole(setup: impl FnOnce(&mut Script)) -> (super::Receipt, Shared) {
     run(setup, |handle| {
         block(async move { read_only_sample(handle, &Selector::SoleCandidate, 1).await })
     })
+}
+
+#[test]
+fn discovery_listing_a_device_twice_is_one_device_to_every_selector() {
+    let other = || IccDeviceId::new("synthetic-other".into()).expect("valid");
+    let exact = Selector::Exact(id());
+    // Exact selection of X among [X, X] selects X, wherever the repeats sit.
+    for found in [
+        vec![id(), id()],
+        vec![id(), other(), id()],
+        vec![other(), id(), id()],
+    ] {
+        assert_eq!(exact.choose(&found), Ok(id()), "{}", found.len());
+    }
+    // The same repeated device is still the sole candidate; two different ones are not.
+    assert_eq!(Selector::SoleCandidate.choose(&[id(), id()]), Ok(id()));
+    assert_eq!(
+        Selector::SoleCandidate.choose(&[id(), other(), id()]),
+        Err(IccError::Ambiguous)
+    );
+    assert_eq!(exact.choose(&[other(), other()]), Err(IccError::NotFound));
+    assert_eq!(Selector::SoleCandidate.choose(&[]), Err(IccError::NotFound));
+    // The shared de-duplication keeps first-seen order and counts each repeat.
+    assert_eq!(
+        super::distinct(&[id(), other(), id(), id()]),
+        [(&id(), 3), (&other(), 1)]
+    );
 }
 
 #[test]
