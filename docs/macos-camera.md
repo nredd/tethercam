@@ -1,11 +1,100 @@
 # Cooperative macOS camera acquisition
 
-This is a proposed contract, not a shipped backend or production support. The work is tracked
-by [#72](https://github.com/nredd/tethercam/issues/72); this specification does not close it.
+The experimental `macos-icc` Cargo feature (off by default, macOS-only native code) implements this
+contract in `transport::icc`. It is not production support and no runtime selects it: runtime
+selection and commissioning are separate work in [#77](https://github.com/nredd/tethercam/issues/77).
+The work is tracked by [#72](https://github.com/nredd/tethercam/issues/72); this document does not
+close it.
 ImageCaptureCore (ICC) provides a cooperative camera session and PTP command interface while
 Apple's camera helpers remain running. Raw USB interface claiming can conflict with those
 helpers. Killing or disabling them, installing a daemon, elevating capture privileges or using
-whole-device capture is not the proposed solution.
+whole-device capture is not the solution.
+
+## Implementation (`macos-icc`)
+
+```toml
+tethercam = { version = "0.0.2", features = ["macos-icc"] }  # macOS, Rust 1.99 or newer
+```
+
+The feature depends on the registry crate [`image-capture`](https://crates.io/crates/image-capture)
+`=0.1.0` ([source](https://github.com/nredd/image-capture)), target-gated to macOS. All native
+interop and every `unsafe` block live in that crate. This repository stays `unsafe`-free and keeps
+`unsafe_code = "forbid"`. Default, Linux, simulator and cross builds are unchanged: the dependency
+is not compiled off macOS, `Cargo.toml` pins `=0.1.0` and `deny.toml` bans every newer version. The feature needs Rust
+1.99 on macOS because that crate does; the declared MSRV is unchanged for everything else.
+
+Layers, all in `src/transport/icc/`:
+
+- `Boundary` / `Lease`: the crate's blocking owned-session API as traits that name none of its types.
+  Everything below runs on any platform against deterministic implementations
+- `run_with` / `IccHandle`: one owner thread holds the boundary and its lease. Async callers hold the
+  handle. A shared busy gate admits one request at a time and is released when the native call has
+  *finished*, so a cancelled caller future neither backlogs nor overlaps native work
+- `IccSession`: a `PtpSession`, so `SonyCamera` runs unchanged and no Sony logic is duplicated
+- `classify`: total classification of the boundary's tagged events
+- `native` (macOS only): one-line delegations onto the crate, plus `run`, the main-thread entry point
+- `read_only_sample`: the read-only acceptance consumer described below
+
+Session semantics, all following from "ICC owns the pipes":
+
+- Raw `OpenSession`/`CloseSession` are refused (`IccError::RawSessionOperation`). Response transaction
+  ids are opaque and not exposed. More than five parameters, outgoing data over
+  `min(max_data_out, 16 MiB)` and incoming data over `max_data_len` are typed errors. A non-`OK` camera
+  response is `SessionError::Response`, never an ICC failure
+- A caller deadline ends only the wait. `IccError::AdmissionExpired` means nothing was submitted;
+  `IccError::DeadlineExceeded` means native work continues. After a deadline the session is *retired*:
+  it refuses work, never issues a second close, and a replacement `open` returns `IccError::Busy`
+  until the native owner has settled cleanup. A cancelled `open` future leaves the session `Opening`:
+  the owner may still complete it, so `close` (not a second `open`) confirms closure if a lease exists. If none does, nothing was confirmed: `close` reports `IccError::NotOpen` and the session is retired. `close` on a retired session is `NotOpen` too (terminal; a retry cannot help), and only `open` probes for reuse, which stays `Busy` until native cleanup settles. A late open success is closed natively after it completes.
+- Failure categories are sanitized statics: permission, busy, removal, admission, deadline, malformed
+  completion, event overflow, malformed event, cleanup failure, quarantine
+- Failures fault, retire or quarantine the session. A faulted session refuses transactions but `close`
+  still confirms closure. A quarantined session (native quarantine, removal, close failure, owner gone)
+  accepts nothing and never reopens
+- Events are advisory and bounded by the boundary (64), and the boundary has ONE process-wide queue.
+  When a session opens, everything queued before it (stale PTP events, a previous native error or access
+  restriction, the overflow flag) is discarded so it cannot fault or feed the new session. Removal is not
+  lost by this: the native owner keeps a sticky, process-lifetime removal flag that quarantines
+  independently of the queue (`driver.rs` `disconnected`): the next transaction, close or open reports it,
+  but a consumer that only polls events will not see a removal discarded here until then. Events that
+  arrive in the instant between open completion and the discard are lost too, so the guarantee is
+  conditional on the caller resynchronizing after open; the Sony handshake re-reads the property table.
+  Afterwards `poll_event` fails closed. Overflow, access restriction, a native error observation, an
+  oversized event and any malformed, truncated or oversized PTP event fault the session, so the Sony
+  layer must close and reconnect to resynchronize. Removal quarantines it. Only benign observations are skipped
+
+Native code runs on the main thread (`run` blocks it in the run loop) and joins one worker, which can
+wait forever if the framework never calls back. There is no bounded-shutdown guarantee.
+
+### Validation status
+
+- AI-assisted independent source review of the `image-capture` crate (not a certification or formal audit)
+- ONE short real-camera sample of that crate: discovery, two open / `GetDeviceInfo` / confirmed-close
+  cycles with a same-process reopen, helpers untouched
+- Hosted tests prove the state machine, bridge, framing and failure paths with deterministic fakes and
+  the simulated Sony body behind the seam. They do not prove native memory safety, callback delivery,
+  framework behavior, disconnect ordering or deployment permissions
+- The thin `native` delegation is compiled only on macOS and needs a real device, so hosted coverage
+  cannot execute it (see `docs/verification.md`). Its decisions (error mapping, event draining,
+  conversions) are covered by macOS unit tests
+- Running this adapter against a camera is a hardware action reserved to the hardware owner:
+
+```sh
+cargo build --release --features macos-icc --example icc_sample
+# default path does nothing native:
+target/release/examples/icc_sample
+# hardware owner only. Either select the camera only if discovery finds exactly one, so the identifier
+# is never handled (zero or several candidates fail with exit 1 and counts only, never "the first"):
+target/release/examples/icc_sample --hardware-admitted --sole-candidate
+# or name it exactly; the identifier stays in the environment (mutually exclusive with --sole-candidate):
+TETHERCAM_ICC_DEVICE_ID=<exact identifier> target/release/examples/icc_sample --hardware-admitted
+```
+
+It performs discovery, then two cycles of open, `GetDeviceInfo` (`0x1001`) and a confirmed close, and
+prints one line of counts and response codes, e.g.
+`candidates=1 cycles=2 device_info_ok=2 confirmed_closes=2 response_codes=0x2001,0x2001 result=ok`.
+It never prints identities or payload bytes, writes no settings, fires no shutter and runs no vendor handshake.
+Exit status is 0 for a pass, 1 for a failed sample and 2 for usage errors. CI never passes the flag.
 
 ## Transaction boundary
 
@@ -60,15 +149,16 @@ delivery.
 ## Dependency and security gate
 
 Shipped repository code remains Rust-only with `unsafe_code` forbidden. No Swift or Objective-C
-sources or local unsafe exception are approved. A separate safe Rust dependency is a proposal,
-not an approval or a way to evade unsafe review. [#75](https://github.com/nredd/tethercam/issues/75)
-owns the maintainer approval of ownership and maintenance, independent unsafe audit, and actual
-safe-library validation. Its [approval-ready design](https://github.com/nredd/tethercam/issues/75#issuecomment-6842174382)
-is not implementation or publication authorization. The audit must cover pinned bindings and headers, callback ABI, object,
-block and buffer lifetimes, thread transitions, disconnect and teardown. Native linking also needs
-the existing written architecture justification and `deny.toml` exception, behind an experimental
-feature off by default. Do not unsafely mark native objects `Send`; the native owner needs a real
-run loop, while any portable worker must be joined.
+sources or local unsafe exception are approved. The safe Rust dependency is not a way to evade unsafe
+review: [#75](https://github.com/nredd/tethercam/issues/75) recorded the maintainer approval of
+ownership and maintenance, and the published `image-capture` crate carries its own unsafe-site inventory
+and native contract (AI-assisted independent source review, not a certification). That review covered
+the pinned bindings and headers, callback ABI, object, block and buffer lifetimes, thread transitions,
+disconnect and teardown, and any change to them (SDK, toolchain, dependency versions, unsafe sites) needs
+a renewed review before hardware use. `Cargo.toml` therefore pins the reviewed `0.1.0` with `=0.1.0`, and
+`deny.toml` bans every newer version, so a bump fails the gate until the review is renewed. It links only Apple system frameworks, vendors
+no C, and sits behind the off-by-default `macos-icc` feature (justification in `architecture.md`). Native
+objects are never marked `Send` here: the native owner has a real run loop, and the portable worker is joined.
 
 ## Evidence and validation
 
@@ -80,7 +170,7 @@ It did not test real deadlines, late callbacks, disconnect, LaunchAgent, or scre
 
 | Case | Required evidence before support |
 |---|---|
-| Discovery, open, handshake, live view, close and same-process reopen | Actual Rust boundary with helpers untouched, repeated sessions and explicit close results |
+| Discovery, open, handshake, live view, close and same-process reopen | Actual Rust boundary with helpers untouched, repeated sessions and explicit close results. The `icc_sample` run above would cover discovery, open, `GetDeviceInfo`, confirmed close and reopen only, once the hardware owner has run it: it has not been run. Handshake and live view are not yet run on hardware |
 | Deadline during open, command and close; late success/error | Deterministic callback scheduler plus real deadline/late-callback tests, ownership and quarantine verified |
 | Disconnect and reconnect at each lifecycle phase | Real device tests plus scheduler tests; no overlapping replacement or assumed cleanup |
 | Events, overflow and property refresh | Verify framing and event completeness; test bounded overflow and explicit resynchronization |

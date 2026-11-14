@@ -171,6 +171,10 @@ The next `0.0.2` release adds the off-by-default `test-support` feature with reu
 diagnostics, separate from normal camera runtime. The optional `repo-tools` feature builds
 `tethercam-tools` for native provisioning, protected client inputs, subprocess verification,
 offline profiling summaries and release-tag validation. Default install/run behavior is unchanged.
+The experimental `macos-icc` feature (off by default, macOS and Rust 1.99 only) adds an `ImageCaptureCore`
+PTP session so Apple's camera helpers can keep running. It depends on the pinned `image-capture` crate,
+adds no local `unsafe`, is not selected by any runtime yet and carries no production support claim. See
+[`docs/macos-camera.md`](docs/macos-camera.md) for its limits and validation status.
 See [`docs/verification.md`](docs/verification.md) for API, privilege, coverage, profiling and
 extracted-package verification contracts, and [`docs/usb.md`](docs/usb.md) for normal camera setup.
 
