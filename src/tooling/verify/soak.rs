@@ -626,9 +626,9 @@ mod tests {
         ] {
             assert!(run(&values(duration, segment, gap)).is_err());
         }
-        // Valid numbers reach the path checks, which fail on the missing config.
+        // Valid numbers reach the config load, which fails: no sampling, no report.
         assert!(run(&values("10", "1", "500")).is_err());
-        assert!(!out.exists() || fs::read_dir(&out).is_ok());
+        assert!(!out.join("report.json").exists());
         let non_utf8 = {
             use std::os::unix::ffi::OsStringExt;
             OsString::from_vec(vec![0xff])

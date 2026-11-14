@@ -128,6 +128,8 @@ fn status_sampling_reads_the_counters_of_a_running_simulator() {
     assert_eq!(report["battery"]["points_dropped"], 0, "{report}");
 }
 
+/// Needs a real `ffprobe`, which hosted runners do not all have: without one this returns early
+/// and the streaming counts are proven only by the fixture-backed tests.
 #[test]
 fn a_real_ffprobe_segment_counts_the_streamed_frames() {
     let Some(ffprobe) = [

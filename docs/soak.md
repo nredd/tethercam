@@ -10,8 +10,8 @@ device identity: counts, durations and the battery trajectory only.
 `tethercam-tools soak` samples a service that is already running. Each iteration:
 
 - reads `GET /tethercam/status` with `curl` (HTTP Digest, credentials from a protected file, never argv)
-- plays the primary RTSP stream (`/live/main`) for one segment with `ffprobe`, recording packet
-  arrival times
+- plays the primary RTSP stream (`/live/main`, so `streams.h264` must stay enabled) for one segment
+  with `ffprobe`, recording packet arrival times
 
 These are the same external clients and protected client inputs as `tethercam-tools verify`
 ([`verification.md`](verification.md)). It never starts, stops or configures the service and never

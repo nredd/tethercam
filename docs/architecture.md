@@ -258,7 +258,7 @@ Client-visible behavior:
 | ONVIF Device and Media services (every operation, including `GetProfiles`, `GetStreamUri`, `GetSnapshotUri`, `GetCapabilities`) | HTTP `503`, body `camera not ready`, before authentication | Normal |
 | ONVIF snapshot endpoint | `401` challenge, then `503` once authenticated | Newest live-view JPEG |
 | WS-Discovery | Socket bound at startup (a bad interface fails the run), but no `Hello`, no `ProbeMatch`: not announced | Announced; `Hello` goes out when the first frame arrives |
-| `GET /tethercam/status` on the ONVIF port | Digest-authenticated JSON, `{"camera":"waiting",` then the run counters | `{"camera":"ready","battery_percent":87,"power":"usb",` then the run counters (battery fields only when the camera reports them) |
+| `GET /tethercam/status` on the ONVIF port | Digest-authenticated JSON: `{"camera":"waiting"}` as before, with the run counters appended | `{"camera":"ready","battery_percent":87,"power":"usb"}` as before, with the run counters appended (battery fields only when the camera reports them) |
 
 Why `503` before authentication on the ONVIF services: Home Assistant's ONVIF integration retries
 transport errors and `503` with backoff but stops and prompts the user on authentication
