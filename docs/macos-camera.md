@@ -147,10 +147,11 @@ target/release/tethercam run --config ./camera.toml
   after the command's own error line if it failed) and exits with status 69 through the same `exit` path,
   nothing cancelled. 69 is distinct from 75 (restart me) and from 1 (the command failed): the output is
   complete and trustworthy, but this process's native runtime is spent, so run the command again in a
-  fresh process. 60 s is the longest single step any one-shot command waits on, `probe` and `doctor`'s
-  60 s whole-transaction deadline, and six of the 10 s `cameras` steps: a step that hit its deadline
-  leaves one retired command to complete and then the confirming close, each a native step of up to that
-  bound, so a merely slow camera settles inside it. It is well under the service's 300 s busy limit.
+  fresh process. 60 s is a heuristic, not a guarantee: the longest single step any one-shot command waits
+  on, `probe` and `doctor`'s 60 s whole-transaction deadline, and six of the 10 s `cameras` steps. A step
+  that hit its deadline leaves one retired command to complete and then the confirming close, so a merely
+  slow camera is expected to settle within a few such steps; one slower than that exits with 69 and can
+  be run again. It is well under the service's 300 s busy limit.
   The service (`run`) keeps its own policy and is not watched this way. Verified through an injected
   runtime whose cleanup never settles, and a subprocess exit; not validated on hardware
 - Sony protocol generation: a non-OK response to the 3.00 request falls back to 2.00 on the same session,

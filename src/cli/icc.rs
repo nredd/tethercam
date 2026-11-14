@@ -75,13 +75,15 @@ pub(super) const UNSETTLED_EXIT: u8 = 69;
 /// How long a finished one-shot command waits for native cleanup before it exits with
 /// [`UNSETTLED_EXIT`].
 ///
-/// Every step of `cameras` is bounded at 10 s, and `probe` and `doctor` at their 60 s whole
-/// transaction deadline. A step that hit its deadline leaves one retired command to complete and
-/// then the confirming close to run, each a native step of up to that same bound, so a camera that
-/// is merely slow settles within a bound of that size. 60 s is six of the `cameras` steps and the
-/// longest `probe` step, yet still a bounded, human-scale wait before a command that has already
-/// printed its answer gives up. It is well under the service's [`BUSY_LIMIT`]: nothing here waits
-/// on a 300 s download.
+/// A heuristic, not a guarantee. Every step of `cameras` is bounded at 10 s, and `probe` and
+/// `doctor` at their 60 s whole-transaction deadline. A step that hit its deadline leaves one
+/// retired command to complete and then the confirming close to run, so a merely slow camera is
+/// expected to settle within a few such steps. 60 s is six of the `cameras` steps and as long as
+/// the longest single `probe` step: long enough that a slow cleanup is not cut off for the 10 s
+/// steps, short enough that a command that has already printed its answer does not appear hung.
+/// A camera slow enough to need two full 60 s `probe` steps exits with [`UNSETTLED_EXIT`] and can
+/// simply be run again. It is well under the service's [`BUSY_LIMIT`]: nothing here waits on a
+/// 300 s download.
 pub(super) const SETTLE_LIMIT: Duration = Duration::from_secs(60);
 
 /// The settle bound for `command`: one-shot commands only, never the long-running service.
@@ -364,7 +366,7 @@ impl Drop for Finished {
 /// panicked mid-write leaves a usable sink.
 type SharedOut<W> = Arc<Mutex<W>>;
 
-fn sink<W>(out: &SharedOut<W>) -> std::sync::MutexGuard<'_, W> {
+fn lock_out<W>(out: &SharedOut<W>) -> std::sync::MutexGuard<'_, W> {
     out.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -387,7 +389,7 @@ fn watch<W: Write>(
         event = "icc_cleanup_unsettled",
         limit = ?limit
     );
-    let mut out = sink(out);
+    let mut out = lock_out(out);
     // Best effort: the process is about to end and there is nowhere left to report to.
     if let Some(failure) = failure {
         let _ = writeln!(out, "Error: {failure}");
@@ -426,7 +428,9 @@ fn launch_with<W: Write + Send + 'static>(
         cfg,
         dispatch,
         out,
-        (run, settle, terminate),
+        run,
+        settle,
+        terminate,
         spawn_watcher,
     )
 }
@@ -435,8 +439,8 @@ fn launch_with<W: Write + Send + 'static>(
 /// the command before the native runtime is touched: silently running unbounded would be the hang
 /// this exists to prevent.
 fn launch_spawning<W: Write + Send + 'static>(
-    options: &Options, cfg: &Config, dispatch: &Dispatch, out: W,
-    (run, settle, terminate): (Run, Option<Duration>, fn(u8)), spawn: Spawn,
+    options: &Options, cfg: &Config, dispatch: &Dispatch, out: W, run: Run,
+    settle: Option<Duration>, terminate: fn(u8), spawn: Spawn,
 ) -> Result<(), Error> {
     let plan = Plan {
         options: options.clone(),
@@ -467,7 +471,7 @@ fn launch_spawning<W: Write + Send + 'static>(
             progress: finished,
             failure: None,
         };
-        let mut out = sink(&out);
+        let mut out = lock_out(&out);
         let result = worker(handle, &plan, &mut *out);
         if let Err(error @ Error::Quarantined) = &result {
             // Best effort: the process is about to end and there is nowhere left to report to.

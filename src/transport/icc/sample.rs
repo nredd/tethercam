@@ -108,8 +108,8 @@ impl Receipt {
 pub enum Selector {
     /// Exactly this identifier, which discovery must return (a repeat of it is the same device).
     Exact(IccDeviceId),
-    /// Whatever camera discovery returns, but only if it returns exactly one distinct device. Lets the hardware
-    /// owner run without ever handling the identifier.
+    /// Whatever camera discovery returns, but only if it returns exactly one distinct device. Lets
+    /// the hardware owner run without ever handling the identifier.
     SoleCandidate,
 }
 

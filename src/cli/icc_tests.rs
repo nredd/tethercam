@@ -748,7 +748,7 @@ fn hung_without_camera(entry: Entry) -> Result<Result<(), Error>, IccError> {
     hung(|settle| Unsettled::new(Fake::new().0, settle), entry)
 }
 
-fn text(sink: &Sink) -> String {
+fn written(sink: &Sink) -> String {
     String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
 }
 
@@ -770,10 +770,10 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
     result.unwrap();
     assert_eq!(EXITED.load(Ordering::SeqCst), UNSETTLED_EXIT);
     assert_ne!(UNSETTLED_EXIT, QUARANTINE_EXIT);
-    let text = text(&sink);
+    let text = written(&sink);
     // The command's own result is written first, the counts-only notice after it.
-    let (result, notice) = text.split_once("Camera: PC Remote").unwrap();
-    assert!(result.is_empty(), "{text}");
+    let (before, notice) = text.split_once("Camera: PC Remote").unwrap();
+    assert!(before.is_empty(), "{text}");
     assert!(
         notice.contains("Native cleanup did not settle within 50ms; exiting with status 69."),
         "{text}"
@@ -804,7 +804,7 @@ fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit()
     // Reached only because the stand-in `terminate` returns; the real one never does.
     assert!(matches!(result, Err(Error::NoCamera)), "{result:?}");
     assert_eq!(EXITED.load(Ordering::SeqCst), UNSETTLED_EXIT);
-    let text = text(&sink);
+    let text = written(&sink);
     let error = text.find("Error: no selected camera").unwrap();
     assert!(
         text.find("Native cleanup did not settle").unwrap() > error,
@@ -820,16 +820,14 @@ fn a_watcher_that_cannot_start_fails_the_command_before_any_native_work() {
         &free_cfg(),
         &LogCapture::new().dispatch(),
         sink.clone(),
-        (
-            hung_with_camera,
-            Some(SETTLE_LIMIT),
-            record_unexpected_termination,
-        ),
+        hung_with_camera,
+        Some(SETTLE_LIMIT),
+        record_unexpected_termination,
         |_task| Err(io::Error::other("synthetic thread limit")),
     );
     assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
     // The application never ran, so nothing was printed or opened.
-    assert_eq!(text(&sink), "");
+    assert_eq!(written(&sink), "");
 }
 
 #[test]
