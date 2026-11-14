@@ -36,7 +36,7 @@ The composite action `.github/actions/assert-xcode-27` runs right after checkout
 are both 27, so a retargeted label cannot silently gate on another image. `tests/repository_policy.rs`
 requires it in every leg and rejects any other `macos*` matrix value or label.
 
-The image is a scarce preview pool, so only gates that add information on macOS get a leg.
+The image is a scarce hosted pool, so only gates that add information on macOS get a leg.
 
 | Gate | macOS 27 leg | Why |
 | --- | --- | --- |

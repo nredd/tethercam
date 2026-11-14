@@ -461,6 +461,13 @@ fn macos_gate_commands_remain_present() -> Result<(), Box<dyn Error>> {
     for (file, id, command) in macos {
         check_gate(&workflows, file, id, command, None)?;
     }
+    // VHCI and the USB/IP fixture are Linux-only: the macOS coverage leg must opt out.
+    let coverage = &workflows
+        .iter()
+        .find(|(name, _)| name == "coverage.yml")
+        .ok_or("missing coverage")?
+        .1["jobs"]["coverage-macos"];
+    assert_eq!(coverage["env"]["TETHERCAM_USBIP"], json!(0));
     Ok(())
 }
 
@@ -1208,7 +1215,7 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
         "add new macOS legs to this count and to the docs table"
     );
     // Each mutation breaks exactly one rule of `validate_macos_legs`.
-    let mutations: [(&str, &str, Mutation); 6] = [
+    let mutations: [(&str, &str, Mutation); 7] = [
         ("lint.yml", "clippy", |job| {
             job["runs-on"] = json!("macos-latest");
         }),
@@ -1230,6 +1237,9 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
         }),
         ("lint.yml", "clippy", |job| {
             job["steps"][1]["if"] = json!("always()");
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            job["steps"][1]["if"] = json!("runner.os == 'macOS'");
         }),
     ];
     for (file, id, mutate) in mutations {
