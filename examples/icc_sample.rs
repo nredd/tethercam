@@ -58,7 +58,6 @@ enum Error {
     Identifier,
     #[error("the native runtime failed: {0}")]
     Native(IccError),
-    #[cfg(target_os = "macos")]
     #[error("the async runtime could not start")]
     Runtime(#[source] io::Error),
     #[error("writing the receipt failed")]
@@ -139,11 +138,10 @@ impl Receipt {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn sample(selector: Selector, live: bool) -> Result<Receipt, Error> {
     use tethercam::transport::icc::{live_view_probe, read_only_sample, run};
 
-    // `run` blocks the main thread in the native run loop and hands this closure to a joined
+    // Off macOS `run` is a stub that reports the runtime unavailable. `run` blocks the main thread in the native run loop and hands this closure to a joined
     // worker, which builds its own async runtime.
     run(move |handle| -> io::Result<_> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -159,11 +157,6 @@ fn sample(selector: Selector, live: bool) -> Result<Receipt, Error> {
     })
     .map_err(Error::Native)?
     .map_err(Error::Runtime)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn sample(_selector: Selector, _live: bool) -> Result<Receipt, Error> {
-    Err(Error::Native(IccError::Runtime))
 }
 
 fn execute() -> Result<ExitCode, Error> {
@@ -275,9 +268,11 @@ mod tests {
         assert!(!error.to_string().contains("secret-identifier"));
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
-    fn other_platforms_refuse_to_run() {
+    fn a_test_thread_is_never_the_native_main_thread() {
+        // Off macOS `run` is a stub; on macOS the real one refuses off the main thread before it
+        // touches anything native. The guard keeps that true even if a harness ran this inline.
+        assert_ne!(std::thread::current().name(), Some("main"));
         assert!(matches!(
             sample(Selector::SoleCandidate, false),
             Err(Error::Native(IccError::Runtime))

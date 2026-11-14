@@ -467,20 +467,19 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
 fn launch_terminates_with_the_restart_status_after_a_quarantine() {
     let logs = LogCapture::new();
     let sink = Sink::default();
-    let boundary = SimBoundary::with_faults(
-        camera(),
-        SimFaults {
-            close: Some(IccError::CleanupFailure),
-            ..SimFaults::default()
-        },
-    );
     TERMINATED.store(0, Ordering::SeqCst);
     let result = launch_with(
         &options(Command::Probe),
         &free_cfg(),
         &logs.dispatch(),
         sink.clone(),
-        |entry| run_with(boundary, entry),
+        |entry| {
+            let faults = SimFaults {
+                close: Some(IccError::CleanupFailure),
+                ..SimFaults::default()
+            };
+            run_with(SimBoundary::with_faults(camera(), faults), entry)
+        },
         record_termination,
     );
     assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");

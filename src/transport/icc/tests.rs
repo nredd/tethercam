@@ -1686,9 +1686,9 @@ fn a_deadline_on_the_newer_request_is_not_a_refusal_and_never_reuses_the_retired
 }
 
 #[test]
-fn a_native_failure_when_the_fallback_cannot_close_the_session_is_the_error() {
-    // The newer request fails natively and then the confirming close does too: the close error
-    // is reported and nothing is reopened.
+fn a_native_failure_when_the_fallback_cannot_close_the_session_ends_quarantined() {
+    // The newer request fails natively and then the confirming close does too: the session is
+    // quarantined, so the reopen is refused with that category and nothing is retried.
     let faults = SimFaults {
         transact: Some((
             op::SDIO_GET_EXT_DEVICE_INFO,
@@ -1698,10 +1698,7 @@ fn a_native_failure_when_the_fallback_cannot_close_the_session_is_the_error() {
         close: Some(IccError::CleanupFailure),
     };
     let (result, _) = connect_over_icc(body_300(), faults);
-    assert_eq!(
-        result,
-        Err(SonyError::Session(icc(IccError::CleanupFailure)))
-    );
+    assert_eq!(result, Err(SonyError::Session(icc(IccError::Quarantined))));
 }
 
 // ---- live-view probe ---------------------------------------------------------------------

@@ -202,7 +202,7 @@ type StopSignal = io::Result<Pin<Box<dyn Future<Output = ()>>>>;
 /// The worker side: scoped logging, a runtime of its own, and OS signals registered in it.
 fn worker_with(
     handle: IccHandle, plan: &Plan, out: &mut dyn Write,
-    runtime: io::Result<tokio::runtime::Runtime>, stop: impl FnOnce() -> StopSignal,
+    runtime: io::Result<tokio::runtime::Runtime>, stop: fn() -> StopSignal,
 ) -> Result<(), Error> {
     tracing::dispatcher::with_default(&plan.dispatch, || {
         runtime?
@@ -229,7 +229,7 @@ type Entry = Box<dyn FnOnce(IccHandle) -> Result<(), Error> + Send>;
 /// native run loop cannot return.
 fn launch_with<W: Write + Send + 'static>(
     options: &Options, cfg: &Config, dispatch: &Dispatch, mut out: W,
-    run: impl FnOnce(Entry) -> Result<Result<(), Error>, IccError>, terminate: fn(u8),
+    run: fn(Entry) -> Result<Result<(), Error>, IccError>, terminate: fn(u8),
 ) -> Result<(), Error> {
     let plan = Plan {
         options: options.clone(),

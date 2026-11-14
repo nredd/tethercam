@@ -467,7 +467,9 @@ async fn negotiate_ext_info<T: PtpSession>(
     if !session.is_open() {
         // A no-op once the session is closed (a USB reset ended it); a session that faulted but
         // still holds a lease (`ImageCaptureCore`) is closed with confirmation before the reopen.
-        session.close().await?;
+        // A failed close is not reported here: it leaves the session retired or quarantined, and
+        // the reopen then fails with that state's own category.
+        let _ = session.close().await;
         session.open().await?;
         connect_phase(session, 1).await?;
         connect_phase(session, 2).await?;
