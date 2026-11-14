@@ -1195,6 +1195,9 @@ fn validate_macos_legs(workflows: &Workflows) -> Result<usize, String> {
     Ok(legs)
 }
 
+/// An in-place edit that must make `validate_macos_legs` fail.
+type Mutation = fn(&mut Value);
+
 #[test]
 fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Error>> {
     let workflows = workflows()?;
@@ -1204,23 +1207,43 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
         4,
         "add new macOS legs to this count and to the docs table"
     );
-    let mut drifted = workflows.clone();
-    drifted[0].1["jobs"] = json!({"x": {"runs-on": "macos-latest", "steps": []}});
-    assert!(validate_macos_legs(&drifted).is_err());
-    let mut versioned = workflows.clone();
-    for (_, workflow) in &mut versioned {
-        if let Some(os) = workflow["jobs"]["clippy"]["strategy"]["matrix"]["os"].as_array_mut() {
-            os[1] = json!("macos-27");
-        }
+    // Each mutation breaks exactly one rule of `validate_macos_legs`.
+    let mutations: [(&str, &str, Mutation); 6] = [
+        ("lint.yml", "clippy", |job| {
+            job["runs-on"] = json!("macos-latest");
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["strategy"]["matrix"]["os"][1] = json!("macos-27");
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["runs-on"] = json!("${{ matrix.os }}");
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            if let Some(steps) = job["steps"].as_array_mut() {
+                steps.remove(1);
+            }
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            if let Some(steps) = job["steps"].as_array_mut() {
+                steps.swap(1, 2);
+            }
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["steps"][1]["if"] = json!("always()");
+        }),
+    ];
+    for (file, id, mutate) in mutations {
+        let mut mutated = workflows.clone();
+        let (_, workflow) = mutated
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .ok_or("missing workflow")?;
+        mutate(&mut workflow["jobs"][id]);
+        assert!(
+            validate_macos_legs(&mutated).is_err(),
+            "accepted {file}/{id}"
+        );
     }
-    assert!(validate_macos_legs(&versioned).is_err());
-    let mut missing = workflows;
-    for (_, workflow) in &mut missing {
-        if let Some(steps) = workflow["jobs"]["coverage-macos"]["steps"].as_array_mut() {
-            steps.remove(1);
-        }
-    }
-    assert!(validate_macos_legs(&missing).is_err());
     Ok(())
 }
 
