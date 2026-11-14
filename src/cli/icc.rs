@@ -355,24 +355,26 @@ struct Finished {
 
 impl Drop for Finished {
     fn drop(&mut self) {
-        // A watcher that is gone (no bound for this command) has nothing to be told.
+        // The service has no watcher: nothing reads the send, which is then simply unobserved.
         drop(self.progress.send(Progress::Finished(self.failure.take())));
     }
 }
 
 /// The operator's output, shared between the worker and the settle watcher. A holder that
 /// panicked mid-write leaves a usable sink.
-type Shared<W> = Arc<Mutex<W>>;
+type SharedOut<W> = Arc<Mutex<W>>;
 
-fn sink<W>(out: &Shared<W>) -> std::sync::MutexGuard<'_, W> {
+fn sink<W>(out: &SharedOut<W>) -> std::sync::MutexGuard<'_, W> {
     out.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Once the application has ended, give native cleanup `limit` to settle. If it does not, the
 /// result is already written: report the error if there was one, add the counts-only notice and
-/// exit through `terminate`, because `run` may never return.
+/// exit through `terminate`, because `run` may never return. A command that settles exactly at
+/// the bound can still lose that race and exit with [`UNSETTLED_EXIT`]; the notice is true when
+/// it is printed, and the output is complete either way.
 fn watch<W: Write>(
-    out: &Shared<W>, progress: &mpsc::Receiver<Progress>, limit: Duration, terminate: fn(u8),
+    out: &SharedOut<W>, progress: &mpsc::Receiver<Progress>, limit: Duration, terminate: fn(u8),
 ) {
     let Ok(Progress::Finished(failure)) = progress.recv() else {
         // `run` ended before the application ever did: nothing is pending on its account.
@@ -383,7 +385,7 @@ fn watch<W: Write>(
     }
     tracing::error!(
         event = "icc_cleanup_unsettled",
-        limit_secs = limit.as_secs()
+        limit = ?limit
     );
     let mut out = sink(out);
     // Best effort: the process is about to end and there is nowhere left to report to.
@@ -441,7 +443,7 @@ fn launch_spawning<W: Write + Send + 'static>(
         cfg: cfg.clone(),
         dispatch: dispatch.clone(),
     };
-    let out: Shared<W> = Arc::new(Mutex::new(out));
+    let out: SharedOut<W> = Arc::new(Mutex::new(out));
     let (progress, observed) = mpsc::channel();
     let watcher = settle
         .map(|limit| {

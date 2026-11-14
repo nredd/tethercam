@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -725,7 +725,7 @@ static EXITED: AtomicU8 = AtomicU8::new(0);
 /// Records the status `terminate` was given, then lets the native side return so the test ends.
 fn exit_and_settle(code: u8) {
     EXITED.store(code, Ordering::SeqCst);
-    SETTLE.lock().unwrap().take();
+    SETTLE.lock().unwrap_or_else(PoisonError::into_inner).take();
 }
 
 /// `native::run` over `boundary` whose cleanup settles only once `terminate` is called.
@@ -733,7 +733,7 @@ fn hung<B: Boundary + Send>(
     boundary: impl FnOnce(Receiver<()>) -> B, entry: Entry,
 ) -> Result<Result<(), Error>, IccError> {
     let (release, settle) = mpsc::channel();
-    *SETTLE.lock().unwrap() = Some(release);
+    *SETTLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(release);
     run_with(boundary(settle), entry)
 }
 
@@ -754,7 +754,7 @@ fn text(sink: &Sink) -> String {
 
 #[test]
 fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_distinct_status() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap();
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let logs = LogCapture::new();
     let sink = Sink::default();
     EXITED.store(0, Ordering::SeqCst);
@@ -780,7 +780,8 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
     );
     assert!(!text.contains("synthetic"), "{text}");
     assert!(
-        logs.text().contains("icc_cleanup_unsettled"),
+        logs.text()
+            .contains(r#"event="icc_cleanup_unsettled" limit=50ms"#),
         "{}",
         logs.text()
     );
@@ -788,7 +789,7 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
 
 #[test]
 fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit() {
-    let _serial = ONE_AT_A_TIME.lock().unwrap();
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let sink = Sink::default();
     EXITED.store(0, Ordering::SeqCst);
     let result = launch_with(

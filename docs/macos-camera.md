@@ -246,7 +246,7 @@ Set camera_id in the configuration to one of these identifiers; --describe opens
   zero-width and joiner characters, the BOM, tag characters) and the line and paragraph separators
   (U+2028, U+2029), each shown as `?`, and cut to 64 characters. The format characters are an explicit
   list for Unicode 17.0 rather than a new dependency; one a later version adds is not covered until the
-  list is extended With `camera_id` set only the selected device is described
+  list is extended. With `camera_id` set only the selected device is described
   (the others show `not described (not selected by camera_id)` and are never opened), as the service
   ignores them; unset the key to describe them all
 - Bounded: at most 64 devices (the native limit, more is an error), and 10 s per step (open,
