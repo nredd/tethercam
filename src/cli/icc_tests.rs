@@ -134,6 +134,48 @@ fn discovery_outcomes_leave_the_handle_with_the_factory() {
 }
 
 #[test]
+fn an_error_or_a_reached_camera_also_ends_a_run_of_busy_answers() {
+    // Every step is 80% of the limit, so two busy answers of one run are not yet fatal but a
+    // third would be: each run below is broken by something other than busy, and never is.
+    let (fake, _) = scripted(|s| {
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Permission));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Ok(vec![device("synthetic-a")]));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Busy));
+    });
+    let flags = run_with(fake, |handle| {
+        paused_runtime().block_on(async {
+            let (mut factory, fatal) = IccFactory::new(handle);
+            let step = BUSY_LIMIT * 4 / 5;
+            let mut flags = Vec::new();
+            // Busy, a refusal, busy: the refusal ended the first run.
+            for _ in 0..3 {
+                let _ = attempt(&mut factory).await;
+                tokio::time::advance(step).await;
+                flags.push(*fatal.borrow());
+            }
+            // Busy, then a camera reached and released: that ended the run too.
+            let _ = attempt(&mut factory).await;
+            tokio::time::advance(step).await;
+            let camera = factory.connect().await.unwrap().unwrap();
+            factory.release(camera);
+            tokio::time::advance(step).await;
+            for _ in 0..2 {
+                let _ = attempt(&mut factory).await;
+                tokio::time::advance(step).await;
+                flags.push(*fatal.borrow());
+            }
+            flags
+        })
+    })
+    .unwrap();
+    assert_eq!(flags, [false; 5]);
+}
+
+#[test]
 fn a_quarantine_is_terminal_and_refuses_every_later_discovery() {
     let logs = LogCapture::new();
     let (fake, shared) = scripted(|s| s.discover.push_back(Err(IccError::Removed)));
