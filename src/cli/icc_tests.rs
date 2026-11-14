@@ -134,6 +134,48 @@ fn discovery_outcomes_leave_the_handle_with_the_factory() {
 }
 
 #[test]
+fn an_error_or_a_reached_camera_also_ends_a_run_of_busy_answers() {
+    // Every step is 80% of the limit, so two busy answers of one run are not yet fatal but a
+    // third would be: each run below is broken by something other than busy, and never is.
+    let (fake, _) = scripted(|s| {
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Permission));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Ok(vec![device("synthetic-a")]));
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Busy));
+    });
+    let flags = run_with(fake, |handle| {
+        paused_runtime().block_on(async {
+            let (mut factory, fatal) = IccFactory::new(handle);
+            let step = BUSY_LIMIT * 4 / 5;
+            let mut flags = Vec::new();
+            // Busy, a refusal, busy: the refusal ended the first run.
+            for _ in 0..3 {
+                let _ = attempt(&mut factory).await;
+                tokio::time::advance(step).await;
+                flags.push(*fatal.borrow());
+            }
+            // Busy, then a camera reached and released: that ended the run too.
+            let _ = attempt(&mut factory).await;
+            tokio::time::advance(step).await;
+            let camera = factory.connect().await.unwrap().unwrap();
+            factory.release(camera);
+            tokio::time::advance(step).await;
+            for _ in 0..2 {
+                let _ = attempt(&mut factory).await;
+                tokio::time::advance(step).await;
+                flags.push(*fatal.borrow());
+            }
+            flags
+        })
+    })
+    .unwrap();
+    assert_eq!(flags, [false; 5]);
+}
+
+#[test]
 fn a_quarantine_is_terminal_and_refuses_every_later_discovery() {
     let logs = LogCapture::new();
     let (fake, shared) = scripted(|s| s.discover.push_back(Err(IccError::Removed)));
@@ -161,6 +203,98 @@ fn a_quarantine_is_terminal_and_refuses_every_later_discovery() {
     // Only the first attempt reached the native boundary.
     assert_eq!(script(&shared).calls, [Call::Discover]);
     assert!(logs.text().contains("icc_runtime_quarantined"));
+}
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn a_run_of_busy_answers_past_the_limit_is_fatal_through_the_quarantine_flag() {
+    let logs = LogCapture::new();
+    let (fake, shared) = scripted(|s| s.discover.extend((0..8).map(|_| Err(IccError::Busy))));
+    let dispatch = logs.dispatch();
+    let out = run_with(fake, |handle| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            paused_runtime().block_on(async {
+                let (mut factory, fatal) = IccFactory::new(handle);
+                // Busy at the start of the run, then up to one tick short of the limit.
+                let first = attempt(&mut factory).await;
+                tokio::time::advance(BUSY_LIMIT.saturating_sub(Duration::from_secs(1))).await;
+                let short = attempt(&mut factory).await;
+                let before = *fatal.borrow();
+                tokio::time::advance(Duration::from_secs(1)).await;
+                let limit = attempt(&mut factory).await;
+                let after = *fatal.borrow();
+                // Fatal is terminal: nothing more reaches the boundary.
+                let refused = attempt(&mut factory).await;
+                (first, short, before, limit, after, refused)
+            })
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        out,
+        (
+            Err(OpenError::Busy),
+            Err(OpenError::Busy),
+            false,
+            Err(OpenError::Busy),
+            true,
+            Err(OpenError::Disconnected)
+        )
+    );
+    assert_eq!(
+        script(&shared).calls,
+        [Call::Discover, Call::Discover, Call::Discover]
+    );
+    let text = logs.text();
+    assert!(
+        text.contains(r#"event="icc_busy_limit_exceeded" limit_secs=300"#),
+        "{text}"
+    );
+    assert!(text.contains("icc_runtime_quarantined"), "{text}");
+}
+
+#[test]
+fn the_busy_limit_outlasts_every_wait_the_process_asks_of_the_native_side() {
+    // A retired command may still be completing: the longest wait gets as long again.
+    let sony = crate::sony::SonyConfig::default();
+    let session = SessionConfig::default();
+    assert!(BUSY_LIMIT >= sony.download_timeout);
+    assert!(BUSY_LIMIT >= session.transaction_timeout);
+    assert!(BUSY_LIMIT >= IccTimeout::default().wait());
+}
+
+#[test]
+fn any_other_outcome_ends_a_run_of_busy_answers() {
+    let (fake, _) = scripted(|s| {
+        s.discover.push_back(Err(IccError::Busy));
+        s.discover.push_back(Err(IccError::Busy));
+        // Settled: the run ends, so the busy answers after it start a new one.
+        s.discover.push_back(Ok(Vec::new()));
+        s.discover.extend((0..3).map(|_| Err(IccError::Busy)));
+    });
+    let flags = run_with(fake, |handle| {
+        paused_runtime().block_on(async {
+            let (mut factory, fatal) = IccFactory::new(handle);
+            let mut flags = Vec::new();
+            for _ in 0..6 {
+                let _ = attempt(&mut factory).await;
+                // Each step is 80% of the limit. Without the reset the fourth answer would
+                // already be far past the limit in one run; with it only the sixth is past the limit.
+                tokio::time::advance(BUSY_LIMIT * 4 / 5).await;
+                flags.push(*fatal.borrow());
+            }
+            flags
+        })
+    })
+    .unwrap();
+    assert_eq!(flags, [false, false, false, false, false, true]);
 }
 
 #[test]
@@ -344,6 +478,42 @@ fn run_until_quarantined(faults: SimFaults) -> Result<(), Error> {
 }
 
 #[test]
+fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_busy_limit() {
+    // The retired command's completion never arrives, so every discovery is answered busy. The
+    // supervisor's backoff keeps retrying until the bound turns it into the orderly exit.
+    let logs = LogCapture::new();
+    let (fake, shared) = scripted(|s| s.discover.extend((0..1000).map(|_| Err(IccError::Busy))));
+    let dispatch = logs.dispatch();
+    let cfg = free_cfg();
+    let mut out = Vec::new();
+    let result = run_with(fake, |handle| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            paused_runtime().block_on(drive_until(
+                handle,
+                &cfg,
+                &options(Command::Run),
+                &mut out,
+                Box::pin(std::future::pending()),
+            ))
+        })
+    })
+    .unwrap();
+    assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
+    // 100 ms doubling to the 5 s cap reaches 300 s on about the 66th attempt.
+    let attempts = script(&shared).calls.len();
+    assert!((60..=70).contains(&attempts), "{attempts}");
+    assert!(logs.text().contains("icc_busy_limit_exceeded"));
+}
+
+#[test]
+fn the_backend_slows_reconnects_after_a_refused_handshake() {
+    let (fake, _) = Fake::new();
+    let delay = run_with(fake, |handle| IccFactory::new(handle).0.refusal_delay()).unwrap();
+    assert_eq!(delay, Some(REFUSAL_DELAY));
+    assert!(REFUSAL_DELAY > Duration::from_secs(5));
+}
+
+#[test]
 fn a_removal_mid_connect_shuts_the_application_down_as_quarantined() {
     let result = run_until_quarantined(SimFaults {
         transact: Some((op::GET_OBJECT, None, IccError::Removed)),
@@ -507,6 +677,33 @@ fn launch_reports_an_unavailable_runtime_without_running_anything() {
 }
 
 #[test]
+fn launch_does_not_blame_the_platform_when_the_worker_failed_after_it_ran() {
+    let sink = Sink::default();
+    let result = launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        sink.clone(),
+        |entry| {
+            run_with(SimBoundary::new(camera()), |handle| {
+                // The application ran to completion, then the worker thread failed.
+                let _ = entry(handle);
+                std::panic::resume_unwind(Box::new("synthetic worker failure"))
+            })
+        },
+        record_unexpected_termination,
+    );
+    let error = result.unwrap_err();
+    assert!(matches!(error, Error::IccFailed), "{error:?}");
+    assert!(!error.to_string().contains("unavailable"), "{error}");
+    assert!(
+        String::from_utf8(sink.0.lock().unwrap().clone())
+            .unwrap()
+            .starts_with("Camera: PC Remote")
+    );
+}
+
+#[test]
 fn the_real_entry_point_refuses_before_any_camera_access_off_the_main_thread() {
     // Off macOS the native entry point is a stub. On macOS the real one checks for the main thread
     // before it touches anything native, so a test thread (never `main`) cannot start it.
@@ -542,7 +739,7 @@ fn terminate_exits_the_process_with_the_given_status() {
 
 #[test]
 fn backend_errors_are_static_and_name_no_device() {
-    for error in [Error::IccUnavailable, Error::Quarantined] {
+    for error in [Error::IccUnavailable, Error::IccFailed, Error::Quarantined] {
         let text = error.to_string();
         assert!(text.contains("icc") || text.contains("native"), "{text}");
     }

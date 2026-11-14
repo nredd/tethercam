@@ -81,13 +81,16 @@ pub enum Error {
     /// No selected network interface can advertise this listener.
     #[error("no usable network interface for discovery")]
     Interface,
-    /// `camera_backend = "icc"` cannot run here: unsupported platform or build, the one native
-    /// runtime could not start, or it failed as a whole. Before the application ran, nothing was
-    /// started or opened.
+    /// `camera_backend = "icc"` cannot run here: unsupported platform or build, or the one native
+    /// runtime could not start. The application never ran, so nothing was started or opened.
     #[error(
         "camera_backend `icc` is unavailable: it needs macOS, a build with the `macos-icc` feature and a free native runtime"
     )]
     IccUnavailable,
+    /// The native runtime failed after the application started, e.g. its worker panicked. This
+    /// is not a platform or build problem: something ran and may have touched the camera.
+    #[error("camera_backend `icc` failed after it started; check the log and restart the process")]
+    IccFailed,
     /// The one native runtime is quarantined for the life of the process.
     #[error("native camera runtime quarantined; it cannot be reused, restart the process")]
     Quarantined,
