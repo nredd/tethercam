@@ -48,6 +48,10 @@ pub use event::{Notice, classify};
 #[cfg(target_os = "macos")]
 pub use native::run;
 
+pub use probe::{LiveReceipt, ProbeError, live_view_probe};
+pub use sample::{DISCOVERY_WINDOW, Receipt, SampleError, Selector, read_only_sample};
+pub use session::IccSession;
+
 /// The main-thread native entry point exists only on macOS. Elsewhere there is no native runtime
 /// to start: this reports [`IccError::Runtime`] without running `user` or touching anything.
 ///
@@ -62,6 +66,3 @@ where
 {
     Err(IccError::Runtime)
 }
-pub use probe::{LiveReceipt, ProbeError, live_view_probe};
-pub use sample::{DISCOVERY_WINDOW, Receipt, SampleError, Selector, read_only_sample};
-pub use session::IccSession;

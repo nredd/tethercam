@@ -72,7 +72,7 @@ ICC owns the USB pipes, so it is a session, not a `Transport`: it cannot emulate
 it never forwards raw `OpenSession`/`CloseSession`. Caller deadlines do not cancel native work: one
 retained native operation completes before close, and confirmed closure is required before reuse.
 Quarantine bounds admission, but joined shutdown may remain unresolved indefinitely. The Sony layer is
-unchanged and shared. `camera_backend = "icc"` selects it ([#77](https://github.com/nredd/tethercam/issues/77)): the
+shared, with one feature-gated refusal rule for ICC native failures (below). `camera_backend = "icc"` selects it ([#77](https://github.com/nredd/tethercam/issues/77)): the
 main thread runs `transport::icc::run` and the whole async application runs as its joined worker, with
 `cli::icc::IccFactory` as the `CameraFactory`. A quarantine is terminal for the process, which exits non-zero
 for the service manager to restart; the default stays raw USB and there is never an automatic fallback.
