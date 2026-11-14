@@ -7,6 +7,8 @@
 //! a run that dies still leaves its last complete report. `SIGINT` and `SIGTERM` end the run
 //! cleanly: the child is reaped, the report finished and the credential-bearing inputs removed.
 //!
+//! Unix only, like the rest of the tooling that signals or reaps children.
+//!
 //! References:
 //! - <https://curl.se/docs/manpage.html>
 //! - <https://ffmpeg.org/ffprobe.html>
@@ -197,10 +199,12 @@ impl Report {
             .as_ref()
             .is_some_and(|previous| previous.run_id != sample.run_id);
         self.process_restarts += u64::from(restarted);
+        // The first reading is the baseline: the report counts what happened during the soak,
+        // not what the service had counted before it started.
         let before = self
             .previous
             .as_ref()
-            .map_or([0; 8], |previous| previous.counters);
+            .map_or(sample.counters, |previous| previous.counters);
         for ((total, now), before) in self.totals.iter_mut().zip(sample.counters).zip(before) {
             *total += if restarted {
                 now
@@ -414,7 +418,10 @@ fn watch_signals(
             let _ = ready.send(Err(error));
         }
     });
-    installed.recv().unwrap_or(Ok(()))
+    installed
+        .recv()
+        .map_err(|_| io::Error::other("signal listener thread ended"))
+        .and_then(|result| result)
 }
 
 /// Where one iteration runs and keeps its scratch files.
@@ -733,6 +740,7 @@ mod tests {
     fn counter_totals_survive_a_restart_but_not_a_clock_step() {
         let mut report = Report::default();
         let at = Duration::from_secs;
+        // The first reading is only the baseline.
         report.status(at(0), sample("a1", 10, 100));
         report.status(at(60), sample("a1", 70, 160));
         // A new run identifier is a restart, whatever the counters and the uptime say.
@@ -743,7 +751,7 @@ mod tests {
         // A restart whose counters and uptime are higher than before is still seen.
         report.status(at(240), sample("c3", 9_000, 50_000));
         assert_eq!(report.process_restarts, 2);
-        assert_eq!(report.totals[0], 100 + 60 + 7 + 50_000);
+        assert_eq!(report.totals[0], 60 + 7 + 50_000);
         assert_eq!(report.samples, 5);
         assert_eq!(report.ready_samples, 5);
         report.status_failed();
@@ -924,8 +932,9 @@ mod tests {
         assert!(json["status"]["samples"].as_u64().expect("samples") >= 2);
         assert_eq!(json["status"]["failures"], 0);
         assert_eq!(json["status"]["process_restarts_seen"], 0);
-        assert_eq!(json["status"]["totals"]["frames_fetched"], 10);
-        assert_eq!(json["status"]["totals"]["connect_misses"], 2);
+        // The fixture reports the same counts every time: a baseline and no change.
+        assert_eq!(json["status"]["totals"]["frames_fetched"], 0);
+        assert_eq!(json["status"]["totals"]["connect_misses"], 0);
         assert_eq!(
             json["battery"]["points"].as_array().expect("points").len(),
             1
@@ -1248,6 +1257,29 @@ mod tests {
             stop(false),
         );
         assert!(no_runtime.is_err());
+        // A listener thread that dies before reporting is an error, not a silent success.
+        let dies = watch_signals(
+            || panic!("synthetic runtime failure"),
+            SignalKind::user_defined1(),
+            SignalKind::user_defined2(),
+            stop(false),
+        );
+        assert!(dies.is_err());
+        // The first slot of the pair works as well.
+        let other = stop(false);
+        watch_signals(
+            current_thread_runtime,
+            SignalKind::user_defined1(),
+            SignalKind::window_change(),
+            Arc::clone(&other),
+        )
+        .expect("installed");
+        send("-WINCH");
+        let seen = (0..500).find(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            other.load(Ordering::Relaxed)
+        });
+        assert!(seen.is_some());
     }
 
     #[test]

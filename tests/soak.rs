@@ -137,8 +137,8 @@ fn status_sampling_reads_the_counters_of_a_running_simulator() {
         "{report}"
     );
     assert_eq!(status["process_restarts_seen"], 0, "{report}");
-    // Nobody streams, so the simulator's one first frame is all that was fetched.
-    assert_eq!(status["totals"]["frames_fetched"], 1, "{report}");
+    // Nobody streams, so nothing was fetched after the baseline reading.
+    assert_eq!(status["totals"]["frames_fetched"], 0, "{report}");
     assert_eq!(status["totals"]["session_restarts"], 0, "{report}");
     assert_eq!(report["battery"]["points_dropped"], 0, "{report}");
 }

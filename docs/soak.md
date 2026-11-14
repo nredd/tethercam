@@ -59,7 +59,13 @@ silence longer than the threshold (`GAP_MS`) in any of three places:
   appears here as a long tail gap. Measured with ffmpeg 9.0.2 against a simulator stopped with
   `SIGSTOP`: a 30 s tail gap, no `segments_failed`
 - from the start of `ffprobe` to the first packet, only beyond a fixed 5 s startup allowance
-  (a healthy start measured about 0.15 s)
+  (a healthy start measured about 0.15 s). A connect that takes 5 to 15 s (the `-timeout` of the
+  client) is reported as a gap, not as a normal start
+
+The tail includes `ffprobe`'s teardown (about 0.13 s measured) and the head its connect, so choose
+`GAP_MS` of at least two frame intervals plus half a second; 500 is a floor for 15 fps, not a
+default to lower. Packet times and the end of `ffprobe` are both wall-clock, so a clock step on the
+host during a segment can produce one false gap.
 
 `max_gap_ms` is the longest of those that counted. A segment whose `ffprobe` exits non-zero keeps its
 packets and gaps and also counts in `segments_failed`; one with no packets at all counts only there.
@@ -108,7 +114,8 @@ cases through fixtures, and the status leg through the real simulator with real 
 }
 ```
 
-- `status.totals` are summed across process restarts. A restart is a reading whose `run_id` (a random
+- `status.totals` are what the counters did during the soak: the first reading is the baseline, so
+  history from before the soak is not included. They are summed across process restarts. A restart is a reading whose `run_id` (a random
   per-process identifier in the status document) differs from the previous one
   (`process_restarts_seen`); the new process's counts are added rather than subtracted. The uptime
   and the wall clock play no part, so a clock step on the host is not mistaken for a restart
