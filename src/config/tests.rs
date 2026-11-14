@@ -332,6 +332,10 @@ fn camera_id_is_icc_only_and_validated_without_echoing_it() {
         "SYNTHETIC-ID-0001 ".into(),
         "SYNTHETIC\0ID".into(),
         "SYNTHETIC\nID".into(),
+        // Format and separator characters hide or forge text in a terminal.
+        "SYNTHETIC\u{202E}ID".into(),
+        "SYNTHETIC\u{200B}ID".into(),
+        "SYNTHETIC\u{2028}ID".into(),
         "S".repeat(1025),
     ] {
         config.camera_id = Some(Secret::new(bad.clone()));

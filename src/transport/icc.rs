@@ -49,6 +49,7 @@ pub use event::{Notice, classify};
 pub use native::run;
 
 pub use probe::{LiveReceipt, ProbeError, live_view_probe};
+pub(crate) use sample::distinct;
 pub use sample::{DISCOVERY_WINDOW, Receipt, SampleError, Selector, read_only_sample};
 pub use session::IccSession;
 

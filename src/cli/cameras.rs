@@ -13,7 +13,9 @@
 //! that refuses or fails is reported as "not a supported camera" with a category and the listing
 //! goes on. The work is bounded: at most [`MAX_DEVICES`] devices, [`DESCRIBE_WAIT`] per step.
 //! After a failure that leaves native cleanup unsettled the remaining devices are listed but not
-//! described, because a replacement session would only be refused as busy. With `camera_id` set
+//! described, because a replacement session would only be refused as busy. One device listed more
+//! than once is one line flagged with a count, and an identifier that `camera_id` validation
+//! refuses is printed as a fixed marker, never raw, and never opened. With `camera_id` set
 //! only that device is described: the others are ignored here as they are by the service. A quarantine is the
 //! same terminal condition as everywhere: the process reports it and exits for a restart.
 //!
@@ -28,11 +30,11 @@ use std::time::{Duration, Instant};
 
 use super::Error;
 use super::icc::open_error;
-use crate::config::Config;
+use crate::config::{Config, is_unprintable, valid_camera_id};
 use crate::ptp::DeviceInfo;
 use crate::ptp::session::{PtpSession, SessionConfig, SessionError};
 use crate::transport::icc::{
-    DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession, IccTimeout,
+    DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession, IccTimeout, distinct,
 };
 
 #[cfg(test)]
@@ -77,13 +79,14 @@ fn category(error: &SessionError) -> &'static str {
     }
 }
 
-/// Make or model text from a device, safe to print: control characters (terminal escapes) become
-/// `?`, padding goes and the length is bounded.
+/// Make or model text from a device, safe to print: control characters (terminal escapes), format
+/// characters (bidirectional overrides, zero-width) and line and paragraph separators become `?`
+/// (see [`is_unprintable`]), padding goes and the length is bounded.
 fn clean(text: &str) -> String {
     let text: String = text
         .chars()
         .take(MAX_LABEL)
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_unprintable(c) { '?' } else { c })
         .collect();
     text.trim().to_owned()
 }
@@ -144,12 +147,28 @@ async fn stopped(stop: &mut Pin<Box<dyn Future<Output = ()> + '_>>) -> bool {
     std::future::poll_fn(|cx| std::task::Poll::Ready(stop.as_mut().poll(cx).is_ready())).await
 }
 
-/// One output line per device: `index  identifier[  description][  (selected by camera_id)]`.
+/// What a line shows for an identifier: the identifier itself, or a fixed marker when it would
+/// fail `camera_id` validation. Such a value (control characters, padding, a bidirectional
+/// override) can neither be pasted into `camera_id` nor be printed safely: a newline or an escape
+/// in it could forge list lines or rewrite the terminal.
+fn shown(device: &IccDeviceId) -> &str {
+    if valid_camera_id(device.as_str()) {
+        device.as_str()
+    } else {
+        "(identifier not selectable)"
+    }
+}
+
+/// One output line per distinct device:
+/// `index  identifier[  (reported N times)][  description][  (selected by camera_id)]`.
 fn write_line(
-    out: &mut dyn Write, index: usize, device: &IccDeviceId, description: Option<&str>,
-    selected: bool,
+    out: &mut dyn Write, index: usize, device: &IccDeviceId, reported: usize,
+    description: Option<&str>, selected: bool,
 ) -> Result<(), Error> {
-    write!(out, "{index}  {}", device.as_str())?;
+    write!(out, "{index}  {}", shown(device))?;
+    if reported > 1 {
+        write!(out, "  (reported {reported} times)")?;
+    }
     if let Some(description) = description {
         write!(out, "  {description}")?;
     }
@@ -180,17 +199,24 @@ pub(super) async fn list(
         Err(error) if error.effect() == Effect::Quarantine => return Err(Error::Quarantined),
         Err(error) => return Err(Error::Open(open_error(error))),
     };
-    writeln!(out, "Cameras found: {}", found.len())?;
+    // One device the framework lists twice is one line, flagged with the count.
+    let devices = distinct(&found);
+    writeln!(out, "Cameras found: {}", devices.len())?;
     let mut pause: Option<&'static str> = None;
     let mut matched = false;
     let mut quarantined = false;
-    for (position, device) in found.iter().enumerate() {
+    let mut selectable = false;
+    for (position, (device, reported)) in devices.into_iter().enumerate() {
+        let usable = valid_camera_id(device.as_str());
+        selectable |= usable;
         if pause.is_none() && describe && stopped(&mut stop).await {
             pause = Some("stopped");
         }
         let selected = wanted.is_some_and(|wanted| wanted == device.as_str());
         matched |= selected;
         let description = match pause {
+            // Never opened: it cannot be selected, so there is nothing to tell apart.
+            _ if !usable => None,
             // Only ever set while describing.
             Some(reason) => Some(format!("not described ({reason})")),
             // With a key set the other devices are ignored, here as in the service.
@@ -219,6 +245,7 @@ pub(super) async fn list(
             out,
             position.saturating_add(1),
             device,
+            reported,
             description.as_deref(),
             selected,
         )?;
@@ -228,7 +255,7 @@ pub(super) async fn list(
             out,
             "camera_id is set but matches none of these; the service waits for it and never falls back."
         )?,
-        (None, _) if !found.is_empty() => writeln!(
+        (None, _) if selectable => writeln!(
             out,
             "Set camera_id in the configuration to one of these identifiers{}.",
             if describe {

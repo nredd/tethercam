@@ -175,13 +175,51 @@ pub struct Config {
 /// pins them together).
 pub(crate) const MAX_CAMERA_ID_BYTES: usize = 1024;
 
+/// A character that must never reach a terminal or a log line from outside input: a control
+/// character (escape sequences, newlines, NUL), a Unicode format character (`Cf`: bidirectional
+/// overrides and isolates, zero-width and joiner characters, the BOM, tag characters) or a line or
+/// paragraph separator (`Zl`, `Zp`).
+///
+/// `char::is_control` is the only category the standard library exposes, so the `Cf`, `Zl` and
+/// `Zp` ranges are listed explicitly instead of through a new dependency. They are the complete
+/// set for Unicode 17.0; a character a later Unicode version adds to those categories is not
+/// covered until this list is extended.
+pub(crate) fn is_unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{AD}'
+                | '\u{600}'..='\u{605}'
+                | '\u{61C}'
+                | '\u{6DD}'
+                | '\u{70F}'
+                | '\u{890}'..='\u{891}'
+                | '\u{8E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
 /// An exact identifier: nonempty, bounded, no padding (a copy-paste slip would otherwise wait
-/// forever for a camera that cannot match) and no control characters, NUL included.
-fn valid_camera_id(id: &str) -> bool {
+/// forever for a camera that cannot match) and nothing [`is_unprintable`], NUL included. What
+/// `tethercam cameras` prints and what it refuses to print are the same rule.
+pub(crate) fn valid_camera_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_CAMERA_ID_BYTES
         && id == id.trim()
-        && !id.chars().any(char::is_control)
+        && !id.chars().any(is_unprintable)
 }
 
 fn random_hex(
@@ -315,7 +353,7 @@ impl Config {
             check(
                 valid_camera_id(id.expose()),
                 "camera_id",
-                &"empty, padded, over 1024 bytes or containing control characters",
+                &"empty, padded, over 1024 bytes or containing control, format or separator characters",
             )?;
             check(
                 self.camera_backend == CameraBackend::Icc,

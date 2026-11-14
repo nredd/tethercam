@@ -427,6 +427,15 @@ fn device_text_is_cleaned_before_it_reaches_the_terminal() {
     assert_eq!(clean("  Model \u{1b}[31mX\u{7}  "), "Model ?[31mX?");
     assert_eq!(clean(&"y".repeat(500)).len(), MAX_LABEL);
     assert_eq!(clean("\t"), "?");
+    // Format characters (bidi override, zero width, BOM, tags) and the line and paragraph
+    // separators hide or forge text just as an escape does.
+    assert_eq!(
+        clean("A\u{202E}B\u{200B}C\u{2028}D\u{2029}E\u{FEFF}F\u{E0041}G\u{AD}H"),
+        "A?B?C?D?E?F?G?H"
+    );
+    assert_eq!(clean("\u{200B}"), "?");
+    // Ordinary non-ASCII text and an interior space survive.
+    assert_eq!(clean("Cam\u{e9}ra \u{3042}"), "Cam\u{e9}ra \u{3042}");
     assert_eq!(
         label(&info_bytes("Maker", "")),
         Description::Camera("Maker".into())
@@ -571,8 +580,13 @@ impl Write for FailAt {
 
 #[test]
 fn every_output_failure_is_reported_as_io() {
-    // Header, each line part, the marker, the flush and both footers.
-    for (selection, attached) in [(None, &[A][..]), (Some(A), &[A][..]), (Some(B), &[A][..])] {
+    // Header, each line part, the duplicate flag, the marker, the flush and both footers.
+    for (selection, attached) in [
+        (None, &[A][..]),
+        (None, &[A, A][..]),
+        (Some(A), &[A][..]),
+        (Some(B), &[A][..]),
+    ] {
         let mut failures = 0;
         for fail_at in 1..=40 {
             let (fake, _) = scripted(attached, |s| s.transact.push_back(info("Maker", "Model")));
@@ -588,4 +602,187 @@ fn every_output_failure_is_reported_as_io() {
         }
         assert!(failures >= 6, "{failures}");
     }
+}
+
+#[test]
+fn every_range_of_hidden_characters_is_replaced_at_both_ends() {
+    // Both ends of every Cf range (and the Zl and Zp pair) of Unicode 17, known independently of
+    // the table in `config`, plus the neighbours that are ordinary text and must survive.
+    for hidden in [
+        '\u{AD}',
+        '\u{600}',
+        '\u{605}',
+        '\u{61C}',
+        '\u{6DD}',
+        '\u{70F}',
+        '\u{890}',
+        '\u{891}',
+        '\u{8E2}',
+        '\u{180E}',
+        '\u{200B}',
+        '\u{200F}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{202A}',
+        '\u{202E}',
+        '\u{2060}',
+        '\u{2064}',
+        '\u{2066}',
+        '\u{206F}',
+        '\u{FEFF}',
+        '\u{FFF9}',
+        '\u{FFFB}',
+        '\u{110BD}',
+        '\u{110CD}',
+        '\u{13430}',
+        '\u{1343F}',
+        '\u{1BCA0}',
+        '\u{1BCA3}',
+        '\u{1D173}',
+        '\u{1D17A}',
+        '\u{E0001}',
+        '\u{E0020}',
+        '\u{E007F}',
+    ] {
+        assert_eq!(
+            clean(&format!("a{hidden}b")),
+            "a?b",
+            "{:x}",
+            u32::from(hidden)
+        );
+    }
+    for plain in [
+        '\u{AC}', '\u{AE}', '\u{606}', '\u{2027}', '\u{202F}', '\u{2065}', '\u{FEFE}',
+    ] {
+        let text = format!("a{plain}b");
+        assert_eq!(clean(&text), text, "{:x}", u32::from(plain));
+    }
+}
+
+/// Characters a hostile device would reach for, known independently of the implementation.
+const HOSTILE: [char; 12] = [
+    '\u{1b}',
+    '\n',
+    '\r',
+    '\u{7}',
+    '\u{85}',
+    '\u{202E}',
+    '\u{2066}',
+    '\u{200B}',
+    '\u{FEFF}',
+    '\u{2028}',
+    '\u{2029}',
+    '\u{E0020}',
+];
+
+proptest::proptest! {
+    #[test]
+    fn cleaned_text_never_holds_a_control_format_or_separator_character(
+        text in proptest::collection::vec(
+            proptest::prop_oneof![
+                proptest::prelude::any::<char>(),
+                proptest::sample::select(HOSTILE.to_vec()),
+            ],
+            0..200,
+        ),
+    ) {
+        let text: String = text.into_iter().collect();
+        let cleaned = clean(&text);
+        proptest::prop_assert!(cleaned.chars().count() <= MAX_LABEL);
+        proptest::prop_assert!(cleaned.len() <= MAX_LABEL * 4);
+        proptest::prop_assert!(!cleaned.chars().any(char::is_control), "{cleaned:?}");
+        proptest::prop_assert!(!cleaned.chars().any(|c| HOSTILE.contains(&c)), "{cleaned:?}");
+        proptest::prop_assert!(!cleaned.chars().any(crate::config::is_unprintable), "{cleaned:?}");
+        proptest::prop_assert_eq!(cleaned.trim(), cleaned.as_str());
+    }
+}
+
+#[test]
+fn an_identifier_reported_twice_is_one_flagged_line_and_one_device() {
+    let (fake, shared) = scripted(&[A, B, A, A], |s| {
+        s.transact.push_back(info("Synthetic Maker", "Model One"));
+        s.transact.push_back(info("Synthetic Maker", "Model Two"));
+    });
+    let listing = run(fake, &config(Some(A)), true, false);
+    listing.result.as_ref().unwrap();
+    assert_eq!(
+        listing.out.lines().collect::<Vec<_>>(),
+        [
+            "Cameras found: 2",
+            "1  synthetic-secret-a  (reported 3 times)  Synthetic Maker Model One  (selected by camera_id)",
+            "2  synthetic-secret-b  not described (not selected by camera_id)",
+        ]
+    );
+    // Selected once and opened once, however often it was reported.
+    assert_eq!(script(&shared).opened, [device(A)]);
+    assert_eq!(listing.out.matches("(selected by camera_id)").count(), 1);
+    assert_quiet(&listing);
+
+    let (fake, shared) = scripted(&[A, A], |_| {});
+    let listing = run(fake, &config(None), false, false);
+    assert!(
+        listing.out.starts_with(
+            "Cameras found: 1\n1  synthetic-secret-a  (reported 2 times)\nSet camera_id"
+        ),
+        "{}",
+        listing.out
+    );
+    assert_eq!(script(&shared).calls, [Call::Discover]);
+}
+
+/// Identifiers the framework crate accepts but `camera_id` validation refuses.
+const ODD: [&str; 6] = [
+    "fake\n9  synthetic-secret-forged  (selected by camera_id)",
+    "\u{1b}[2J\u{1b}[H",
+    " padded ",
+    "bidi\u{202E}reversed",
+    "split\u{2028}line",
+    "carriage\rreturn",
+];
+
+#[test]
+fn an_identifier_that_cannot_be_selected_is_never_printed_and_never_opened() {
+    let mut attached = vec![A];
+    attached.extend(ODD);
+    let (fake, shared) = scripted(&attached, |s| {
+        s.transact.push_back(info("Synthetic Maker", "Model One"));
+    });
+    let listing = run(fake, &config(None), true, false);
+    listing.result.as_ref().unwrap();
+    let mut expected = vec![
+        "Cameras found: 7".to_owned(),
+        "1  synthetic-secret-a  Synthetic Maker Model One".to_owned(),
+    ];
+    // Every odd one keeps its index and shows only the fixed marker.
+    for index in 2..=7 {
+        expected.push(format!("{index}  (identifier not selectable)"));
+    }
+    expected.push("Set camera_id in the configuration to one of these identifiers.".into());
+    assert_eq!(listing.out.lines().collect::<Vec<_>>(), expected);
+    assert!(!listing.out.contains('\u{1b}'), "{:?}", listing.out);
+    assert!(!listing.out.contains("forged"), "{}", listing.out);
+    // Only the selectable device was ever opened.
+    assert_eq!(script(&shared).opened, [device(A)]);
+    assert_eq!(closes(&shared), 1);
+    assert_quiet(&listing);
+}
+
+#[test]
+fn with_nothing_selectable_there_is_no_hint_to_pick_one() {
+    let (fake, shared) = scripted(&[ODD[0], ODD[0]], |_| {});
+    let listing = run(fake, &config(None), false, false);
+    listing.result.as_ref().unwrap();
+    assert_eq!(
+        listing.out,
+        "Cameras found: 1\n1  (identifier not selectable)  (reported 2 times)\n"
+    );
+    assert_eq!(script(&shared).calls, [Call::Discover]);
+    // A configured key still says it matched none of them.
+    let (fake, _) = scripted(&[ODD[1]], |_| {});
+    let listing = run(fake, &config(Some(A)), false, false);
+    assert!(
+        listing.out.contains("camera_id is set but matches none"),
+        "{}",
+        listing.out
+    );
 }
