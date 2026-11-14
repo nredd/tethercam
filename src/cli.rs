@@ -3,6 +3,8 @@
 //! References:
 //! - `docs/architecture.md`, configuration, security and supervisor contracts
 
+#[cfg(feature = "macos-icc")]
+mod cameras;
 #[cfg(test)]
 mod diagnostic_tests;
 mod diagnostics;
@@ -44,6 +46,8 @@ pub const BANNER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VE
 /// Short command/option help. Daemon operations require an explicit `service` subcommand.
 pub const HELP: &str = "tethercam setup|probe|run|doctor [--config PATH] [--simulate JPEG] [--no-discovery]\n\
 setup creates owner-only credentials and identity; probe inspects a camera; run serves in the foreground; doctor checks readiness.\n\
+tethercam cameras [--config PATH] [--describe]\n\
+cameras lists what the configured backend can see; --describe (icc only) briefly opens each device read-only for its make and model, which can raise a trust prompt on a phone; with camera_id set only that device is described.\n\
 tethercam service install|uninstall|status [--user]\n\
 Linux defaults to a privileged system unit; --user selects its user manager. macOS uses a per-user launchd agent. Service paths are fixed; uninstall retains credentials.\n";
 
@@ -218,6 +222,9 @@ fn dispatch_runtime<B: crate::transport::usb::Bus + Send>(
             let factory = simulator::Simulator::new(jpeg)?;
             command(factory, cfg, options, out, diagnostics::Signals::install()).await
         } else {
+            if let Command::Cameras { .. } = options.command {
+                return native::list(&bus, out);
+            }
             if options.command == Command::Probe {
                 native::report(&bus, out)?;
             }
@@ -266,6 +273,10 @@ async fn command_until<F: CameraFactory>(
             crate::supervisor::serve(factory, cfg, discovery, shutdown, out).await?;
             Ok(())
         }
-        Command::Setup | Command::Version | Command::Help | Command::Service { .. } => Ok(()),
+        Command::Setup
+        | Command::Version
+        | Command::Help
+        | Command::Cameras { .. }
+        | Command::Service { .. } => Ok(()),
     }
 }

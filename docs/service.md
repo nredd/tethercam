@@ -144,7 +144,9 @@ and the manager's restart policy picks up the new size. See [`architecture.md`](
 ### macOS and the `icc` backend
 
 An installed agent runs `run --config` like a foreground run, so selecting `camera_backend = "icc"`
-in the service's config file is all that changes: the agent's main thread runs the `ImageCaptureCore`
+in the service's config file is all that changes (select the camera there with `camera_id`, found with
+`tethercam cameras`; an unset key refuses several attached devices, and a set key waits for its device,
+never falling back): the agent's main thread runs the `ImageCaptureCore`
 run loop and the application runs joined beside it ([macOS camera](macos-camera.md)). A camera removal
 quarantines the native runtime for the rest of the process. The process then shuts down in order and exits
 with status 75, and `KeepAlive` restarts it after the throttle. So does a native command that never

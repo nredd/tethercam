@@ -74,7 +74,9 @@ retained native operation completes before close, and confirmed closure is requi
 Quarantine bounds admission, but joined shutdown may remain unresolved indefinitely. The Sony layer is
 shared, with one feature-gated refusal rule for ICC native failures (below). `camera_backend = "icc"` selects it ([#77](https://github.com/nredd/tethercam/issues/77)): the
 main thread runs `transport::icc::run` and the whole async application runs as its joined worker, with
-`cli::icc::IccFactory` as the `CameraFactory`. A quarantine is terminal for the process, which exits non-zero
+`cli::icc::IccFactory` as the `CameraFactory`. It selects by `camera_id` (exact, others never opened, absent
+waits) or, unset, the sole discovered camera; `tethercam cameras` (`cli::cameras`) is the one place an
+identifier is printed. A quarantine is terminal for the process, which exits non-zero
 for the service manager to restart; the default stays raw USB and there is never an automatic fallback.
 
 Native dependency justification (required for any dependency that links native code): the feature depends

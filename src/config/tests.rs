@@ -282,3 +282,68 @@ fn icc_rejects_a_usb_serial_instead_of_ignoring_it() {
     config.camera_serial = None;
     assert!(config.validate().is_ok());
 }
+
+#[test]
+fn camera_id_is_optional_persisted_exactly_and_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config::generate().unwrap();
+    assert!(config.camera_id.is_none());
+    config.create(&path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(!content.contains("camera_id"));
+    // A config written before the key existed still loads, with no selection.
+    assert!(Config::load(&path).unwrap().camera_id.is_none());
+    fs::remove_file(&path).unwrap();
+    config.camera_backend = CameraBackend::Icc;
+    config.camera_id = Some(Secret::new("SYNTHETIC-ID-0001".into()));
+    config.create(&path).unwrap();
+    let loaded = Config::load(&path).unwrap();
+    assert_eq!(
+        loaded.camera_id.as_ref().unwrap().expose(),
+        "SYNTHETIC-ID-0001"
+    );
+    // It names a private device: never formatted.
+    assert!(!format!("{loaded:?}").contains("SYNTHETIC-ID-0001"));
+}
+
+#[test]
+fn camera_id_is_icc_only_and_validated_without_echoing_it() {
+    let mut config = Config::generate().unwrap();
+    config.camera_id = Some(Secret::new("SYNTHETIC-ID-0001".into()));
+    // The raw-USB backend selects by `camera_serial`: a `camera_id` is rejected, not ignored.
+    let (key, value) = validation(config.validate().unwrap_err());
+    assert_eq!(key, "camera_id");
+    assert!(value.contains("camera_backend"), "{value}");
+    assert!(!value.contains("SYNTHETIC-ID-0001"));
+    config.camera_backend = CameraBackend::Icc;
+    assert!(config.validate().is_ok());
+    // And the reverse is still true.
+    config.camera_serial = Some("SYNTHETIC-SERIAL".into());
+    assert_eq!(
+        validation(config.validate().unwrap_err()).0,
+        "camera_serial"
+    );
+    config.camera_serial = None;
+    for bad in [
+        String::new(),
+        " ".into(),
+        " SYNTHETIC-ID-0001".into(),
+        "SYNTHETIC-ID-0001 ".into(),
+        "SYNTHETIC\0ID".into(),
+        "SYNTHETIC\nID".into(),
+        "S".repeat(1025),
+    ] {
+        config.camera_id = Some(Secret::new(bad.clone()));
+        let error = config.validate().unwrap_err();
+        let shown = format!("{error} {error:?}");
+        let (key, value) = validation(error);
+        assert_eq!(key, "camera_id", "{bad:?}");
+        assert!(
+            !value.contains("SYNTHETIC") && !shown.contains("SYNTHETIC"),
+            "{shown}"
+        );
+    }
+    config.camera_id = Some(Secret::new("S".repeat(1024)));
+    assert!(config.validate().is_ok());
+}

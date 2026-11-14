@@ -23,6 +23,12 @@ pub enum Command {
     Run,
     /// Check clock, ports, permissions and camera readiness.
     Doctor,
+    /// List the cameras the configured backend can see, so one can be selected explicitly.
+    Cameras {
+        /// Also open each listed `ImageCaptureCore` device read-only to read its `DeviceInfo`
+        /// make and model. Opt-in: it can raise a trust prompt on a phone.
+        describe: bool,
+    },
     /// Manage a native service without touching a camera.
     Service {
         /// Requested lifecycle operation.
@@ -60,8 +66,8 @@ impl Options {
     /// Parse arguments excluding the executable. Every argument sequence has a typed result.
     ///
     /// # Errors
-    /// Rejects unknown/duplicate arguments and missing paths. Only three distinct options
-    /// exist, so parsing stops after at most seven arguments even for an infinite iterator.
+    /// Rejects unknown/duplicate arguments and missing paths. Only four distinct options
+    /// exist, so parsing stops after at most eight arguments even for an infinite iterator.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
         let mut args = args.into_iter();
         let first = args.next();
@@ -72,6 +78,7 @@ impl Options {
             Some(Some("probe")) => Command::Probe,
             Some(Some("run")) => Command::Run,
             Some(Some("doctor")) => Command::Doctor,
+            Some(Some("cameras")) => Command::Cameras { describe: false },
             Some(Some("service")) => return service(&mut args),
             _ => return Err(ParseError::Invalid),
         };
@@ -90,6 +97,9 @@ impl Options {
                     options.simulate = Some(path(&mut args)?);
                 }
                 Some("--no-discovery") if !options.no_discovery => options.no_discovery = true,
+                Some("--describe") if options.command == (Command::Cameras { describe: false }) => {
+                    options.command = Command::Cameras { describe: true };
+                }
                 _ => return Err(ParseError::Invalid),
             }
         }
@@ -98,7 +108,8 @@ impl Options {
         {
             return Err(ParseError::Invalid);
         }
-        if command == Command::Setup && (options.simulate.is_some() || options.no_discovery) {
+        let listing = matches!(command, Command::Setup | Command::Cameras { .. });
+        if listing && (options.simulate.is_some() || options.no_discovery) {
             return Err(ParseError::Invalid);
         }
         Ok(options)

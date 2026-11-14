@@ -412,6 +412,7 @@ async fn command_dispatch_and_sanitized_probe_failures() {
         OpenError::Busy,
         OpenError::Disconnected,
         OpenError::Discovery,
+        OpenError::Ambiguous,
     ] {
         let mut factory = Factory::new(Vec::new());
         factory.steps.push_back(Err(failure));
