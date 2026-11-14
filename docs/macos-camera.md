@@ -118,10 +118,12 @@ target/release/tethercam run --config ./camera.toml
   a refusal: native work is still running, the retired session may not be reused, and the connect fails
   until native cleanup settles. A body that needs 2.00 first and stalls the newer request that way
   belongs in the model quirks, like the a7 III, which starts at 2.00
-- Access restriction: the open-time event drain keeps the *state*. If the last restriction event before
+- Access restriction: the open-time event drain keeps the *state* of what it drains. If the last restriction event before
   the session opened says access is restricted, `open` closes the lease with confirmation and fails as
   `camera access restricted` (the permission category) instead of surfacing later as a generic native
-  failure
+  failure. Limit: a restriction event consumed earlier (by an event poll of a previous session or while no
+  session was open) is not remembered, so the next open can still succeed and the restriction surface
+  as a native failure then
 
 Not validated on hardware, and not claimed: a live Sony stream over ICC, the LaunchAgent context
 (GUI-session domain, camera consent, signing), screen lock and unlock, unplug and replug, deadlines and
