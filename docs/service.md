@@ -162,7 +162,7 @@ address or payload. Each counter is a relaxed atomic, so the frame path takes no
 | --- | --- | --- |
 | `uptime_secs` | Wall-clock seconds since the process started, host sleep included | Read from the start time |
 | `frames_fetched` | Live-view frames fetched from the camera | `Supervisor::refresh` and the first frame of each session, `src/supervisor/actor.rs` |
-| `frames_served` | Paced frames handed to subscribers' RTP queues, duplicates that hold the frame rate included | After each processed frame in `Pipeline::run_with_worker`, `src/supervisor/pipeline.rs` |
+| `frames_served` | Paced frames processed for subscribers (decoded, encoded and offered to the RTP queues), duplicates that hold the frame rate included. A frame whose queue was full counts here and in `frames_dropped` | After each processed frame in `Pipeline::run_with_worker`, `src/supervisor/pipeline.rs` |
 | `frames_dropped` | Fetched frames replaced in the pacer before they were emitted, plus frames whose packets met a full client queue (once per stream) | `account_drops` and `publish`, `src/supervisor/pipeline.rs`. Pacer overruns count only while a client streams |
 | `reconnects` | Sessions that reached live view after an earlier one | `Counters::session_ready`, when a session's first frame arrives |
 | `session_restarts` | Sessions that ended with an error (unplug, power-off, transport failure) | The `camera_disconnected` branch of `Supervisor::run` |

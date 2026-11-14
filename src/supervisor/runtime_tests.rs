@@ -65,6 +65,7 @@ async fn counters_are_logged_on_a_fixed_period_until_stop() {
     assert_eq!(logs.matches("event=\"run_counters\"").count(), 2);
     assert!(logs.contains("camera=waiting"));
     assert!(logs.contains("battery_percent=n/a power=n/a"));
+    assert!(logs.contains("uptime_secs="));
     assert!(logs.contains("frames_fetched=0 frames_served=0 frames_dropped=0"));
     assert!(logs.contains("reconnects=0 session_restarts=0 connect_misses=0"));
     assert!(logs.contains("snapshots_served=0 snapshots_refused=0"));

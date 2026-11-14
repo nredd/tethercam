@@ -361,15 +361,17 @@ fn soak(tools: &Tools<'_>, cfg: &Path, output: &Path, plan: Plan) -> Result<(), 
     }
     directory.create(output)?;
     let client_dir = output.join("clients");
-    let base = clients::prepare_host(cfg, &client_dir)?;
-    let run = Run {
-        tools,
-        client_dir: &client_dir,
-        base: &base,
-        output,
-    };
-    let result = sample_until_done(&run, plan);
-    // The client inputs carry credentials; the report must be safe to share.
+    let result = clients::prepare_host(cfg, &client_dir).and_then(|base| {
+        let run = Run {
+            tools,
+            client_dir: &client_dir,
+            base: &base,
+            output,
+        };
+        sample_until_done(&run, plan)
+    });
+    // The client inputs carry credentials, also after a partial preparation; the report must
+    // be safe to share. A failure that left nothing to remove is the failure already in hand.
     let cleaned = fs::remove_dir_all(&client_dir);
     result.and(cleaned.map_err(Error::from))
 }

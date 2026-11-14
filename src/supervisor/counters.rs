@@ -49,7 +49,7 @@ impl Counters {
         Self::add(&self.frames_fetched);
     }
 
-    /// One paced frame handed to the RTP queues of at least one subscriber.
+    /// One paced frame processed and offered to the RTP queues of the subscribed streams.
     pub(crate) fn frame_served(&self) {
         Self::add(&self.frames_served);
     }
@@ -116,7 +116,8 @@ pub struct CounterSnapshot {
     pub uptime_secs: u64,
     /// Live-view frames fetched from the camera.
     pub frames_fetched: u64,
-    /// Paced frames handed to subscribers' RTP queues, duplicates included.
+    /// Paced frames processed and offered to subscribers' RTP queues, duplicates included. A
+    /// frame whose queue was full counts here and in `frames_dropped`.
     pub frames_served: u64,
     /// Fetched frames replaced before they were emitted, plus frames whose packets met a full
     /// client queue.
