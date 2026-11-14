@@ -129,6 +129,12 @@ source tests. The sole local constraint remains exactly `src/transport/usb/nusb_
 and only when `CI` is absent and VHCI is absent. It is announced loudly; any `CI` value disables
 that exception. Hosted Linux requires the adapter's full coverage too.
 
+macOS: `coverage-macos` runs the same `make coverage` on the `xcode-27` image (see
+[`branch-ruleset.md`](branch-ruleset.md)) with `TETHERCAM_USBIP=0`, so `cfg(target_os = "macos")`
+code is held to the same 100% bar. A local macOS run with `CI=true` reproduces it. No exclusion is
+added for macOS: `nusb_backend.rs` needs a real USB device there, so its coverage is unresolved on
+that leg and the leg is red until the owner decides.
+
 Toolchain: `rust-toolchain.toml` pins one exact stable release (plus the `clippy`, `rustfmt` and
 `llvm-tools-preview` components and the two cross targets) for every gate, and LLVM region
 accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0 disagree on the inline

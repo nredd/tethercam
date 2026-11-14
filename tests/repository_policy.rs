@@ -347,7 +347,7 @@ fn linux_usb_tests_and_coverage_require_the_shared_emulator_setup() -> Result<()
         .1["jobs"]["test"];
     assert_eq!(
         tests["env"]["TETHERCAM_USBIP"],
-        "${{ matrix.os != 'macos-latest' && '1' || '0' }}"
+        "${{ matrix.os != 'macos' && '1' || '0' }}"
     );
     let steps = tests["steps"].as_array().ok_or("missing test steps")?;
     assert!(steps.iter().any(|step| {
@@ -423,6 +423,54 @@ fn checked_in_policy_matches_every_owned_pr_job() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+/// Assert one gate job runs its command unconditionally on exactly the expected matrix.
+fn check_gate(
+    workflows: &Workflows, file: &str, id: &str, command: &str, matrix: Option<Value>,
+) -> Result<(), Box<dyn Error>> {
+    let (_, workflow) = workflows
+        .iter()
+        .find(|(name, _)| name == file)
+        .ok_or("missing gate workflow")?;
+    let job = &workflow["jobs"][id];
+    assert_eq!(
+        job["strategy"]["matrix"],
+        matrix.unwrap_or(Value::Null),
+        "{file}/{id}"
+    );
+    let steps = job["steps"].as_array().ok_or("missing steps")?;
+    let step = steps
+        .iter()
+        .find(|step| step["run"] == command)
+        .ok_or("missing gate command")?;
+    if id == "bench" {
+        assert_eq!(step["if"], "github.event_name == 'pull_request'");
+    } else {
+        assert!(step.get("if").is_none(), "gate step must be unconditional");
+    }
+    assert!(
+        step.get("continue-on-error").is_none(),
+        "gate step must not tolerate failure"
+    );
+    Ok(())
+}
+
+#[test]
+fn macos_gate_commands_remain_present() -> Result<(), Box<dyn Error>> {
+    let workflows = workflows()?;
+    let macos = [("coverage.yml", "coverage-macos", "make coverage")];
+    for (file, id, command) in macos {
+        check_gate(&workflows, file, id, command, None)?;
+    }
+    // VHCI and the USB/IP fixture are Linux-only: the macOS coverage leg must opt out.
+    let coverage = &workflows
+        .iter()
+        .find(|(name, _)| name == "coverage.yml")
+        .ok_or("missing coverage")?
+        .1["jobs"]["coverage-macos"];
+    assert_eq!(coverage["env"]["TETHERCAM_USBIP"], json!(0));
+    Ok(())
+}
+
 #[test]
 fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
     let workflows = workflows()?;
@@ -433,19 +481,19 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
             "lint.yml",
             "clippy",
             "make lint",
-            Some(json!({"os": ["ubuntu-latest", "macos-latest"]})),
+            Some(json!({"os": ["ubuntu-latest", "macos"]})),
         ),
         (
             "check.yml",
             "native-check",
             "make check",
-            Some(json!({"os": ["ubuntu-latest", "macos-latest"]})),
+            Some(json!({"os": ["ubuntu-latest", "macos"]})),
         ),
         (
             "test.yml",
             "test",
             "make test",
-            Some(json!({"os": ["ubuntu-latest", "ubuntu-24.04-arm", "macos-latest"]})),
+            Some(json!({"os": ["ubuntu-latest", "ubuntu-24.04-arm", "macos"]})),
         ),
         ("docs.yml", "rustdoc", "make doc", None),
         ("bench.yml", "bench", "make bench-check", None),
@@ -471,30 +519,7 @@ fn gate_commands_and_platforms_remain_present() -> Result<(), Box<dyn Error>> {
         ),
     ];
     for (file, id, command, matrix) in gates {
-        let (_, workflow) = workflows
-            .iter()
-            .find(|(name, _)| name == file)
-            .ok_or("missing gate workflow")?;
-        let job = &workflow["jobs"][id];
-        assert_eq!(
-            job["strategy"]["matrix"],
-            matrix.unwrap_or(Value::Null),
-            "{file}/{id}"
-        );
-        let steps = job["steps"].as_array().ok_or("missing steps")?;
-        let step = steps
-            .iter()
-            .find(|step| step["run"] == command)
-            .ok_or("missing gate command")?;
-        if id == "bench" {
-            assert_eq!(step["if"], "github.event_name == 'pull_request'");
-        } else {
-            assert!(step.get("if").is_none(), "gate step must be unconditional");
-        }
-        assert!(
-            step.get("continue-on-error").is_none(),
-            "gate step must not tolerate failure"
-        );
+        check_gate(&workflows, file, id, command, matrix)?;
     }
     let makefile = include_str!("../Makefile");
     assert!(makefile.lines().any(|line| {
@@ -1112,6 +1137,147 @@ fn hand_selected_and_extra_toolchain_setup_fails() -> Result<(), Box<dyn Error>>
             validate_recipes(&format!("{makefile}\n{bad}\n")).is_err(),
             "accepted {bad}"
         );
+    }
+    Ok(())
+}
+
+const MACOS_PROOF: &str = "./.github/actions/assert-xcode-27";
+
+/// The single place a matrix leg maps the label-free `macos` value to the hosted image label.
+const MACOS_RUNS_ON: &str = "${{ matrix.os == 'macos' && 'xcode-27' || matrix.os }}";
+
+/// Every macOS leg runs on the Xcode 27 image label and proves it before any toolchain work.
+///
+/// Matrix contexts use the label-free value `macos`, so an image bump edits workflows only, never
+/// the ruleset. Any other `macos*` value or label is an older image and is rejected.
+fn validate_macos_legs(workflows: &Workflows) -> Result<usize, String> {
+    let mut legs = 0;
+    for (file, workflow) in workflows {
+        for (id, job) in workflow["jobs"].as_object().ok_or("missing jobs")? {
+            let at = format!("{file}/{id}");
+            let runs_on = job["runs-on"].as_str().ok_or("runs-on must be a string")?;
+            let matrix = job["strategy"]["matrix"]["os"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice);
+            let fixed = runs_on == "xcode-27";
+            let matrixed = matrix.contains(&json!("macos"));
+            require(
+                !runs_on.contains("macos") || runs_on == MACOS_RUNS_ON,
+                &format!("{at}: macOS legs use the `xcode-27` label, not an older image"),
+            )?;
+            require(
+                matrix
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .all(|os| !os.starts_with("macos") || os == "macos"),
+                &format!("{at}: the only macOS matrix value is `macos`"),
+            )?;
+            require(
+                !matrixed || runs_on == MACOS_RUNS_ON,
+                &format!("{at}: the `macos` value must map to the `xcode-27` label"),
+            )?;
+            if !fixed && !matrixed {
+                continue;
+            }
+            legs += 1;
+            let steps = job["steps"].as_array().ok_or("missing steps")?;
+            let proof = steps
+                .iter()
+                .position(|step| step["uses"] == MACOS_PROOF)
+                .ok_or(format!("{at}: missing the Xcode 27 proof step"))?;
+            require(proof == 1, &format!("{at}: proof must follow checkout"))?;
+            let condition = steps[proof].get("if");
+            require(
+                if fixed {
+                    condition.is_none()
+                } else {
+                    condition == Some(&json!("runner.os == 'macOS'"))
+                },
+                &format!(
+                    "{at}: proof must be unconditional on a fixed leg, macOS-only on a matrix"
+                ),
+            )?;
+        }
+    }
+    Ok(legs)
+}
+
+/// An in-place edit that must make `validate_macos_legs` fail.
+type Mutation = fn(&mut Value);
+
+#[test]
+fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Error>> {
+    let workflows = workflows()?;
+    // clippy, native-check and test matrices plus coverage.
+    assert_eq!(
+        validate_macos_legs(&workflows)?,
+        4,
+        "add new macOS legs to this count and to the docs table"
+    );
+    // Each mutation breaks exactly one rule of `validate_macos_legs`.
+    let mutations: [(&str, &str, Mutation); 7] = [
+        ("lint.yml", "clippy", |job| {
+            job["runs-on"] = json!("macos-latest");
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["strategy"]["matrix"]["os"][1] = json!("macos-27");
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["runs-on"] = json!("${{ matrix.os }}");
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            if let Some(steps) = job["steps"].as_array_mut() {
+                steps.remove(1);
+            }
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            if let Some(steps) = job["steps"].as_array_mut() {
+                steps.swap(1, 2);
+            }
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["steps"][1]["if"] = json!("always()");
+        }),
+        ("coverage.yml", "coverage-macos", |job| {
+            job["steps"][1]["if"] = json!("runner.os == 'macOS'");
+        }),
+    ];
+    for (file, id, mutate) in mutations {
+        let mut mutated = workflows.clone();
+        let (_, workflow) = mutated
+            .iter_mut()
+            .find(|(name, _)| name == file)
+            .ok_or("missing workflow")?;
+        mutate(&mut workflow["jobs"][id]);
+        assert!(
+            validate_macos_legs(&mutated).is_err(),
+            "accepted {file}/{id}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn xcode_27_proof_action_checks_arch_and_both_majors() -> Result<(), Box<dyn Error>> {
+    let action: Value = serde_saphyr::from_str(include_str!(
+        "../.github/actions/assert-xcode-27/action.yml"
+    ))?;
+    assert_eq!(action["runs"]["using"], "composite");
+    let steps = action["runs"]["steps"]
+        .as_array()
+        .ok_or("proof action has no steps")?;
+    assert_eq!(steps.len(), 1);
+    let script = steps[0]["run"]
+        .as_str()
+        .ok_or("proof action step has no script")?;
+    for needle in [
+        "sw_vers\n",
+        "xcodebuild -version\n",
+        "test \"$arch\" = arm64",
+        "test \"$os_major\" = 27",
+        "test \"$xcode_major\" = 27",
+    ] {
+        assert!(script.contains(needle), "missing {needle}");
     }
     Ok(())
 }
