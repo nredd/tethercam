@@ -129,7 +129,7 @@ pub enum CameraBackend {
     #[default]
     Usb,
     /// Experimental macOS `ImageCaptureCore` (`docs/macos-camera.md`): needs a build with the
-    /// `macos-icc` feature, and selects the one camera it discovers.
+    /// `macos-icc` feature. Selects `camera_id`, else the one camera it discovers.
     Icc,
 }
 
@@ -150,9 +150,14 @@ pub struct Config {
     /// Camera access path. Defaults to raw USB when absent.
     #[serde(default)]
     pub camera_backend: CameraBackend,
-    /// Optional USB serial; absent selects a camera automatically. Raw USB only: `icc` selects
-    /// its sole discovered camera and rejects a serial rather than ignore it.
+    /// Optional USB serial; absent selects a camera automatically. Raw USB only: `icc` rejects a
+    /// serial rather than ignore it, and selects by `camera_id`.
     pub camera_serial: Option<String>,
+    /// Optional exact `ImageCaptureCore` device identifier, as printed by `tethercam cameras`.
+    /// `icc` only: with it set, other attached devices are ignored and an absent device waits,
+    /// never falling back. Absent selects the sole discovered camera. Redacted when formatted.
+    #[serde(default)]
+    pub camera_id: Option<Secret>,
     /// Device name advertised to clients.
     pub device_name: String,
     /// Logging level.
@@ -163,6 +168,18 @@ pub struct Config {
     pub streams: Streams,
     /// Shared protocol credentials.
     pub credentials: Credentials,
+}
+
+/// Longest `camera_id` in UTF-8 bytes, the framework identifier bound (`MAX_ID_BYTES`).
+const MAX_CAMERA_ID_BYTES: usize = 1024;
+
+/// An exact identifier: nonempty, bounded, no padding (a copy-paste slip would otherwise wait
+/// forever for a camera that cannot match) and no control characters, NUL included.
+fn valid_camera_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_CAMERA_ID_BYTES
+        && id == id.trim()
+        && !id.chars().any(char::is_control)
 }
 
 fn random_hex(
@@ -206,6 +223,7 @@ impl Config {
             interface: None,
             camera_backend: CameraBackend::Usb,
             camera_serial: None,
+            camera_id: None,
             device_name: "tethercam".into(),
             log_level: "info".into(),
             endpoint_uuid: id,
@@ -290,6 +308,19 @@ impl Config {
             "camera_serial",
             &"unused with camera_backend = \"icc\"",
         )?;
+        if let Some(id) = &self.camera_id {
+            // Never echo the identifier: it names a private device.
+            check(
+                valid_camera_id(id.expose()),
+                "camera_id",
+                &"empty, padded, over 1024 bytes or containing control characters",
+            )?;
+            check(
+                self.camera_backend == CameraBackend::Icc,
+                "camera_id",
+                &"unused with camera_backend = \"usb\"",
+            )?;
+        }
         check(
             !self.credentials.username.expose().is_empty(),
             "credentials.username",

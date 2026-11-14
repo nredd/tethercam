@@ -16,7 +16,8 @@
 //! owner never has to handle the identifier; zero or several candidates fail (exit 1, counts
 //! only) and the first of several is never taken. The two modes are mutually exclusive. The
 //! exact identifier is read from the environment so it stays out of the process list and shell
-//! history, and nothing here prints it. The single output line carries counts and response
+//! history, and nothing here prints it. It is the identifier `tethercam cameras` prints and the
+//! `camera_id` key holds, and the service picks its camera with the same `Selector`. The single output line carries counts and response
 //! codes only: never a device identity, name, serial or payload byte. CI never passes the flag.
 //!
 //! Exit status: 0 for a passing sample, 1 for a failed sample, 2 for usage or startup errors.

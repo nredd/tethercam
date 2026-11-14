@@ -71,7 +71,8 @@ the operator, so keep its output private. Without `--config`, the platform confi
 is used. `probe` lists candidate USB modes and reports the selected body's remote-control capabilities
 and battery/USB power. `camera_serial` in the configuration selects an exact device; otherwise
 the first usable camera is chosen. `camera_backend = "icc"` (default `"usb"`, no fallback) selects the
-experimental macOS `ImageCaptureCore` backend instead, see below. USB serials and OS bus paths are not printed. `doctor` checks file
+experimental macOS `ImageCaptureCore` backend instead, see below. `tethercam cameras --config ./camera.toml`
+lists what the backend can see so one can be chosen (`camera_id` for `icc`, `camera_serial` for USB). USB serials and OS bus paths are not printed. `doctor` checks file
 permissions and values, listener addresses/ports, a plausible UTC clock and camera readiness; it
 does not prove that NTP is synchronized. These foreground commands never install a daemon or
 background themselves; only the explicit `service` command performs native service operations.
@@ -192,8 +193,9 @@ The experimental `macos-icc` feature (off by default, macOS and Rust 1.99 only) 
 PTP session so Apple's camera helpers can keep running. It depends on the pinned `image-capture` crate,
 adds no local `unsafe` and carries no production support claim. Build with `--features macos-icc` and set
 `camera_backend = "icc"` in the configuration to run on it; `probe`, `doctor` and `run` otherwise fail
-before any camera access. It selects the sole camera ICC discovers and is not validated against a live
-camera. See [`docs/macos-camera.md`](docs/macos-camera.md) for configuration, threading, the quarantine
+before any camera access. It selects `camera_id`, else the sole camera ICC discovers, and is not validated
+against a live camera. `tethercam cameras` lists the cameras with their identifiers (printed only there);
+`--describe` opens each read-only for its make and model, which can raise a trust prompt on a phone. See [`docs/macos-camera.md`](docs/macos-camera.md) for configuration, threading, the quarantine
 policy, limits and validation status.
 See [`docs/verification.md`](docs/verification.md) for API, privilege, coverage, profiling and
 extracted-package verification contracts, and [`docs/usb.md`](docs/usb.md) for normal camera setup.

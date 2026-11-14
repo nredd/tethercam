@@ -57,6 +57,9 @@ pub(crate) struct Script {
     /// queue, which is where the bridge's stale drain ends.
     pub fresh: VecDeque<Result<Option<Vec<u8>>, IccError>>,
     pub calls: Vec<Call>,
+    /// The exact identifier of every `open`, in order, so a test can prove which device was
+    /// (or was never) opened. Test-only: production code never records an identifier.
+    pub opened: Vec<IccDeviceId>,
     pub live_leases: usize,
     pub panic_on_discover: bool,
     /// Block the next `open` the way a slow native open does: signal, then wait for release.
@@ -178,12 +181,13 @@ impl Boundary for Fake {
     }
 
     fn open(
-        &mut self, _id: &IccDeviceId, _timeout: IccTimeout,
+        &mut self, id: &IccDeviceId, _timeout: IccTimeout,
     ) -> Result<Self::Lease<'_>, IccError> {
         let shared = Arc::clone(&self.shared);
         let (held, outcome) = {
             let mut script = lock(&shared);
             script.calls.push(Call::Open);
+            script.opened.push(id.clone());
             (script.hold_open.take(), script.open.pop_front())
         };
         if let Some((entered, release)) = held {

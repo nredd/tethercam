@@ -43,6 +43,7 @@ fn sensitive_fields(type_name: &str, fields: &syn::Fields) -> bool {
             && !replay_cache
             && ![
                 "password",
+                "camera_id",
                 "authorization",
                 "response",
                 "headers",
@@ -54,15 +55,25 @@ fn sensitive_fields(type_name: &str, fields: &syn::Fields) -> bool {
         {
             return false;
         }
-        match &field.ty {
-            syn::Type::Path(path) => {
-                !path.path.segments.last().is_some_and(|s| {
-                    s.ident == "Secret" || s.ident == "Headers" || s.ident == "u16"
-                })
-            }
-            _ => true,
-        }
+        !redacted(&field.ty)
     })
+}
+
+/// A type whose `Debug` is safe: a redacting wrapper, or an `Option` of one.
+fn redacted(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(last) = path.path.segments.last() else {
+        return false;
+    };
+    if last.ident == "Option"
+        && let syn::PathArguments::AngleBracketed(args) = &last.arguments
+        && let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>().as_slice()
+    {
+        return redacted(inner);
+    }
+    last.ident == "Secret" || last.ident == "Headers" || last.ident == "u16"
 }
 
 impl<'ast> Visit<'ast> for Guard {
@@ -124,10 +135,11 @@ fn guard_detects_raw_secrets_and_header_maps() {
         #[derive(Debug)] struct WsseVerifier { seen: Vec<u8> }
         #[derive(Debug)] struct Response { body: Vec<u8> }
         #[derive(Debug)] struct Challenge { nonce: String, www_authenticate: String }
-        #[derive(Debug)] struct Safe { password: Secret, headers: Headers }
+        #[derive(Debug)] struct Safe { password: Secret, headers: Headers, camera_id: Option<Secret> }
         #[derive(std::fmt::Debug)] struct Qualified { password: String }
         #[derive(Debug)] enum BadEnum { Variant { password: String } }
         #[derive(Debug)] enum Messages { Request { body: Vec<u8> } }
+        #[derive(Debug)] struct Listed { camera_id: Option<String> }
     ",
     )
     .unwrap();
@@ -146,7 +158,8 @@ fn guard_detects_raw_secrets_and_header_maps() {
             "Challenge",
             "Qualified",
             "BadEnum",
-            "Messages"
+            "Messages",
+            "Listed"
         ]
     );
 }

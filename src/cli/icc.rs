@@ -9,8 +9,11 @@
 //! the process stdout and the tracing dispatcher is re-installed on the worker, because
 //! the main thread is parked in the run loop and holds neither.
 //!
-//! Selection: the one camera discovery returns, never the first of several, and never logged.
-//! `camera_serial` is a raw-USB identity and is rejected rather than ignored (`config`).
+//! Selection: `camera_id` names one device exactly. The others attached are ignored and never
+//! opened, and an absent one waits, never falling back. Without it the one camera discovery
+//! returns is used, zero wait and several are refused (a count, naming `tethercam cameras`).
+//! Never the first of several, and never logged. `camera_serial` is a raw-USB identity and is
+//! rejected rather than ignored (`config`); identifiers are printed only by `cameras`.
 //!
 //! Reconnect: the supervisor's loop reuses the one runtime. After a confirmed close the next
 //! session reopens on it. A deadline retires the session and the next attempt reports busy until
@@ -32,8 +35,8 @@ use std::time::Instant;
 use tokio::sync::watch;
 use tracing::Dispatch;
 
-use super::{Error, Options, command_until, diagnostics};
-use crate::config::Config;
+use super::{Command, Error, Options, cameras, command_until, diagnostics};
+use crate::config::{self, Config};
 use crate::ptp::session::SessionConfig;
 use crate::supervisor::{CameraFactory, OpenError};
 use crate::transport::icc::{
@@ -42,6 +45,9 @@ use crate::transport::icc::{
 };
 
 #[cfg(test)]
+#[path = "selection_tests.rs"]
+mod selection_tests;
+#[cfg(test)]
 #[path = "icc_tests.rs"]
 mod tests;
 
@@ -49,15 +55,32 @@ mod tests;
 pub(super) const QUARANTINE_EXIT: u8 = 75;
 
 /// What a discovery failure means to the supervisor, as a category safe to log.
-fn open_error(error: IccError) -> OpenError {
+pub(super) fn open_error(error: IccError) -> OpenError {
     match error {
         IccError::Permission => OpenError::Permission,
         IccError::Busy | IccError::AdmissionExpired | IccError::DeadlineExceeded => OpenError::Busy,
         IccError::Removed | IccError::Disconnected | IccError::NotFound | IccError::Quarantined => {
             OpenError::Disconnected
         }
+        IccError::Ambiguous => OpenError::Ambiguous,
         _ => OpenError::Discovery,
     }
+}
+
+/// The selection `cfg` asks for. `Config::validate` already bounded `camera_id`, so a failure
+/// here means an unvalidated configuration; it is reported as the same key, never its value.
+pub(super) fn selector(cfg: &Config) -> Result<Selector, Error> {
+    let Some(id) = &cfg.camera_id else {
+        return Ok(Selector::SoleCandidate);
+    };
+    IccDeviceId::new(id.expose().to_owned())
+        .map(Selector::Exact)
+        .map_err(|_| {
+            Error::Config(config::Error::Validation {
+                key: "camera_id",
+                value: "[REDACTED]".into(),
+            })
+        })
 }
 
 /// The selected camera and the one bridge handle to it, passed between connect and session.
@@ -71,16 +94,18 @@ pub(super) struct IccCamera {
 /// and reports a quarantine through `fatal`, which the application turns into a shutdown.
 pub(super) struct IccFactory {
     handle: Option<IccHandle>,
+    selector: Selector,
     fatal: watch::Sender<bool>,
 }
 
 impl IccFactory {
-    /// Retain the handle; construction touches nothing native.
-    pub(super) fn new(handle: IccHandle) -> (Self, watch::Receiver<bool>) {
+    /// Retain the handle and selection; construction touches nothing native.
+    pub(super) fn new(handle: IccHandle, selector: Selector) -> (Self, watch::Receiver<bool>) {
         let (fatal, quarantined) = watch::channel(false);
         (
             Self {
                 handle: Some(handle),
+                selector,
                 fatal,
             },
             quarantined,
@@ -125,7 +150,7 @@ impl CameraFactory for IccFactory {
             .discover(DISCOVERY_WINDOW, IccTimeout::default())
             .await;
         let chosen = found.and_then(|found| {
-            Selector::SoleCandidate.choose(&found).inspect_err(|error| {
+            self.selector.choose(&found).inspect_err(|error| {
                 if *error == IccError::Ambiguous {
                     tracing::warn!(event = "icc_ambiguous_cameras", candidates = found.len());
                 }
@@ -174,7 +199,10 @@ pub(super) async fn drive_until(
     handle: IccHandle, cfg: &Config, options: &Options, out: &mut dyn Write,
     stop: Pin<Box<dyn Future<Output = ()> + '_>>,
 ) -> Result<(), Error> {
-    let (factory, mut fatal) = IccFactory::new(handle);
+    if let Command::Cameras { describe } = options.command {
+        return cameras::list(handle, cfg, describe, out, stop).await;
+    }
+    let (factory, mut fatal) = IccFactory::new(handle, selector(cfg)?);
     let quarantined = fatal.clone();
     let shutdown = async move {
         tokio::select! {
