@@ -642,6 +642,25 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
 }
 
 #[test]
+fn launch_without_a_settle_bound_runs_unwatched() {
+    // The service's policy: no watcher, so nothing can end it but its own shutdown.
+    record_unexpected_termination(0);
+    let sink = Sink::default();
+    launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        sink.clone(),
+        |entry| run_with(SimBoundary::new(camera()), entry),
+        None,
+        record_unexpected_termination,
+    )
+    .unwrap();
+    assert!(written(&sink).starts_with("Camera: PC Remote"));
+    assert_eq!(UNEXPECTED.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn launch_terminates_with_the_restart_status_after_a_quarantine() {
     let logs = LogCapture::new();
     let sink = Sink::default();
