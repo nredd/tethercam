@@ -36,16 +36,41 @@ target/release/tethercam-tools soak \
   /opt/homebrew/bin/ffprobe /usr/bin/curl 86400 60 500
 ```
 
-Run it detached from the terminal (e.g. `nohup ... &` or a multiplexer). It rewrites `report.json`
-after every iteration, so a run that dies early still leaves its last state. The client inputs it
-creates carry credentials; it deletes them when it finishes. If it is killed instead, delete
-`NEW_OUTPUT_DIRECTORY/clients` by hand before sharing anything from the directory.
+Run it detached from the terminal (e.g. `nohup ... &` or a multiplexer). It replaces `report.json`
+after every iteration (a synced temporary file renamed over it, then the directory synced), so a run
+that dies early still leaves its last complete report, never an empty one. The client inputs it
+creates carry credentials; it deletes them when it finishes.
+
+- `SIGINT` and `SIGTERM`: it stops the `ffprobe` or `curl` it is running (that exact child, then
+  reaped), drops the interrupted reading, writes the final report and deletes the inputs
+- a panic or an error: the inputs are deleted on the way out
+- `SIGKILL`, a crash of the host or a power cut: nothing runs. The last complete `report.json` is
+  intact, but `NEW_OUTPUT_DIRECTORY/clients` stays with the credentials in it and a running
+  `ffprobe` can outlive the tool for up to one segment. Delete the directory by hand before
+  sharing anything from the output
 
 The soak is itself the streaming client, so the camera's live view runs during segments (that is
-the load an NVR would add). Between segments the client reconnects, which takes a moment. Pauses
-inside a segment are what `gaps_over_threshold` counts; time not inside any segment is
-`elapsed_secs` minus `covered_secs`. A camera that is away shows up as a segment that fails fast
-(`segments_failed`) and status samples reading `waiting`.
+the load an NVR would add). Between segments the client reconnects, which takes a moment. A gap is
+silence longer than the threshold (`GAP_MS`) in any of three places:
+
+- between two consecutive packets
+- from the last packet to the moment `ffprobe` ended. `ffprobe` gives up on a stream that has gone
+  quiet after about 30 s and exits with status 0 and the packets it had, so a freeze mid-segment
+  appears here as a long tail gap. Measured with ffmpeg 9.0.2 against a simulator stopped with
+  `SIGSTOP`: a 30 s tail gap, no `segments_failed`
+- from the start of `ffprobe` to the first packet, only beyond a fixed 5 s startup allowance
+  (a healthy start measured about 0.15 s)
+
+`max_gap_ms` is the longest of those that counted. A segment whose `ffprobe` exits non-zero keeps its
+packets and gaps and also counts in `segments_failed`; one with no packets at all counts only there.
+Time not inside any segment is `elapsed_secs` minus `covered_secs`. A camera that is away shows up as
+segments that fail (`segments_failed`) and status samples reading `waiting`.
+
+What CI proves and what it does not: hosted CI has no `ffprobe`, so the real-`ffprobe` tests
+(`tests/soak.rs`) return early there. The `-/i` option-file syntax, `-read_intervals`, the real
+`pts_time` format and the gap arithmetic on real packets are proven only by local runs (ffmpeg
+9.0.2, macOS). CI covers the parsers, the gap arithmetic and the tail, head and partial-output
+cases through fixtures, and the status leg through the real simulator with real `curl`.
 
 ## Report
 
@@ -83,13 +108,13 @@ inside a segment are what `gaps_over_threshold` counts; time not inside any segm
 }
 ```
 
-- `status.totals` are summed across process restarts: a restart is a reading whose uptime or any
-  counter went backwards (`process_restarts_seen`), and the new process's counts are added rather
-  than subtracted. A restart that happens between two readings and leaves every counter and the
-  uptime higher is not detectable, so cross-check the service log
+- `status.totals` are summed across process restarts. A restart is a reading whose `run_id` (a random
+  per-process identifier in the status document) differs from the previous one
+  (`process_restarts_seen`); the new process's counts are added rather than subtracted. The uptime
+  and the wall clock play no part, so a clock step on the host is not mistaken for a restart
 - `status.failures` are readings that failed (connection refused, non-200, unparsable): the service
   was down, restarting or unreachable
-- `stream.segments_failed`: `ffprobe` could not play or returned no packets
+- `stream.segments_failed`: `ffprobe` exited non-zero or returned no packets
 - `battery.points` records each change of `(percent, power)` with seconds since the start, at most 1000
   (`points_dropped` counts the rest). `percent` is null when the camera reports none
 - Also read the service's own `run_counters` lines (every five minutes) for the same totals from
@@ -104,7 +129,7 @@ Record for every case:
 
 - the UTC time of the action and the UTC time the status first read `ready` again (seconds to recover)
 - the counter deltas from two `/tethercam/status` readings, before and after: `session_restarts`,
-  `reconnects`, `connect_misses`, and `uptime_secs` (a drop means the process restarted)
+  `reconnects`, `connect_misses`, and `run_id` (a different one means the process restarted)
 - whether the stream client resumed with no manual step (yes/no), and whether anything had to be
   done by hand (what)
 - whether the camera needed a physical power-cycle (yes/no). The answer for the whole run, not per
@@ -113,8 +138,8 @@ Record for every case:
 | Case | How | Expect, per the design | Also record |
 | --- | --- | --- | --- |
 | Camera auto power-off | Set the camera's power-save time to its shortest, leave it idle on USB and wait | Status reads `waiting`, `session_restarts` +1, the service stays up | Whether the camera powers off at all on USB power, and whether waking it is enough or it needs a power-cycle |
-| USB unplug and replug | Unplug the cable, wait 10 s, replug | `waiting` with the process still running (`uptime_secs` keeps growing), `ready` again after replug, `session_restarts` +1 and `reconnects` +1 | Time unplugged; whether `camera_open_failed` reasons were `disconnected`, `busy` or `mode` meanwhile |
-| Host sleep and wake | `pmset sleepnow`, wake after 10 minutes | The service survives; `uptime_secs` includes the sleep; the camera session may need to recover | Whether the session recovered by itself; whether the camera stayed powered during sleep (battery trend across it) |
+| USB unplug and replug | Unplug the cable, wait 10 s, replug | `waiting` with the process still running (same `run_id`), `ready` again after replug, `session_restarts` +1 and `reconnects` +1 | Time unplugged; whether `camera_open_failed` reasons were `disconnected`, `busy` or `mode` meanwhile |
+| Host sleep and wake | `pmset sleepnow`, wake after 10 minutes | The service survives (same `run_id`; `uptime_secs` does not advance while asleep); the camera session may need to recover | Whether the session recovered by itself; whether the camera stayed powered during sleep (battery trend across it) |
 | Screen lock and unlock | Lock the screen (Ctrl+Cmd+Q), wait 10 minutes, unlock | No effect on a per-user LaunchAgent, which keeps its GUI session | Any `waiting` period or `session_restarts` change. [`service.md`](service.md) notes lock is not yet validated on hardware |
 | Process kill and restart, graceful | macOS: `launchctl kill TERM gui/$(id -u)/net.tethercam.agent`. Linux: `systemctl --user kill -s TERM tethercam` | The agent shuts down in order. macOS: `KeepAlive` restarts it after the ten-second throttle. Linux: the unit has `Restart=on-failure`, so a clean stop stays stopped until `systemctl --user start tethercam`; record that manual step. Counters reset | Time from kill to `ready`; the `process_restarts_seen` count |
 | Process kill and restart, abrupt | macOS: `launchctl kill KILL gui/$(id -u)/net.tethercam.agent`. Linux: `systemctl --user kill -s KILL tethercam` | Restarts without a manual step (`KeepAlive`, or `Restart=on-failure` after five seconds), but the camera session was never closed | Whether the camera accepted a new session at once or needed a power-cycle, and for how long it refused |

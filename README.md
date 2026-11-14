@@ -116,8 +116,8 @@ Read the camera state with the generated credentials, e.g. `curl --digest -K cli
 http://192.0.2.10:8080/tethercam/status` (credentials in a `-K` file, not the command line):
 
 ```json
-{"camera":"waiting","uptime_secs":12,"frames_fetched":0,"frames_served":0,"frames_dropped":0,"reconnects":0,"session_restarts":0,"connect_misses":2,"snapshots_served":0,"snapshots_refused":0}
-{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0}
+{"camera":"waiting","uptime_secs":12,"frames_fetched":0,"frames_served":0,"frames_dropped":0,"reconnects":0,"session_restarts":0,"connect_misses":2,"snapshots_served":0,"snapshots_refused":0,"run_id":"4be1077a2c93d5f0"}
+{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0,"run_id":"9f3c2a71b0d4e856"}
 ```
 
 The camera members come first and are unchanged; the counters are appended after them

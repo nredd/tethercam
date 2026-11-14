@@ -162,7 +162,8 @@ address or payload. Each counter is a relaxed atomic, so the frame path takes no
 
 | Counter | Counts | Incremented |
 | --- | --- | --- |
-| `uptime_secs` | Wall-clock seconds since the process started, host sleep included | Read from the start time |
+| `uptime_secs` | Monotonic seconds since the process started. A wall-clock step cannot move it; it does not advance while the host sleeps | Read from the start time |
+| `run_id` | A random 16-digit hex identifier of this process run, in the status document only (appended last). Names nothing about the device or host | Drawn once at start. Differs after every restart |
 | `frames_fetched` | Live-view frames fetched from the camera | `Supervisor::refresh` and the first frame of each session, `src/supervisor/actor.rs` |
 | `frames_served` | Paced frames processed for subscribers (decoded, encoded and offered to the RTP queues), duplicates that hold the frame rate included. A frame whose queue was full counts here and in `frames_dropped` | After each processed frame in `Pipeline::run_with_worker`, `src/supervisor/pipeline.rs` |
 | `frames_dropped` | Fetched frames replaced in the pacer before they were emitted, plus frames whose packets met a full client queue (once per stream) | `account_drops` and `publish`, `src/supervisor/pipeline.rs`. Pacer overruns count only while a client streams |
@@ -172,14 +173,14 @@ address or payload. Each counter is a relaxed atomic, so the frame path takes no
 | `snapshots_served` / `snapshots_refused` | Snapshot requests answered with an image / refused or failed | `Control::snapshot`, the seam the ONVIF snapshot endpoint calls |
 
 Nothing is fetched or served while no client streams, apart from snapshot refreshes, so the frame
-counters stay flat with no subscriber. The counters reset when the process restarts, so a decrease
-between two readings is a restart. `tethercam-tools soak` detects that and keeps totals across it
+counters stay flat with no subscriber. The counters reset when the process restarts; a different
+`run_id` between two readings is a restart. `tethercam-tools soak` detects that and keeps totals across it
 ([`soak.md`](soak.md)).
 
 The status endpoint reports them after the camera members, which are unchanged:
 
 ```json
-{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0}
+{"camera":"ready","battery_percent":87,"power":"usb","uptime_secs":3700,"frames_fetched":51210,"frames_served":50877,"frames_dropped":3,"reconnects":1,"session_restarts":1,"connect_misses":2,"snapshots_served":12,"snapshots_refused":0,"run_id":"9f3c2a71b0d4e856"}
 ```
 
 Before this, the document was only the camera members, e.g.

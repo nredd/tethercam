@@ -835,6 +835,11 @@ fn state_members(control: &Control) -> (String, serde_json::Map<String, serde_js
     for key in COUNT_KEYS {
         assert!(document.remove(key).unwrap().is_u64(), "{key}");
     }
+    // Appended last: a random per-process identifier, 16 hex digits.
+    let run_id = document.remove("run_id").unwrap();
+    let run_id = run_id.as_str().unwrap();
+    assert!(run_id.len() == 16 && run_id.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(json.ends_with(&format!(r#""run_id":"{run_id}"}}"#)));
     // Existing members stay first, in their original order, so older parsers are unaffected.
     assert!(json.starts_with(r#"{"camera":""#));
     (json, document)

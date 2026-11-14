@@ -7,12 +7,13 @@
 //! - `docs/service.md`, run counters
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// Process-lifetime totals, shared by the camera actor, the media pipeline and snapshot callers.
 #[derive(Debug)]
 pub(crate) struct Counters {
-    started: SystemTime,
+    started: Instant,
+    run_id: u64,
     frames_fetched: AtomicU64,
     frames_served: AtomicU64,
     frames_dropped: AtomicU64,
@@ -27,7 +28,8 @@ pub(crate) struct Counters {
 impl Counters {
     pub(crate) fn new() -> Self {
         Self {
-            started: SystemTime::now(),
+            started: Instant::now(),
+            run_id: run_id(&mut getrandom::fill),
             frames_fetched: AtomicU64::new(0),
             frames_served: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
@@ -90,12 +92,10 @@ impl Counters {
     pub(crate) fn snapshot(&self) -> CounterSnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         CounterSnapshot {
-            // Wall clock on purpose: a monotonic clock stops while the host sleeps, and sleep
-            // is one of the cases an unattended run has to account for.
-            uptime_secs: self
-                .started
-                .elapsed()
-                .map_or(0, |elapsed| elapsed.as_secs()),
+            // Monotonic, so a wall-clock step cannot move it. It does not advance while the host
+            // sleeps; `run_id` is what tells two processes apart.
+            uptime_secs: self.started.elapsed().as_secs(),
+            run_id: self.run_id,
             frames_fetched: load(&self.frames_fetched),
             frames_served: load(&self.frames_served),
             frames_dropped: load(&self.frames_dropped),
@@ -108,11 +108,24 @@ impl Counters {
     }
 }
 
+/// A random identifier for this process run, so a reader can tell a restart from a clock step.
+/// It names nothing about the device or the host. If the system source fails, the wall clock in
+/// microseconds still differs between two starts.
+fn run_id(fill: &mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>) -> u64 {
+    let mut bytes = [0; 8];
+    match fill(&mut bytes) {
+        Ok(()) => u64::from_be_bytes(bytes),
+        Err(_) => SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| u64::try_from(since.as_micros()).unwrap_or(0)),
+    }
+}
+
 /// A point-in-time copy of the run counters. Counts only, never a device identity, an address
 /// or image bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CounterSnapshot {
-    /// Wall-clock seconds since the process started, host sleep included.
+    /// Monotonic seconds since the process started. Does not advance during host sleep.
     pub uptime_secs: u64,
     /// Live-view frames fetched from the camera.
     pub frames_fetched: u64,
@@ -132,6 +145,8 @@ pub struct CounterSnapshot {
     pub snapshots_served: u64,
     /// Snapshot requests refused or failed.
     pub snapshots_refused: u64,
+    /// Random identifier of this process run. Differs after every restart.
+    pub run_id: u64,
 }
 
 impl CounterSnapshot {
@@ -141,7 +156,7 @@ impl CounterSnapshot {
         format!(
             "\"uptime_secs\":{},\"frames_fetched\":{},\"frames_served\":{},\"frames_dropped\":{},\
              \"reconnects\":{},\"session_restarts\":{},\"connect_misses\":{},\
-             \"snapshots_served\":{},\"snapshots_refused\":{}",
+             \"snapshots_served\":{},\"snapshots_refused\":{},\"run_id\":\"{:016x}\"",
             self.uptime_secs,
             self.frames_fetched,
             self.frames_served,
@@ -151,6 +166,7 @@ impl CounterSnapshot {
             self.connect_misses,
             self.snapshots_served,
             self.snapshots_refused,
+            self.run_id,
         )
     }
 }
@@ -200,12 +216,24 @@ mod tests {
     }
 
     #[test]
-    fn a_start_time_in_the_future_reads_as_zero_uptime() {
+    fn uptime_counts_from_the_start() {
         let mut counters = Counters::new();
-        counters.started = SystemTime::now() + std::time::Duration::from_secs(3600);
-        assert_eq!(counters.snapshot().uptime_secs, 0);
-        counters.started = SystemTime::now() - std::time::Duration::from_secs(90);
+        counters.started = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(90))
+            .expect("monotonic clock far enough from its origin");
         assert!(counters.snapshot().uptime_secs >= 90);
+    }
+
+    #[test]
+    fn the_run_id_is_random_and_falls_back_to_the_clock() {
+        let a = run_id(&mut |bytes| {
+            bytes.copy_from_slice(&[0, 0, 0, 0, 0, 0, 1, 2]);
+            Ok(())
+        });
+        assert_eq!(a, 0x0102);
+        assert_ne!(Counters::new().run_id, Counters::new().run_id);
+        let fallback = run_id(&mut |_| Err(getrandom::Error::UNSUPPORTED));
+        assert!(fallback > 1_000_000_000_000_000);
     }
 
     #[test]
@@ -220,12 +248,13 @@ mod tests {
             connect_misses: 7,
             snapshots_served: 8,
             snapshots_refused: 9,
+            run_id: 0xabc,
         };
         assert_eq!(
             snapshot.json_members(),
             "\"uptime_secs\":1,\"frames_fetched\":2,\"frames_served\":3,\"frames_dropped\":4,\
              \"reconnects\":5,\"session_restarts\":6,\"connect_misses\":7,\
-             \"snapshots_served\":8,\"snapshots_refused\":9"
+             \"snapshots_served\":8,\"snapshots_refused\":9,\"run_id\":\"0000000000000abc\""
         );
     }
 }

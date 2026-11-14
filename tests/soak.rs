@@ -10,6 +10,7 @@ use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 use tethercam::config::Config;
 
 struct Service {
@@ -26,7 +27,9 @@ impl Drop for Service {
     }
 }
 
-/// Start `tethercam run --simulate` on loopback and return once it serves video.
+/// Start `tethercam run --simulate` on loopback and return once it serves video. The listener
+/// ports are reserved by binding and releasing them, which can race another process, so a start
+/// that exits early is retried with fresh ports. The wait for "Serving" is bounded.
 fn service(dir: &Path) -> Service {
     let mut jpeg = Vec::new();
     let mut encoder = Encoder::new(&mut jpeg, 80);
@@ -36,37 +39,49 @@ fn service(dir: &Path) -> Service {
         .unwrap();
     let image = dir.join("synthetic.jpg");
     std::fs::write(&image, jpeg).unwrap();
-    let mut cfg = Config::generate().unwrap();
-    cfg.rtsp_address = "127.0.0.1".parse().unwrap();
-    cfg.onvif_address = cfg.rtsp_address;
-    let rtsp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    cfg.rtsp_port = rtsp.local_addr().unwrap().port();
-    cfg.onvif_port = http.local_addr().unwrap().port();
-    let config = dir.join("service.toml");
-    cfg.create(&config).unwrap();
-    drop((rtsp, http));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tethercam"))
-        .args(["run", "--no-discovery", "--config"])
-        .arg(&config)
-        .arg("--simulate")
-        .arg(&image)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let service = Service {
-        child: Some(child),
-        config,
-    };
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
-    while !line.contains("Serving") {
-        line.clear();
-        assert!(reader.read_line(&mut line).unwrap() > 0, "service exited");
+    for attempt in 0..5 {
+        let mut cfg = Config::generate().unwrap();
+        cfg.rtsp_address = "127.0.0.1".parse().unwrap();
+        cfg.onvif_address = cfg.rtsp_address;
+        let rtsp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        cfg.rtsp_port = rtsp.local_addr().unwrap().port();
+        cfg.onvif_port = http.local_addr().unwrap().port();
+        let config = dir.join(format!("service-{attempt}.toml"));
+        cfg.create(&config).unwrap();
+        drop((rtsp, http));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tethercam"))
+            .args(["run", "--no-discovery", "--config"])
+            .arg(&config)
+            .arg("--simulate")
+            .arg(&image)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let service = Service {
+            child: Some(child),
+            config,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            while !line.contains("Serving") {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+            let _ = tx.send(line.contains("Serving"));
+        });
+        // Dropping `service` on a failed attempt kills the child.
+        if rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false) {
+            return service;
+        }
     }
-    service
+    panic!("the simulator service did not start after five attempts");
 }
 
 fn soak(
@@ -152,4 +167,52 @@ fn a_real_ffprobe_segment_counts_the_streamed_frames() {
     let totals = &report["status"]["totals"];
     assert!(totals["frames_fetched"].as_u64().unwrap() > 10, "{report}");
     assert!(totals["frames_served"].as_u64().unwrap() > 10, "{report}");
+}
+
+/// Stall the service mid-segment, as a frozen camera pipeline would, and check the sampler sees a
+/// long outage even though `ffprobe` itself exits cleanly with the packets it had. Local proof
+/// only, like the test above: it needs `ffprobe` and takes about a minute.
+#[test]
+fn a_stalled_stream_is_reported_as_a_long_gap_by_real_ffprobe() {
+    let Some(ffprobe) = [
+        "/usr/bin/ffprobe",
+        "/opt/homebrew/bin/ffprobe",
+        "/usr/local/bin/ffprobe",
+    ]
+    .map(Path::new)
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let service = service(dir.path());
+    let pid = service.child.as_ref().unwrap().id().to_string();
+    let signal = |name: &str| {
+        assert!(
+            Command::new("/bin/kill")
+                .args([name, &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let stall = std::thread::spawn({
+        let pid = pid.clone();
+        move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = Command::new("/bin/kill").args(["-STOP", &pid]).status();
+            std::thread::sleep(Duration::from_secs(45));
+            let _ = Command::new("/bin/kill").args(["-CONT", &pid]).status();
+        }
+    });
+    let report = soak(dir.path(), ffprobe, &service, "20", "14");
+    stall.join().unwrap();
+    signal("-CONT");
+    let stream = &report["stream"];
+    assert!(stream["max_gap_ms"].as_u64().unwrap() >= 20_000, "{report}");
+    assert!(
+        stream["gaps_over_threshold"].as_u64().unwrap() >= 1,
+        "{report}"
+    );
+    assert!(stream["packets"].as_u64().unwrap() > 10, "{report}");
 }

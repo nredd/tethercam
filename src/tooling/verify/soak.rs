@@ -3,21 +3,25 @@
 //! Each iteration reads the authenticated status endpoint with `curl` and plays the primary RTSP
 //! stream for one segment with `ffprobe`, the same external clients and protected client inputs
 //! as `verify`. The report holds only counts, durations and the battery trajectory: no device
-//! identity, address, credential or payload. It is rewritten after every iteration, so a run
-//! that is killed still leaves its last report.
+//! identity, address, credential or payload. It is replaced atomically after every iteration, so
+//! a run that dies still leaves its last complete report. `SIGINT` and `SIGTERM` end the run
+//! cleanly: the child is reaped, the report finished and the credential-bearing inputs removed.
 //!
 //! References:
 //! - <https://curl.se/docs/manpage.html>
 //! - <https://ffmpeg.org/ffprobe.html>
 
-use super::{Error, args, capture, clients};
+use super::{Error, args, capture_until, clients};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 use tethercam::onvif::media::STATUS_PATH;
+use tokio::signal::unix::{SignalKind, signal};
 
 /// The run counters of the status document, in report order.
 const COUNTERS: [&str; 8] = [
@@ -40,8 +44,12 @@ const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
 /// Battery changes kept. Further changes are counted, not stored.
 const MAX_BATTERY_POINTS: usize = 1000;
 const STATUS_BUDGET: Duration = Duration::from_secs(15);
-/// `ffprobe` connects for up to 15 s before it plays for the segment.
-const STREAM_SLACK: Duration = Duration::from_secs(30);
+/// `ffprobe` connects for up to 15 s before it plays, and a stream that stalls mid-segment ends
+/// after about 30 s of silence, with exit status 0 and the packets read so far (measured with
+/// ffmpeg 9.0 against a stopped simulator).
+const STREAM_SLACK: Duration = Duration::from_secs(60);
+/// Longest wait from starting `ffprobe` to its first packet that is still a normal start.
+const STARTUP_ALLOWANCE_US: u64 = 5_000_000;
 
 /// What to run and for how long.
 #[derive(Clone, Copy)]
@@ -64,6 +72,7 @@ struct Sample {
     battery_percent: Option<u64>,
     power: Option<String>,
     uptime_secs: u64,
+    run_id: String,
     counters: [u64; 8],
 }
 
@@ -86,6 +95,12 @@ fn parse_sample(text: &str) -> Result<Sample, Error> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         uptime_secs: number("uptime_secs").ok_or(Error::Invalid("status lacks the uptime"))?,
+        run_id: document
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|id| (1..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .ok_or(Error::Invalid("status lacks the run identifier"))?,
         counters,
     })
 }
@@ -130,6 +145,22 @@ fn parse_packets(text: &str) -> Result<Vec<u64>, Error> {
     Ok(times)
 }
 
+/// One `ffprobe` run: packet arrival times and the wall-clock span of the run, in microseconds
+/// since the epoch, the same clock `-use_wallclock_as_timestamps` uses.
+struct Segment {
+    times: Vec<u64>,
+    started_us: u64,
+    ended_us: u64,
+    /// `ffprobe` exited successfully.
+    clean: bool,
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| u64::try_from(since.as_micros()).unwrap_or(0))
+}
+
 /// Everything the report says. Counts only.
 #[derive(Default)]
 struct Report {
@@ -155,26 +186,27 @@ impl Report {
         self.status_failures += 1;
     }
 
-    /// Add a reading. A restart (the uptime or any counter went backwards) restarts the counts,
-    /// so the totals add what the new process counted rather than a negative difference.
+    /// Add a reading. A different `run_id` is a restart, which restarts the counts: the totals
+    /// add what the new process counted rather than a negative difference. The uptime and the
+    /// wall clock play no part, so a clock step cannot look like a restart.
     fn status(&mut self, elapsed: Duration, sample: Sample) {
         self.samples += 1;
         self.ready_samples += u64::from(sample.ready);
-        let restarted = self.previous.as_ref().is_some_and(|previous| {
-            sample.uptime_secs < previous.uptime_secs
-                || sample
-                    .counters
-                    .iter()
-                    .zip(previous.counters)
-                    .any(|(now, before)| *now < before)
-        });
+        let restarted = self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.run_id != sample.run_id);
         self.process_restarts += u64::from(restarted);
         let before = self
             .previous
             .as_ref()
             .map_or([0; 8], |previous| previous.counters);
         for ((total, now), before) in self.totals.iter_mut().zip(sample.counters).zip(before) {
-            *total += if restarted { now } else { now - before };
+            *total += if restarted {
+                now
+            } else {
+                now.saturating_sub(before)
+            };
         }
         let battery = (sample.battery_percent, sample.power.clone());
         if self.last_battery.as_ref() != Some(&battery) {
@@ -197,19 +229,31 @@ impl Report {
         self.segments_failed += 1;
     }
 
-    /// Add a segment's packet times. A gap is a pause between consecutive packets longer than
-    /// the threshold.
-    fn segment(&mut self, times: &[u64], gap_ms: u64) {
+    /// Add a segment. A gap is silence longer than the threshold: between consecutive packets,
+    /// and from the last packet to the moment `ffprobe` ended (a stream that froze or died
+    /// mid-segment). The wait for the first packet counts only beyond the startup allowance.
+    /// A segment whose `ffprobe` failed keeps its packets and also counts as failed.
+    fn segment(&mut self, segment: &Segment, gap_ms: u64) {
         self.segments += 1;
-        self.packets += u64::try_from(times.len()).unwrap_or(u64::MAX);
-        let (Some(first), Some(last)) = (times.first(), times.last()) else {
+        self.segments_failed += u64::from(!segment.clean);
+        self.packets += u64::try_from(segment.times.len()).unwrap_or(u64::MAX);
+        let (Some(first), Some(last)) = (segment.times.first(), segment.times.last()) else {
             return;
         };
         self.covered_us += last.saturating_sub(*first);
-        for (before, after) in times.iter().zip(times.iter().skip(1)) {
-            let gap = after.saturating_sub(*before);
-            self.max_gap_us = self.max_gap_us.max(gap);
-            self.gaps += u64::from(gap > gap_ms * 1000);
+        let threshold = gap_ms * 1000;
+        let between = segment.times.iter().zip(segment.times.iter().skip(1));
+        let inner = between.map(|(before, after)| (after.saturating_sub(*before), threshold));
+        let head = (
+            first.saturating_sub(segment.started_us),
+            STARTUP_ALLOWANCE_US,
+        );
+        let tail = (segment.ended_us.saturating_sub(*last), threshold);
+        for (gap, allowed) in inner.chain([head, tail]) {
+            if gap > allowed {
+                self.gaps += 1;
+                self.max_gap_us = self.max_gap_us.max(gap);
+            }
         }
     }
 
@@ -256,20 +300,30 @@ fn read_capped(path: &Path) -> Result<String, Error> {
         .map_err(Error::from)
 }
 
-/// Rewrite the report, mode `0600`, so an interrupted run keeps its latest state.
+/// Replace the report, mode `0600`: write a sibling temporary file, sync it, rename it over the
+/// report and sync the directory, so a crash leaves the previous complete report or the new one,
+/// never an empty file.
 fn write_report(path: &Path, report: &Value) -> Result<(), Error> {
+    let temporary = path.with_extension("json.tmp");
+    let _ = fs::remove_file(&temporary);
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let text = format!("{report:#}\n");
-    opts.open(path)
+    opts.open(&temporary)
         .and_then(|mut file| {
             file.write_all(text.as_bytes())
                 .and_then(|()| file.sync_all())
+        })
+        .and_then(|()| fs::rename(&temporary, path))
+        .and_then(|()| {
+            path.parent().map_or(Ok(()), |dir| {
+                fs::File::open(dir).and_then(|dir| dir.sync_all())
+            })
         })
         .map_err(Error::from)
 }
@@ -279,12 +333,97 @@ fn elapsed_since(start: SystemTime) -> Duration {
     start.elapsed().unwrap_or_default()
 }
 
+/// Sleep up to `total`, waking early once `stop` is set.
+fn nap(total: Duration, stop: &AtomicBool) {
+    let end = Instant::now() + total;
+    while !stop.load(Ordering::Relaxed) {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// The credential-bearing client inputs. Removed explicitly on the normal path, and by `Drop` on
+/// any other exit, including a panic. A `SIGKILL` skips both and leaves the directory.
+struct ClientDir {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl ClientDir {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            removed: false,
+        }
+    }
+
+    fn remove(&mut self) -> io::Result<()> {
+        self.removed = true;
+        fs::remove_dir_all(&self.path)
+    }
+}
+
+impl Drop for ClientDir {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+type RuntimeBuilder = fn() -> io::Result<tokio::runtime::Runtime>;
+
+fn current_thread_runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// Wait for either signal, then set `stop`. Reports registration back through `ready`.
+async fn listen(
+    first: SignalKind, second: SignalKind, stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::Sender<io::Result<()>>,
+) {
+    match (signal(first), signal(second)) {
+        (Ok(mut first), Ok(mut second)) => {
+            let _ = ready.send(Ok(()));
+            tokio::select! {
+                _ = first.recv() => {},
+                _ = second.recv() => {},
+            }
+            stop.store(true, Ordering::Relaxed);
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            let _ = ready.send(Err(error));
+        }
+    }
+}
+
+/// Set `stop` when either signal arrives. Returns once both handlers are installed, so no signal
+/// between here and the first check is missed. The listener thread lives until the process ends.
+fn watch_signals(
+    build: RuntimeBuilder, first: SignalKind, second: SignalKind, stop: Arc<AtomicBool>,
+) -> io::Result<()> {
+    let (ready, installed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || match build() {
+        Ok(runtime) => runtime.block_on(listen(first, second, stop, ready)),
+        Err(error) => {
+            let _ = ready.send(Err(error));
+        }
+    });
+    installed.recv().unwrap_or(Ok(()))
+}
+
 /// Where one iteration runs and keeps its scratch files.
 struct Run<'a> {
     tools: &'a Tools<'a>,
     client_dir: &'a Path,
     base: &'a str,
     output: &'a Path,
+    stop: &'a Arc<AtomicBool>,
 }
 
 impl Run<'_> {
@@ -301,7 +440,7 @@ impl Run<'_> {
         cmd.push(body.clone().into());
         cmd.extend(args(&["-w", "%{http_code}"]));
         cmd.push(format!("{}{STATUS_PATH}", self.base).into());
-        let result = capture(self.tools.curl, &cmd, &code, STATUS_BUDGET)
+        let result = capture_until(self.tools.curl, &cmd, &code, STATUS_BUDGET, Some(self.stop))
             .and_then(|()| fs::read_to_string(&code).map_err(Error::from))
             .and_then(|status| {
                 if status == "200" {
@@ -316,7 +455,7 @@ impl Run<'_> {
         result
     }
 
-    fn stream(&self, iteration: u64, segment: Duration) -> Result<Vec<u64>, Error> {
+    fn stream(&self, iteration: u64, segment: Duration) -> Result<Segment, Error> {
         let out = self.scratch("stream", iteration);
         let mut cmd = args(&[
             "-v",
@@ -339,15 +478,30 @@ impl Run<'_> {
             "-/i",
         ]));
         cmd.push(self.client_dir.join("rtsp-main.url").into());
-        let result = capture(self.tools.ffprobe, &cmd, &out, segment + STREAM_SLACK)
-            .and_then(|()| read_capped(&out))
-            .and_then(|text| parse_packets(&text));
+        let started_us = now_us();
+        let ran = capture_until(
+            self.tools.ffprobe,
+            &cmd,
+            &out,
+            segment + STREAM_SLACK,
+            Some(self.stop),
+        );
+        let ended_us = now_us();
+        // Read the output even when `ffprobe` failed: what it saw before failing still counts.
+        let parsed = read_capped(&out).and_then(|text| parse_packets(&text));
         let _ = fs::remove_file(out);
-        result
+        parsed.map(|times| Segment {
+            times,
+            started_us,
+            ended_us,
+            clean: ran.is_ok(),
+        })
     }
 }
 
-fn soak(tools: &Tools<'_>, cfg: &Path, output: &Path, plan: Plan) -> Result<(), Error> {
+fn soak(
+    tools: &Tools<'_>, cfg: &Path, output: &Path, plan: Plan, stop: &Arc<AtomicBool>,
+) -> Result<(), Error> {
     for path in [tools.ffprobe, tools.curl, cfg, output] {
         if !path.is_absolute() {
             return Err(Error::Invalid("soak paths must be absolute"));
@@ -360,19 +514,20 @@ fn soak(tools: &Tools<'_>, cfg: &Path, output: &Path, plan: Plan) -> Result<(), 
         directory.mode(0o700);
     }
     directory.create(output)?;
-    let client_dir = output.join("clients");
-    let result = clients::prepare_host(cfg, &client_dir).and_then(|base| {
+    let mut client_dir = ClientDir::new(output.join("clients"));
+    let result = clients::prepare_host(cfg, &client_dir.path).and_then(|base| {
         let run = Run {
             tools,
-            client_dir: &client_dir,
+            client_dir: &client_dir.path,
             base: &base,
             output,
+            stop,
         };
         sample_until_done(&run, plan)
     });
     // The client inputs carry credentials, also after a partial preparation; the report must
     // be safe to share. A failure that left nothing to remove is the failure already in hand.
-    let cleaned = fs::remove_dir_all(&client_dir);
+    let cleaned = client_dir.remove();
     result.and(cleaned.map_err(Error::from))
 }
 
@@ -382,23 +537,37 @@ fn sample_until_done(run: &Run<'_>, plan: Plan) -> Result<(), Error> {
     let mut report = Report::default();
     for iteration in 1_u64.. {
         let began = SystemTime::now();
-        match run.status(iteration) {
+        // A run cut short by a signal drops the reading it interrupted, then reports.
+        if run.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let sample = run.status(iteration);
+        let remaining = plan.duration.saturating_sub(elapsed_since(start));
+        let segment = plan.segment.min(remaining).max(Duration::from_secs(1));
+        let stream = if remaining.is_zero() {
+            None
+        } else {
+            Some(run.stream(iteration, segment))
+        };
+        if run.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match sample {
             Ok(sample) => report.status(elapsed_since(start), sample),
             Err(_) => report.status_failed(),
         }
-        let remaining = plan.duration.saturating_sub(elapsed_since(start));
-        if remaining.is_zero() {
-            break;
-        }
-        let segment = plan.segment.min(remaining).max(Duration::from_secs(1));
-        match run.stream(iteration, segment) {
-            Ok(times) => report.segment(&times, plan.gap_ms),
-            Err(_) => report.segment_failed(),
+        match stream {
+            Some(Ok(segment)) => report.segment(&segment, plan.gap_ms),
+            Some(Err(_)) => report.segment_failed(),
+            None => break,
         }
         write_report(&report_path, &report.json(&plan, elapsed_since(start)))?;
         // A segment that fails fast (no camera yet) must not turn into a busy loop.
         let period_left = plan.segment.saturating_sub(elapsed_since(began));
-        std::thread::sleep(period_left.min(plan.duration.saturating_sub(elapsed_since(start))));
+        nap(
+            period_left.min(plan.duration.saturating_sub(elapsed_since(start))),
+            run.stop,
+        );
     }
     write_report(&report_path, &report.json(&plan, elapsed_since(start)))
 }
@@ -421,24 +590,36 @@ pub(in super::super) fn run(values: &[OsString]) -> Result<(), Error> {
         segment: Duration::from_secs(number(segment, MAX_SEGMENT_SECS)?),
         gap_ms: number(gap, MAX_GAP_MS)?,
     };
-    soak(
-        &Tools {
-            ffprobe: Path::new(ffprobe),
-            curl: Path::new(curl),
-        },
-        Path::new(cfg),
-        Path::new(output),
-        plan,
+    let stop = Arc::new(AtomicBool::new(false));
+    watch_signals(
+        current_thread_runtime,
+        SignalKind::interrupt(),
+        SignalKind::terminate(),
+        Arc::clone(&stop),
     )
+    .map_err(Error::from)
+    .and_then(|()| {
+        soak(
+            &Tools {
+                ffprobe: Path::new(ffprobe),
+                curl: Path::new(curl),
+            },
+            Path::new(cfg),
+            Path::new(output),
+            plan,
+            &stop,
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    const STATUS: &str = r#"{"camera":"ready","battery_percent":80,"power":"usb","uptime_secs":5,"frames_fetched":10,"frames_served":9,"frames_dropped":1,"reconnects":0,"session_restarts":0,"connect_misses":2,"snapshots_served":0,"snapshots_refused":0}"#;
+    const STATUS: &str = r#"{"camera":"ready","battery_percent":80,"power":"usb","uptime_secs":5,"frames_fetched":10,"frames_served":9,"frames_dropped":1,"reconnects":0,"session_restarts":0,"connect_misses":2,"snapshots_served":0,"snapshots_refused":0,"run_id":"00000000000000aa"}"#;
 
-    fn sample(uptime: u64, fetched: u64) -> Sample {
+    fn sample(run_id: &str, uptime: u64, fetched: u64) -> Sample {
         let mut counters = [0; 8];
         counters[0] = fetched;
         Sample {
@@ -446,7 +627,29 @@ mod tests {
             battery_percent: Some(80),
             power: Some("usb".into()),
             uptime_secs: uptime,
+            run_id: run_id.into(),
             counters,
+        }
+    }
+
+    fn stop(set: bool) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(set))
+    }
+
+    proptest! {
+        #[test]
+        fn tool_output_parsers_never_panic_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let text = String::from_utf8_lossy(&bytes);
+            let _ = parse_sample(&text);
+            let _ = parse_packets(&text);
+            let _ = micros(&text);
+        }
+
+        #[test]
+        fn decimal_text_never_panics_and_round_trips_whole_seconds(whole in 0_u64..1_000_000, frac in "[0-9]{0,9}") {
+            let text = format!("{whole}.{frac}");
+            let got = micros(&text).expect("digits parse");
+            prop_assert_eq!(got / 1_000_000, whole);
         }
     }
 
@@ -454,6 +657,7 @@ mod tests {
     fn status_documents_parse_and_every_missing_part_is_refused() {
         let ready = parse_sample(STATUS).expect("status");
         assert_eq!(ready.counters, [10, 9, 1, 0, 0, 2, 0, 0]);
+        assert_eq!(ready.run_id, "00000000000000aa");
         assert_eq!(
             (ready.ready, ready.battery_percent, ready.power.as_deref()),
             (true, Some(80), Some("usb"))
@@ -471,6 +675,10 @@ mod tests {
             STATUS.replace(r#""camera":"ready","#, ""),
             STATUS.replace("frames_dropped", "dropped"),
             STATUS.replace("uptime_secs", "up"),
+            STATUS.replace("run_id", "id"),
+            STATUS.replace("00000000000000aa", ""),
+            STATUS.replace("00000000000000aa", "not-hex"),
+            STATUS.replace("00000000000000aa", &"a".repeat(33)),
         ] {
             assert!(parse_sample(&broken).is_err(), "{broken}");
         }
@@ -522,18 +730,20 @@ mod tests {
     }
 
     #[test]
-    fn counter_totals_survive_a_process_restart() {
+    fn counter_totals_survive_a_restart_but_not_a_clock_step() {
         let mut report = Report::default();
         let at = Duration::from_secs;
-        report.status(at(0), sample(10, 100));
-        report.status(at(60), sample(70, 160));
-        // Restart: uptime went backwards and the counter reset.
-        report.status(at(120), sample(5, 7));
-        // A counter reset alone is a restart as well, even if the uptime kept growing.
-        report.status(at(180), sample(65, 3));
-        report.status(at(240), sample(125, 13));
+        report.status(at(0), sample("a1", 10, 100));
+        report.status(at(60), sample("a1", 70, 160));
+        // A new run identifier is a restart, whatever the counters and the uptime say.
+        report.status(at(120), sample("b2", 5, 7));
+        // The same run with a smaller uptime is a clock step on the host, not a restart, and a
+        // counter never goes negative.
+        report.status(at(180), sample("b2", 1, 7));
+        // A restart whose counters and uptime are higher than before is still seen.
+        report.status(at(240), sample("c3", 9_000, 50_000));
         assert_eq!(report.process_restarts, 2);
-        assert_eq!(report.totals[0], 100 + 60 + 7 + 3 + 10);
+        assert_eq!(report.totals[0], 100 + 60 + 7 + 50_000);
         assert_eq!(report.samples, 5);
         assert_eq!(report.ready_samples, 5);
         report.status_failed();
@@ -544,7 +754,7 @@ mod tests {
     fn the_battery_trajectory_records_changes_only_and_is_bounded() {
         let mut report = Report::default();
         let at = Duration::from_secs;
-        let mut level = sample(1, 0);
+        let mut level = sample("a1", 1, 0);
         for (second, percent) in [(0, Some(90)), (60, Some(90)), (120, Some(89)), (180, None)] {
             level.battery_percent = percent;
             report.status(at(second), level.clone());
@@ -573,29 +783,66 @@ mod tests {
         assert!(report.battery_dropped > 0);
     }
 
+    fn segment(times: &[u64], started_us: u64, ended_us: u64, clean: bool) -> Segment {
+        Segment {
+            times: times.to_vec(),
+            started_us,
+            ended_us,
+            clean,
+        }
+    }
+
     #[test]
-    fn segments_count_packets_coverage_and_gaps_over_the_threshold() {
-        let mut report = Report::default();
-        // 0.0, 0.1, 0.2, then a 0.9 s pause, then 1.1
-        report.segment(&[0, 100_000, 200_000, 1_100_000, 1_200_000], 500);
-        report.segment(&[], 500);
-        report.segment_failed();
-        assert_eq!(report.segments, 3);
-        assert_eq!(report.segments_failed, 1);
-        assert_eq!(report.packets, 5);
-        assert_eq!(report.gaps, 1);
+    fn segments_count_gaps_between_packets_at_the_head_and_at_the_tail() {
         let plan = Plan {
             duration: Duration::from_secs(60),
             segment: Duration::from_secs(10),
             gap_ms: 500,
         };
+        // Healthy: first packet 0.1 s after the start, 0.1 s steps, ended 0.1 s after the last.
+        let mut report = Report::default();
+        report.segment(
+            &segment(&[100_000, 200_000, 300_000], 0, 400_000, true),
+            500,
+        );
+        assert_eq!((report.gaps, report.max_gap_us), (0, 0));
+        // A 0.9 s pause between packets.
+        report.segment(
+            &segment(
+                &[0, 100_000, 200_000, 1_100_000, 1_200_000],
+                0,
+                1_300_000,
+                true,
+            ),
+            500,
+        );
+        assert_eq!((report.gaps, report.max_gap_us), (1, 900_000));
+        // The stream froze mid-segment: the last packet is long before ffprobe gave up.
+        report.segment(&segment(&[100_000, 200_000], 0, 30_200_000, true), 500);
+        assert_eq!((report.gaps, report.max_gap_us), (2, 30_000_000));
+        // A slow start beyond the startup allowance is a gap; within it, it is not.
+        report.segment(&segment(&[4_900_000, 5_000_000], 0, 5_100_000, true), 500);
+        assert_eq!(report.gaps, 2);
+        report.segment(&segment(&[5_100_000, 5_200_000], 0, 5_300_000, true), 500);
+        assert_eq!(report.gaps, 3);
+        // A failed ffprobe keeps what it read, counts as failed, and its tail still counts.
+        report.segment(&segment(&[0, 100_000], 0, 2_000_000, false), 500);
+        assert_eq!(
+            (report.segments, report.segments_failed, report.gaps),
+            (6, 1, 4)
+        );
+        assert_eq!(report.packets, 3 + 5 + 2 + 2 + 2 + 2);
+        // No packets at all: nothing to measure.
+        report.segment(&segment(&[], 0, 1, true), 500);
+        report.segment_failed();
+        assert_eq!((report.segments, report.segments_failed), (8, 2));
         let json = report.json(&plan, Duration::from_secs(61));
-        assert_eq!(json["stream"]["max_gap_ms"], 900);
-        assert_eq!(json["stream"]["covered_secs"], 1);
-        assert_eq!(json["stream"]["gaps_over_threshold"], 1);
+        assert_eq!(json["stream"]["max_gap_ms"], 30_000);
+        assert_eq!(json["stream"]["gaps_over_threshold"], 4);
         assert_eq!(json["status"]["last_uptime_secs"], Value::Null);
         assert_eq!(json["elapsed_secs"], 61);
         assert_eq!(json["gap_threshold_ms"], 500);
+        assert!(json["stream"]["covered_secs"].as_u64().is_some());
     }
 
     #[test]
@@ -651,11 +898,16 @@ mod tests {
             .expect("json")
     }
 
+    fn copy_as(program: &Path, dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::copy(program, &path).expect("copy fixture");
+        path
+    }
+
     #[test]
     fn a_short_run_samples_status_and_stream_and_leaves_no_credentials_behind() {
         let (temp, program, cfg) = super::super::tests::fixture();
-        let curl = temp.path().join("status-curl");
-        fs::copy(&program, &curl).expect("copy");
+        let curl = copy_as(&program, temp.path(), "status-curl");
         let output = temp.path().join("soak");
         soak(
             &Tools {
@@ -665,6 +917,7 @@ mod tests {
             &cfg,
             &output,
             plan(2),
+            &stop(false),
         )
         .expect("soak");
         let json = report(&output);
@@ -678,20 +931,18 @@ mod tests {
             1
         );
         assert_eq!(json["battery"]["points"][0]["power"], "usb");
-        // The fixture's stream has packets at 0 s and 1 s: one gap over 500 ms.
-        assert!(
-            json["stream"]["gaps_over_threshold"]
-                .as_u64()
-                .expect("gaps")
-                >= 1
-        );
-        assert_eq!(json["stream"]["segments_failed"], 0);
+        // The fixture's packets are 0.9 s apart, then the run ends at once: one gap per segment.
+        let stream = &json["stream"];
+        assert!(stream["gaps_over_threshold"].as_u64().expect("gaps") >= 1);
+        assert!(stream["max_gap_ms"].as_u64().expect("max") >= 900);
+        assert!(stream["max_gap_ms"].as_u64().expect("max") < 5_000);
+        assert_eq!(stream["segments_failed"], 0);
         assert!(!output.join("clients").exists());
+        assert!(!output.join("report.json.tmp").exists());
         let text = fs::read_to_string(output.join("report.json")).expect("text");
         let secret = tethercam::config::Config::load(&cfg).expect("cfg");
         assert!(!text.contains(secret.credentials.password.expose()));
         assert!(!text.contains(&secret.endpoint_uuid.to_string()));
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(output.join("report.json")).expect("meta");
@@ -700,10 +951,56 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_went_silent_before_the_segment_ended_is_a_tail_gap() {
+        let (temp, program, cfg) = super::super::tests::fixture();
+        let curl = copy_as(&program, temp.path(), "status-curl");
+        // The fixture reports packets 3.0 s and 2.9 s before it exits: silence at the end.
+        let silent = copy_as(&program, temp.path(), "tail-probe");
+        let output = temp.path().join("tail");
+        soak(
+            &Tools {
+                ffprobe: &silent,
+                curl: &curl,
+            },
+            &cfg,
+            &output,
+            plan(1),
+            &stop(false),
+        )
+        .expect("soak");
+        let stream = &report(&output)["stream"];
+        assert!(stream["gaps_over_threshold"].as_u64().expect("gaps") >= 1);
+        assert!(stream["max_gap_ms"].as_u64().expect("max") >= 2_900);
+        assert_eq!(stream["segments_failed"], 0);
+    }
+
+    #[test]
+    fn a_failed_ffprobe_keeps_the_packets_it_read() {
+        let (temp, program, cfg) = super::super::tests::fixture();
+        let curl = copy_as(&program, temp.path(), "status-curl");
+        let partial = copy_as(&program, temp.path(), "partial-tail-probe");
+        let output = temp.path().join("partial");
+        soak(
+            &Tools {
+                ffprobe: &partial,
+                curl: &curl,
+            },
+            &cfg,
+            &output,
+            plan(1),
+            &stop(false),
+        )
+        .expect("soak");
+        let stream = &report(&output)["stream"];
+        assert_eq!(stream["segments_failed"], stream["segments"]);
+        assert!(stream["packets"].as_u64().expect("packets") >= 2);
+        assert!(stream["gaps_over_threshold"].as_u64().expect("gaps") >= 1);
+    }
+
+    #[test]
     fn failing_clients_are_counted_not_fatal() {
         let (temp, program, cfg) = super::super::tests::fixture();
-        let bad_status = temp.path().join("bad200");
-        fs::copy(&program, &bad_status).expect("copy");
+        let bad_status = copy_as(&program, temp.path(), "bad200");
         for (name, curl, ffprobe, stream_fails) in [
             (
                 "refused",
@@ -725,7 +1022,14 @@ mod tests {
             ),
         ] {
             let output = temp.path().join(name);
-            soak(&Tools { ffprobe, curl }, &cfg, &output, plan(1)).expect(name);
+            soak(
+                &Tools { ffprobe, curl },
+                &cfg,
+                &output,
+                plan(1),
+                &stop(false),
+            )
+            .expect(name);
             let json = report(&output);
             assert_eq!(json["status"]["samples"], 0, "{name}");
             assert!(json["status"]["failures"].as_u64().expect("failures") >= 1);
@@ -753,25 +1057,28 @@ mod tests {
             ffprobe: Path::new("ffprobe"),
             curl: &program,
         };
-        assert!(soak(&relative, &cfg, &temp.path().join("a"), plan(1)).is_err());
+        let never = stop(false);
+        assert!(soak(&relative, &cfg, &temp.path().join("a"), plan(1), &never).is_err());
         assert!(
             soak(
                 &tools,
                 Path::new("config.toml"),
                 &temp.path().join("b"),
-                plan(1)
+                plan(1),
+                &never
             )
             .is_err()
         );
-        assert!(soak(&tools, &cfg, Path::new("out"), plan(1)).is_err());
+        assert!(soak(&tools, &cfg, Path::new("out"), plan(1), &never).is_err());
         // Existing output, missing config: never overwritten, never half-started.
-        assert!(soak(&tools, &cfg, temp.path(), plan(1)).is_err());
+        assert!(soak(&tools, &cfg, temp.path(), plan(1), &never).is_err());
         assert!(
             soak(
                 &tools,
                 &temp.path().join("missing.toml"),
                 &temp.path().join("c"),
-                plan(1)
+                plan(1),
+                &never
             )
             .is_err()
         );
@@ -785,12 +1092,170 @@ mod tests {
             curl: Path::new("/usr/bin/false"),
         };
         let missing = temp.path().join("missing");
+        let never = stop(false);
         let run = Run {
             tools: &tools,
             client_dir: &missing,
             base: "http://127.0.0.1:1",
             output: &missing,
+            stop: &never,
         };
         assert!(sample_until_done(&run, plan(2)).is_err());
+    }
+
+    #[test]
+    fn a_report_is_replaced_atomically_even_past_a_stale_temporary_file() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("report.json");
+        fs::write(path.with_extension("json.tmp"), "stale").expect("stale");
+        write_report(&path, &json!({"n": 1})).expect("first");
+        write_report(&path, &json!({"n": 2})).expect("second");
+        assert_eq!(report(temp.path())["n"], 2);
+        assert!(!path.with_extension("json.tmp").exists());
+        // A directory where the report belongs makes the rename fail, and the old name stays.
+        let blocked = temp.path().join("dir.json");
+        fs::create_dir(&blocked).expect("dir");
+        assert!(write_report(&blocked, &json!({})).is_err());
+        assert!(blocked.is_dir());
+    }
+
+    #[test]
+    fn a_signal_before_the_first_check_ends_the_run_with_a_report_and_no_credentials() {
+        let (temp, program, cfg) = super::super::tests::fixture();
+        let output = temp.path().join("preset");
+        soak(
+            &Tools {
+                ffprobe: &program,
+                curl: &program,
+            },
+            &cfg,
+            &output,
+            plan(5),
+            &stop(true),
+        )
+        .expect("soak");
+        assert_eq!(report(&output)["status"]["samples"], 0);
+        assert!(!output.join("clients").exists());
+    }
+
+    #[test]
+    fn a_signal_during_a_segment_kills_and_reaps_ffprobe_and_still_reports() {
+        let (temp, program, cfg) = super::super::tests::fixture();
+        let curl = copy_as(&program, temp.path(), "status-curl");
+        // This fixture sleeps for 30 s instead of printing packets.
+        let hang = copy_as(&program, temp.path(), "hang-probe");
+        let output = temp.path().join("interrupted");
+        let flag = stop(false);
+        let setter = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let began = Instant::now();
+        soak(
+            &Tools {
+                ffprobe: &hang,
+                curl: &curl,
+            },
+            &cfg,
+            &output,
+            plan(120),
+            &flag,
+        )
+        .expect("soak");
+        assert!(began.elapsed() < Duration::from_secs(20));
+        let json = report(&output);
+        assert_eq!(
+            json["status"]["samples"], 0,
+            "the interrupted iteration is dropped"
+        );
+        assert!(!output.join("clients").exists());
+    }
+
+    #[test]
+    fn client_inputs_are_removed_on_every_exit_including_a_panic() {
+        let temp = tempfile::tempdir().expect("temp");
+        let make = |name: &str| {
+            let path = temp.path().join(name);
+            fs::create_dir(&path).expect("dir");
+            fs::write(path.join("secret"), "x").expect("file");
+            path
+        };
+        let explicit = make("explicit");
+        let mut guard = ClientDir::new(explicit.clone());
+        guard.remove().expect("remove");
+        assert!(!explicit.exists());
+        fs::create_dir(&explicit).expect("recreated by someone else");
+        drop(guard);
+        assert!(
+            explicit.exists(),
+            "an explicit removal is not repeated on drop"
+        );
+        let dropped = make("dropped");
+        drop(ClientDir::new(dropped.clone()));
+        assert!(!dropped.exists());
+        let panicked = make("panicked");
+        let path = panicked.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = ClientDir::new(path);
+            panic!("synthetic failure");
+        });
+        assert!(result.is_err());
+        assert!(!panicked.exists());
+    }
+
+    fn send(signal: &str) {
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("/bin/kill")
+            .args([signal, pid.as_str()])
+            .status()
+            .expect("kill");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn signals_set_the_stop_flag_and_registration_failures_are_reported() {
+        let flag = stop(false);
+        watch_signals(
+            current_thread_runtime,
+            SignalKind::user_defined1(),
+            SignalKind::user_defined2(),
+            Arc::clone(&flag),
+        )
+        .expect("installed");
+        assert!(!flag.load(Ordering::Relaxed));
+        send("-USR2");
+        // Up to ten seconds for the listener thread to see the signal.
+        let seen = (0..500).find(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            flag.load(Ordering::Relaxed)
+        });
+        assert!(seen.is_some());
+        assert!(flag.load(Ordering::Relaxed));
+        // SIGKILL cannot be handled: either slot failing is reported, not swallowed.
+        let forbidden = SignalKind::from_raw(9);
+        for (first, second) in [
+            (forbidden, SignalKind::user_defined1()),
+            (SignalKind::user_defined1(), forbidden),
+        ] {
+            let failed = watch_signals(current_thread_runtime, first, second, stop(false));
+            assert!(failed.is_err());
+        }
+        let no_runtime = watch_signals(
+            || Err(io::Error::other("synthetic")),
+            SignalKind::user_defined1(),
+            SignalKind::user_defined2(),
+            stop(false),
+        );
+        assert!(no_runtime.is_err());
+    }
+
+    #[test]
+    fn a_nap_ends_early_once_stopped() {
+        let began = Instant::now();
+        nap(Duration::from_secs(30), &stop(true));
+        nap(Duration::ZERO, &stop(false));
+        nap(Duration::from_millis(150), &stop(false));
+        assert!(began.elapsed() < Duration::from_secs(5));
     }
 }

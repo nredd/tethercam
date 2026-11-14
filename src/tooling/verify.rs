@@ -13,6 +13,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 pub(super) use timed::serve;
 
@@ -22,6 +24,8 @@ struct Owned {
     ops: Processes,
     requested: bool,
     termination: Termination,
+    /// Set by a signal handler: a wait ends at once and the drop reaps this exact child.
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 /// Only camera/server ownership may wait indefinitely for graceful session cleanup.
@@ -64,6 +68,7 @@ impl Owned {
             ops: Processes::default(),
             requested: false,
             termination: Termination::Client(Duration::from_secs(1)),
+            interrupt: None,
         }
     }
     fn joined(child: Child) -> Self {
@@ -92,6 +97,13 @@ impl Owned {
         loop {
             if let Some(status) = (self.ops.poll)(&mut self.child)? {
                 return Ok(status);
+            }
+            if self
+                .interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Err(Error::Invalid("interrupted"));
             }
             if Instant::now() >= deadline {
                 return Err(Error::Invalid("verification subprocess deadline exceeded"));
@@ -155,6 +167,14 @@ struct Tools<'a> {
 fn capture(
     program: &Path, args: &[OsString], output: &Path, budget: Duration,
 ) -> Result<(), Error> {
+    capture_until(program, args, output, budget, None)
+}
+
+/// [`capture`] that also ends, killing and reaping its own child, once `interrupt` is set.
+fn capture_until(
+    program: &Path, args: &[OsString], output: &Path, budget: Duration,
+    interrupt: Option<&Arc<AtomicBool>>,
+) -> Result<(), Error> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -171,6 +191,7 @@ fn capture(
             .stderr(Stdio::null())
             .spawn()?,
     );
+    child.interrupt = interrupt.cloned();
     child.wait(budget)
 }
 
