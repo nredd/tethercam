@@ -31,12 +31,12 @@
         "required_status_checks": [
           { "context": "fmt", "integration_id": 15368 },
           { "context": "clippy (ubuntu-latest)", "integration_id": 15368 },
-          { "context": "clippy (macos-latest)", "integration_id": 15368 },
+          { "context": "clippy (macos)", "integration_id": 15368 },
           { "context": "native-check (ubuntu-latest)", "integration_id": 15368 },
-          { "context": "native-check (macos-latest)", "integration_id": 15368 },
+          { "context": "native-check (macos)", "integration_id": 15368 },
           { "context": "test (ubuntu-latest)", "integration_id": 15368 },
           { "context": "test (ubuntu-24.04-arm)", "integration_id": 15368 },
-          { "context": "test (macos-latest)", "integration_id": 15368 },
+          { "context": "test (macos)", "integration_id": 15368 },
           { "context": "msrv", "integration_id": 15368 },
           { "context": "rustdoc", "integration_id": 15368 },
           { "context": "bench", "integration_id": 15368 },
@@ -44,7 +44,8 @@
           { "context": "check (armv7-unknown-linux-gnueabihf)", "integration_id": 15368 },
           { "context": "deny", "integration_id": 15368 },
           { "context": "coverage", "integration_id": 15368 },
-          { "context": "policy", "integration_id": 15368 }
+          { "context": "policy", "integration_id": 15368 },
+          { "context": "coverage-macos", "integration_id": 15368 }
         ]
       }
     }
