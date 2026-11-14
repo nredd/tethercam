@@ -54,14 +54,15 @@ pub(super) const QUARANTINE_EXIT: u8 = 75;
 /// Longest a run of consecutive busy answers may last before the native runtime is declared stuck
 /// and the process restarts.
 ///
-/// Busy is the honest answer while a retired command or a close still settles natively, and that
-/// is short: the retiring deadline has already passed, and the longest wait this process ever
-/// asks of the native side is the 60 s default `transaction_timeout`. Two of those, 120 s, leaves
-/// a settling cleanup ample room while still bounding a completion that never arrives (a camera
-/// hung or unplugged mid-command) to about two minutes of `waiting` before the exit-75 restart.
-/// It is a wall clock, not a retry count, because the supervisor's backoff (100 ms doubling to
-/// 5 s) decides how many attempts fit in it.
-const BUSY_LIMIT: Duration = Duration::from_secs(120);
+/// Busy is the honest answer while a retired command or a close still settles natively. The
+/// longest wait this process ever asks of the native side is the Sony driver's 300 s still
+/// download (`SonyConfig::download_timeout`); the 60 s `transaction_timeout` and the 30 s
+/// discovery wait are shorter. A command retired at its deadline can still be completing, so the
+/// native side gets as long again as that longest wait to settle: 300 s. A completion that never
+/// arrives (a camera hung or unplugged mid-command) then costs five minutes of `waiting` before
+/// the exit-75 restart. It is a wall clock, not a retry count, because the supervisor's backoff
+/// (100 ms doubling to 5 s) decides how many attempts fit in it.
+const BUSY_LIMIT: Duration = Duration::from_secs(300);
 
 /// Pause after the sole candidate refused the Sony handshake, in place of the 5 s backoff cap. A
 /// phone or other non-Sony device is a camera to `ImageCaptureCore`, and every reopen of it can
@@ -116,13 +117,14 @@ impl IccFactory {
         self.fatal.send_replace(true);
     }
 
-    /// Bound a run of busy answers: any other outcome ends the run, and one that outlasts
-    /// [`BUSY_LIMIT`] means a native completion is never coming. The runtime is then as
-    /// unresolvable as after a quarantine and takes the same orderly exit. Nothing is cancelled.
-    fn track_busy(&mut self, outcome: &Result<Option<IccCamera>, OpenError>) {
-        if !matches!(outcome, Err(OpenError::Busy)) {
+    /// Classify an unsuccessful connect: a run of busy answers is bounded, anything else ends it.
+    /// One that outlasts [`BUSY_LIMIT`] means a native completion is never coming. The runtime
+    /// is then as unresolvable as after a quarantine and takes the same orderly exit. Nothing is
+    /// cancelled.
+    fn classify(&mut self, error: OpenError) -> OpenError {
+        if error != OpenError::Busy {
             self.busy_since = None;
-            return;
+            return error;
         }
         let since = *self
             .busy_since
@@ -134,13 +136,38 @@ impl IccFactory {
             );
             self.quarantine();
         }
+        error
     }
 
-    /// One discovery and the choice of the sole camera.
-    async fn discover(&mut self) -> Result<Option<IccCamera>, OpenError> {
+    /// Put the handle back and translate a failed discovery.
+    fn rejected(
+        &mut self, handle: IccHandle, error: IccError,
+    ) -> Result<Option<IccCamera>, OpenError> {
+        self.handle = Some(handle);
+        if error == IccError::NotFound {
+            self.busy_since = None;
+            return Ok(None);
+        }
+        if error.effect() == Effect::Quarantine {
+            self.quarantine();
+        }
+        tracing::warn!(event = "icc_connect_failed", category = %error);
+        Err(self.classify(open_error(error)))
+    }
+}
+
+impl CameraFactory for IccFactory {
+    type Camera = IccCamera;
+    type Session = IccSession;
+
+    async fn connect(&mut self) -> Result<Option<IccCamera>, OpenError> {
+        // After a quarantine nothing more may be submitted, not even a discovery.
+        if *self.fatal.borrow() {
+            return Err(OpenError::Disconnected);
+        }
         // Absent only while an earlier camera was never released: native work may be pending.
         let Some(mut handle) = self.handle.take() else {
-            return Err(OpenError::Busy);
+            return Err(self.classify(OpenError::Busy));
         };
         let found = handle
             .discover(DISCOVERY_WINDOW, IccTimeout::default())
@@ -162,36 +189,6 @@ impl IccFactory {
         }
     }
 
-    /// Put the handle back and translate a failed discovery.
-    fn rejected(
-        &mut self, handle: IccHandle, error: IccError,
-    ) -> Result<Option<IccCamera>, OpenError> {
-        self.handle = Some(handle);
-        if error == IccError::NotFound {
-            return Ok(None);
-        }
-        if error.effect() == Effect::Quarantine {
-            self.quarantine();
-        }
-        tracing::warn!(event = "icc_connect_failed", category = %error);
-        Err(open_error(error))
-    }
-}
-
-impl CameraFactory for IccFactory {
-    type Camera = IccCamera;
-    type Session = IccSession;
-
-    async fn connect(&mut self) -> Result<Option<IccCamera>, OpenError> {
-        // After a quarantine nothing more may be submitted, not even a discovery.
-        if *self.fatal.borrow() {
-            return Err(OpenError::Disconnected);
-        }
-        let outcome = self.discover().await;
-        self.track_busy(&outcome);
-        outcome
-    }
-
     fn session(&self, camera: IccCamera, cfg: SessionConfig, clock: fn() -> Instant) -> IccSession {
         IccSession::new(camera.handle, camera.device, cfg, clock)
     }
@@ -207,13 +204,15 @@ impl CameraFactory for IccFactory {
     }
 
     fn release(&mut self, camera: IccCamera) {
+        // A camera was reached: whatever busy run came before it is over.
+        self.busy_since = None;
         if camera.quarantined {
             self.quarantine();
         }
         self.handle = Some(camera.handle);
     }
 
-    fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send {
+    fn pause(&self, delay: std::time::Duration) -> impl Future<Output = ()> + Send {
         tokio::time::sleep(delay)
     }
 

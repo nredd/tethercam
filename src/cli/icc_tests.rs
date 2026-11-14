@@ -212,10 +212,20 @@ fn a_run_of_busy_answers_past_the_limit_is_fatal_through_the_quarantine_flag() {
     );
     let text = logs.text();
     assert!(
-        text.contains(r#"event="icc_busy_limit_exceeded" limit_secs=120"#),
+        text.contains(r#"event="icc_busy_limit_exceeded" limit_secs=300"#),
         "{text}"
     );
     assert!(text.contains("icc_runtime_quarantined"), "{text}");
+}
+
+#[test]
+fn the_busy_limit_outlasts_every_wait_the_process_asks_of_the_native_side() {
+    // A retired command may still be completing: the longest wait gets as long again.
+    let sony = crate::sony::SonyConfig::default();
+    let session = SessionConfig::default();
+    assert!(BUSY_LIMIT >= sony.download_timeout);
+    assert!(BUSY_LIMIT >= session.transaction_timeout);
+    assert!(BUSY_LIMIT >= IccTimeout::default().wait());
 }
 
 #[test]
@@ -234,7 +244,7 @@ fn any_other_outcome_ends_a_run_of_busy_answers() {
             for _ in 0..6 {
                 let _ = attempt(&mut factory).await;
                 // Each step is 80% of the limit. Without the reset the fourth answer would
-                // already be 288 s into one run; with it only the sixth is past the limit.
+                // already be far past the limit in one run; with it only the sixth is past the limit.
                 tokio::time::advance(BUSY_LIMIT * 4 / 5).await;
                 flags.push(*fatal.borrow());
             }
@@ -430,7 +440,7 @@ fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_b
     // The retired command's completion never arrives, so every discovery is answered busy. The
     // supervisor's backoff keeps retrying until the bound turns it into the orderly exit.
     let logs = LogCapture::new();
-    let (fake, shared) = scripted(|s| s.discover.extend((0..500).map(|_| Err(IccError::Busy))));
+    let (fake, shared) = scripted(|s| s.discover.extend((0..1000).map(|_| Err(IccError::Busy))));
     let dispatch = logs.dispatch();
     let cfg = free_cfg();
     let mut out = Vec::new();
@@ -447,9 +457,9 @@ fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_b
     })
     .unwrap();
     assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
-    // 100 ms doubling to the 5 s cap reaches 120 s on about the 30th attempt.
+    // 100 ms doubling to the 5 s cap reaches 300 s on about the 66th attempt.
     let attempts = script(&shared).calls.len();
-    assert!((25..=35).contains(&attempts), "{attempts}");
+    assert!((60..=70).contains(&attempts), "{attempts}");
     assert!(logs.text().contains("icc_busy_limit_exceeded"));
 }
 

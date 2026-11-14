@@ -118,14 +118,15 @@ target/release/tethercam run --config ./camera.toml
   reports busy (with backoff) until native cleanup settles. That wait is bounded: a native command
   can outlive its caller deadline forever if the framework never completes it (a camera hung or
   unplugged mid-command), and discovery would then be answered busy indefinitely, with no quarantine
-  and no restart. Busy answers in an unbroken run for 120 s are treated like a quarantine: the factory
+  and no restart. Busy answers in an unbroken run for 300 s are treated like a quarantine: the factory
   logs `icc_busy_limit_exceeded`, refuses further native work and the same orderly exit with status 75
-  follows. Nothing is cancelled, killed or bypassed. 120 s is twice the 60 s default
-  `transaction_timeout`, the longest single wait this process asks of the native side, and four times
-  the 30 s default wait of a discovery. The retiring deadline has already passed when the run starts,
-  so a native completion that is merely late settles well inside it. It is a wall clock, not a retry
-  count, because the supervisor's backoff (100 ms doubling to 5 s) decides how many attempts fit. Any
-  non-busy outcome ends the run: found, not found, a refusal or any other error. Not validated on
+  follows. Nothing is cancelled, killed or bypassed. 300 s is the longest wait this process asks of
+  the native side, the Sony driver's 300 s still download (the 60 s default `transaction_timeout` and
+  the 30 s default discovery wait are shorter): a command retired at its deadline gets as long again to
+  settle, so a slow but progressing cleanup is not restarted, and a completion that never arrives
+  costs five minutes of `waiting`. It is a wall clock, not a retry count, because the supervisor's
+  backoff (100 ms doubling to 5 s) decides how many attempts fit. Any non-busy outcome ends the run:
+  found, not found, a refusal or any other error. Not validated on
   hardware: whether `ImageCaptureCore` really withholds a completion after a removal
 - Quarantine is terminal for the process. A camera removal (a pulled cable, power loss), a failed close or
   a lost owner quarantines the runtime for the life of the process: the native layer can never be reused

@@ -148,7 +148,7 @@ in the service's config file is all that changes: the agent's main thread runs t
 run loop and the application runs joined beside it ([macOS camera](macos-camera.md)). A camera removal
 quarantines the native runtime for the rest of the process. The process then shuts down in order and exits
 with status 75, and `KeepAlive` restarts it after the throttle. So does a native command that never
-completes: if every discovery is answered busy for 120 s, the service restarts the same way
+completes: if every discovery is answered busy for 300 s, the service restarts the same way
 (`icc_busy_limit_exceeded` in the log) instead of sitting at `waiting` until killed by hand. Under `icc` a stop waits for the native
 join, which can wait forever if the framework never calls back; `ExitTimeOut` 0 keeps launchd from
 sending `SIGKILL`. LaunchAgent execution, camera consent and signing, and screen lock are not validated
