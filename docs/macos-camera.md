@@ -48,7 +48,10 @@ Session semantics, all following from "ICC owns the pipes":
   the owner may still complete it, so `close` (not a second `open`) confirms closure if a lease exists. If none does, nothing was confirmed: `close` reports `IccError::NotOpen` and the session is retired. `close` on a retired session is `NotOpen` too (terminal; a retry cannot help), and only `open` probes for reuse, which stays `Busy` until native cleanup settles. A late open success is closed natively after it completes.
 - Failure categories are sanitized statics: permission, busy, removal, admission, deadline, malformed
   completion, event overflow, malformed event, cleanup failure, quarantine
-- Failures fault, retire or quarantine the session. A faulted session refuses transactions but `close`
+- Failures fault, retire or quarantine the session. A confirming close that fails while `open` is
+  discarding an access restriction follows the same mapping as `close`: a native failure of the close
+  is `native cleanup failed` and quarantines the session, and a close that submitted nothing (busy,
+  admission expired) retires it. A faulted session refuses transactions but `close`
   still confirms closure. A quarantined session (native quarantine, removal, close failure, owner gone)
   accepts nothing and never reopens
 - Events are advisory and bounded by the boundary (64), and the boundary has ONE process-wide queue.
@@ -81,14 +84,23 @@ target/release/tethercam run --config ./camera.toml
 
 - Needs macOS, a build with `macos-icc` (Rust 1.99 or newer) and the process's one native runtime.
   Anywhere else `probe`, `doctor` and `run` fail at once with `camera_backend `icc` is unavailable`,
-  before any camera access, listener or enumeration. `--simulate` bypasses the backend entirely and
+  before any camera access, listener or enumeration. If the native runtime fails *after* the
+  application started (e.g. its worker panicked), the error is `camera_backend `icc` failed after it
+  started` instead, so a platform or build is not blamed for a run that happened. `--simulate` bypasses the backend entirely and
   never starts native code. `setup` and `service` never read the backend
 - Selection: see [Listing and selecting cameras](#listing-and-selecting-cameras). With `camera_id` unset,
   discovery must return exactly one camera, and that camera is used. Zero cameras waits like USB does;
   several are refused (a warning with the count only, and an error that names `tethercam cameras`), never
-  "the first". `camera_serial` is a raw-USB identity, so it is rejected with `icc` instead of ignored. Any
-  other device ICC lists as a camera (e.g. a phone, not verified) counts as another candidate: select the
-  camera with `camera_id`, or disconnect the other device
+  "the first". `camera_serial` is a raw-USB identity, so it is rejected with `icc` instead of ignored.
+  Any other device ICC lists as a camera (e.g. a phone on a charging cable, not verified) counts as a
+  candidate. With the Sony body also attached that is two candidates, refused as ambiguous: select the
+  camera with `camera_id`, or disconnect the other device. Alone it is the sole candidate and is opened,
+  then refused at the Sony handshake (`camera does not advertise the Sony SDIO extension`), which can
+  raise a trust or access prompt on that device. A refused handshake is retried every 60 s, not every
+  backoff cycle (5 s cap), so such a device is reopened at most once a minute for as long as it stays
+  attached. A Sony body outside PC Remote mode is refused the same way and is picked up within a minute
+  of switching mode. With `camera_id` set to the camera, a phone is never opened at all, so none of this
+  applies to it
 - Threading: `ImageCaptureCore` needs the main thread's run loop and one native runtime per process. The
   main thread therefore runs `transport::icc::run` and the whole existing application (camera
   supervisor, RTSP, ONVIF, discovery, signal handling, graceful shutdown) runs as that function's
@@ -105,7 +117,19 @@ target/release/tethercam run --config ./camera.toml
   join waits forever (below)
 - Reconnect: the supervisor's reconnect loop creates new sessions on the same runtime. After a confirmed
   close the next session reopens on it. A caller deadline retires the session, and the next attempt
-  reports busy (with backoff) until native cleanup settles
+  reports busy (with backoff) until native cleanup settles. That wait is bounded: a native command
+  can outlive its caller deadline forever if the framework never completes it (a camera hung or
+  unplugged mid-command), and discovery would then be answered busy indefinitely, with no quarantine
+  and no restart. Busy answers in an unbroken run for 300 s are treated like a quarantine: the factory
+  logs `icc_busy_limit_exceeded`, refuses further native work and the same orderly exit with status 75
+  follows. Nothing is cancelled, killed or bypassed. 300 s is the longest wait this process asks of
+  the native side, the Sony driver's 300 s still download (the 60 s default `transaction_timeout` and
+  the 30 s default discovery wait are shorter): a command retired at its deadline gets as long again to
+  settle, so a slow but progressing cleanup is not restarted, and a completion that never arrives
+  costs five minutes of `waiting`. It is a wall clock, not a retry count, because the supervisor's
+  backoff (100 ms doubling to 5 s) decides how many attempts fit. Any non-busy outcome ends the run:
+  found, not found, a refusal or any other error. Not validated on
+  hardware: whether `ImageCaptureCore` really withholds a completion after a removal
 - Quarantine is terminal for the process. A camera removal (a pulled cable, power loss), a failed close or
   a lost owner quarantines the runtime for the life of the process: the native layer can never be reused
   and its run loop can then never return. The factory refuses further native work, the application shuts

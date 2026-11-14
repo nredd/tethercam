@@ -278,3 +278,47 @@ fn the_cameras_command_runs_through_the_worker_on_the_same_boundary() {
     // Identifiers are for the user's terminal only.
     assert!(!logs.text().contains("synthetic-sony"), "{}", logs.text());
 }
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn an_absent_selected_camera_is_not_found_so_it_ends_a_busy_run_and_never_opens_a_phone() {
+    // Busy, the selected camera absent (a phone is attached), busy: with each step 80% of the
+    // limit a run that carried over the absence would be fatal at the third answer.
+    let (fake, shared) = Fake::new();
+    {
+        let mut script = script(&shared);
+        script.discover.push_back(Err(IccError::Busy));
+        script
+            .discover
+            .push_back(Ok(vec![device("synthetic-phone")]));
+        script.discover.push_back(Err(IccError::Busy));
+    }
+    let (results, fatal) = run_with(fake, |handle| {
+        paused_runtime().block_on(async {
+            let (mut factory, fatal) = IccFactory::new(handle, exact("synthetic-selected"));
+            let step = BUSY_LIMIT * 4 / 5;
+            let mut results = Vec::new();
+            for _ in 0..3 {
+                results.push(factory.connect().await.map(|found| found.is_some()));
+                tokio::time::advance(step).await;
+            }
+            (results, *fatal.borrow())
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        results,
+        [Err(OpenError::Busy), Ok(false), Err(OpenError::Busy)]
+    );
+    assert!(!fatal);
+    // The phone was only ever discovered, never opened, so it cannot be refused or paced.
+    assert_eq!(script(&shared).opened, Vec::new());
+    assert!(!script(&shared).calls.contains(&Call::Open));
+}

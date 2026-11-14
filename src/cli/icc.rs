@@ -17,7 +17,8 @@
 //!
 //! Reconnect: the supervisor's loop reuses the one runtime. After a confirmed close the next
 //! session reopens on it. A deadline retires the session and the next attempt reports busy until
-//! native cleanup settles. A *quarantine* (camera removed, failed close, owner gone) is terminal
+//! native cleanup settles; busy for [`BUSY_LIMIT`] without a break means the completion is never
+//! coming and counts as a quarantine. A *quarantine* (camera removed, failed close, owner gone) is terminal
 //! for the process: the native run loop can then never return, so after the application has shut
 //! down in order the process exits with [`QUARANTINE_EXIT`] and the service manager restarts it.
 //! That is the one deliberate departure from joined shutdown; it is taken only when the native
@@ -30,7 +31,9 @@
 use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tracing::Dispatch;
@@ -53,6 +56,25 @@ mod tests;
 
 /// Exit status after a quarantine (`EX_TEMPFAIL`): the process cannot recover, a restart can.
 pub(super) const QUARANTINE_EXIT: u8 = 75;
+
+/// Longest a run of consecutive busy answers may last before the native runtime is declared stuck
+/// and the process restarts.
+///
+/// Busy is the honest answer while a retired command or a close still settles natively. The
+/// longest wait this process ever asks of the native side is the Sony driver's 300 s still
+/// download (`SonyConfig::download_timeout`); the 60 s `transaction_timeout` and the 30 s
+/// discovery wait are shorter. A command retired at its deadline can still be completing, so the
+/// native side gets as long again as that longest wait to settle: 300 s. A completion that never
+/// arrives (a camera hung or unplugged mid-command) then costs five minutes of `waiting` before
+/// the exit-75 restart. It is a wall clock, not a retry count, because the supervisor's backoff
+/// (100 ms doubling to 5 s) decides how many attempts fit in it.
+const BUSY_LIMIT: Duration = Duration::from_secs(300);
+
+/// Pause after the sole candidate refused the Sony handshake, in place of the 5 s backoff cap. A
+/// phone or other non-Sony device is a camera to `ImageCaptureCore`, and every reopen of it can
+/// raise a trust prompt on that device; a Sony body outside PC Remote mode is retried at the
+/// same slower pace, so after switching mode the service picks the camera up within this time.
+const REFUSAL_DELAY: Duration = Duration::from_secs(60);
 
 /// What a discovery failure means to the supervisor, as a category safe to log.
 pub(super) fn open_error(error: IccError) -> OpenError {
@@ -96,6 +118,8 @@ pub(super) struct IccFactory {
     handle: Option<IccHandle>,
     selector: Selector,
     fatal: watch::Sender<bool>,
+    /// When the current run of consecutive busy answers began, see [`BUSY_LIMIT`].
+    busy_since: Option<tokio::time::Instant>,
 }
 
 impl IccFactory {
@@ -107,6 +131,7 @@ impl IccFactory {
                 handle: Some(handle),
                 selector,
                 fatal,
+                busy_since: None,
             },
             quarantined,
         )
@@ -117,19 +142,42 @@ impl IccFactory {
         self.fatal.send_replace(true);
     }
 
+    /// Classify an unsuccessful connect: a run of busy answers is bounded, anything else ends it.
+    /// One that outlasts [`BUSY_LIMIT`] means a native completion is never coming. The runtime
+    /// is then as unresolvable as after a quarantine and takes the same orderly exit. Nothing is
+    /// cancelled.
+    fn classify(&mut self, error: OpenError) -> OpenError {
+        if error != OpenError::Busy {
+            self.busy_since = None;
+            return error;
+        }
+        let since = *self
+            .busy_since
+            .get_or_insert_with(tokio::time::Instant::now);
+        if since.elapsed() >= BUSY_LIMIT {
+            tracing::error!(
+                event = "icc_busy_limit_exceeded",
+                limit_secs = BUSY_LIMIT.as_secs()
+            );
+            self.quarantine();
+        }
+        error
+    }
+
     /// Put the handle back and translate a failed discovery.
     fn rejected(
         &mut self, handle: IccHandle, error: IccError,
     ) -> Result<Option<IccCamera>, OpenError> {
         self.handle = Some(handle);
         if error == IccError::NotFound {
+            self.busy_since = None;
             return Ok(None);
         }
         if error.effect() == Effect::Quarantine {
             self.quarantine();
         }
         tracing::warn!(event = "icc_connect_failed", category = %error);
-        Err(open_error(error))
+        Err(self.classify(open_error(error)))
     }
 }
 
@@ -144,7 +192,7 @@ impl CameraFactory for IccFactory {
         }
         // Absent only while an earlier camera was never released: native work may be pending.
         let Some(mut handle) = self.handle.take() else {
-            return Err(OpenError::Busy);
+            return Err(self.classify(OpenError::Busy));
         };
         let found = handle
             .discover(DISCOVERY_WINDOW, IccTimeout::default())
@@ -181,6 +229,8 @@ impl CameraFactory for IccFactory {
     }
 
     fn release(&mut self, camera: IccCamera) {
+        // A camera was reached: whatever busy run came before it is over.
+        self.busy_since = None;
         if camera.quarantined {
             self.quarantine();
         }
@@ -189,6 +239,10 @@ impl CameraFactory for IccFactory {
 
     fn pause(&self, delay: std::time::Duration) -> impl Future<Output = ()> + Send {
         tokio::time::sleep(delay)
+    }
+
+    fn refusal_delay(&self) -> Option<Duration> {
+        Some(REFUSAL_DELAY)
     }
 }
 
@@ -264,7 +318,12 @@ fn launch_with<W: Write + Send + 'static>(
         cfg: cfg.clone(),
         dispatch: dispatch.clone(),
     };
+    // Set once the application is about to run: a later failure of the native runtime is then not
+    // "never started", which would send the operator looking at the platform and the build.
+    let started = Arc::new(AtomicBool::new(false));
+    let ran = Arc::clone(&started);
     let entry: Entry = Box::new(move |handle| {
+        ran.store(true, Ordering::Release);
         let result = worker(handle, &plan, &mut out);
         if let Err(error @ Error::Quarantined) = &result {
             // Best effort: the process is about to end and there is nowhere left to report to.
@@ -274,7 +333,13 @@ fn launch_with<W: Write + Send + 'static>(
         }
         result
     });
-    run(entry).map_err(|_| Error::IccUnavailable)?
+    run(entry).map_err(|_| {
+        if started.load(Ordering::Acquire) {
+            Error::IccFailed
+        } else {
+            Error::IccUnavailable
+        }
+    })?
 }
 
 fn terminate(code: u8) {

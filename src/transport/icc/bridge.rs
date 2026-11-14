@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use super::boundary::EVENT_QUEUE;
-use super::{Boundary, IccDeviceId, IccError, IccReply, IccTimeout, Lease};
+use super::{Boundary, Effect, IccDeviceId, IccError, IccReply, IccTimeout, Lease};
 
 type Reply<T> = oneshot::Sender<Result<T, IccError>>;
 
@@ -195,6 +195,18 @@ fn lease_failure(error: IccError) -> IccError {
     }
 }
 
+/// Why a confirming close failed, for a caller that cannot retry it. The lease is gone either
+/// way: a failure that left the lease unconfirmed is a cleanup failure (quarantine, as in
+/// `IccSession::close`), and one that submitted nothing is a retired lease, never a session that
+/// looks reusable.
+fn close_failure(error: IccError) -> IccError {
+    match lease_failure(error) {
+        IccError::Busy | IccError::AdmissionExpired | IccError::InvalidInput => IccError::NotOpen,
+        failure if failure.effect() == Effect::Fault => IccError::CleanupFailure,
+        failure => failure,
+    }
+}
+
 /// Serve requests while a lease is held. Returns whether the owner should keep serving.
 fn hold<L: Lease>(mut lease: L, inbox: &Inbox) -> bool {
     loop {
@@ -284,8 +296,8 @@ fn serve<B: Boundary>(boundary: &mut B, inbox: Inbox) {
                     if discard_stale(&mut lease) {
                         // Nothing may be submitted under a restriction. Give the lease back
                         // with a confirmed close and report the category; a failed close is
-                        // the worse news and wins.
-                        let closed = lease.close(timeout);
+                        // the worse news and wins, as the category `close` reports.
+                        let closed = lease.close(timeout).map_err(close_failure);
                         inbox.answer(reply, Err(closed.err().unwrap_or(IccError::Permission)));
                         continue;
                     }

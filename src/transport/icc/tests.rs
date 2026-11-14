@@ -1197,6 +1197,60 @@ fn a_failed_close_under_a_restriction_reports_the_worse_failure() {
     assert!(calls.contains(&Call::Close));
 }
 
+/// Open under an unlifted restriction with a failing confirming close; report the open result
+/// and whether the session ended quarantined.
+fn restricted_open_with_close(close: IccError) -> (Result<(), SessionError>, bool, bool) {
+    let (out, _) = run(
+        |s| {
+            s.events.push_back(Ok(Some(vec![10])));
+            s.close.push_back(Err(close));
+        },
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                let opened = s.open().await;
+                (opened, s.is_quarantined(), s.is_open())
+            })
+        },
+    );
+    out
+}
+
+#[test]
+fn a_failed_confirming_close_under_a_restriction_is_a_cleanup_failure_and_quarantines() {
+    // The same mapping as `close_failed`: a native failure of the close is not a plain
+    // `NativeFailure` on an open that left the session reusable.
+    for failure in [
+        IccError::NativeFailure,
+        IccError::MalformedCompletion,
+        IccError::LimitExceeded,
+    ] {
+        assert_eq!(
+            restricted_open_with_close(failure),
+            (Err(icc(IccError::CleanupFailure)), true, false),
+            "{failure:?}"
+        );
+    }
+    // Already-quarantining categories keep their own name.
+    assert_eq!(
+        restricted_open_with_close(IccError::Removed),
+        (Err(icc(IccError::Removed)), true, false)
+    );
+    // A close that submitted nothing (busy: the native owner is closing already) leaves the
+    // lease retired, not reusable and not quarantined, like a busy close on a held lease.
+    for nothing_submitted in [
+        IccError::Busy,
+        IccError::AdmissionExpired,
+        IccError::InvalidInput,
+    ] {
+        assert_eq!(
+            restricted_open_with_close(nothing_submitted),
+            (Err(icc(IccError::NotOpen)), false, false),
+            "{nothing_submitted:?}"
+        );
+    }
+}
+
 #[test]
 fn a_restricted_open_leaves_the_session_closed_so_a_later_open_can_succeed() {
     let (out, _) = run(
