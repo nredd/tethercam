@@ -11,7 +11,7 @@
 //!
 //! Selection: `camera_id` names one device exactly. The others attached are ignored and never
 //! opened, and an absent one waits, never falling back. Without it the one camera discovery
-//! returns is used, zero wait and several are refused (a count, naming `tethercam cameras`).
+//! returns is used: zero waits and several are refused (a count, naming `tethercam cameras`).
 //! Never the first of several, and never logged. `camera_serial` is a raw-USB identity and is
 //! rejected rather than ignored (`config`); identifiers are printed only by `cameras`.
 //!

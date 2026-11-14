@@ -165,6 +165,14 @@ fn a_key_listed_twice_is_ambiguous_not_a_free_choice() {
 }
 
 #[test]
+fn the_configuration_bound_is_the_boundary_bound() {
+    assert_eq!(
+        config::MAX_CAMERA_ID_BYTES,
+        crate::transport::icc::MAX_ID_BYTES
+    );
+}
+
+#[test]
 fn the_selector_follows_the_configuration_and_never_echoes_the_key() {
     let mut cfg = Config::generate().unwrap();
     assert_eq!(selector(&cfg).unwrap(), Selector::SoleCandidate);

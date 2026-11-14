@@ -170,8 +170,10 @@ pub struct Config {
     pub credentials: Credentials,
 }
 
-/// Longest `camera_id` in UTF-8 bytes, the framework identifier bound (`MAX_ID_BYTES`).
-const MAX_CAMERA_ID_BYTES: usize = 1024;
+/// Longest `camera_id` in UTF-8 bytes, the framework identifier bound
+/// (`transport::icc::MAX_ID_BYTES`, which the `icc` feature gate keeps this module from naming; a test
+/// pins them together).
+pub(crate) const MAX_CAMERA_ID_BYTES: usize = 1024;
 
 /// An exact identifier: nonempty, bounded, no padding (a copy-paste slip would otherwise wait
 /// forever for a camera that cannot match) and no control characters, NUL included.
