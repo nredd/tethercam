@@ -94,7 +94,22 @@ impl IccSession {
     /// the handle then reports [`IccError::Busy`] until the handle is dropped.
     #[must_use]
     pub fn into_handle(self) -> IccHandle {
-        self.handle
+        self.into_parts().0
+    }
+
+    /// As [`IccSession::into_handle`], plus the exact device the session was for, so a caller
+    /// that selected it once can reopen it on the same runtime.
+    #[must_use]
+    pub fn into_parts(self) -> (IccHandle, IccDeviceId) {
+        (self.handle, self.device)
+    }
+
+    /// Whether ownership is unresolvable: the session is quarantined for good, and so is the
+    /// process's one native runtime (removal, failed close, owner gone). Nothing more can be
+    /// submitted on it, by this session or a replacement.
+    #[must_use]
+    pub fn is_quarantined(&self) -> bool {
+        self.state == State::Quarantined
     }
 
     fn timeout(wait: Duration) -> Result<IccTimeout, IccError> {

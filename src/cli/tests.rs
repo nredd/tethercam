@@ -441,3 +441,39 @@ async fn command_dispatch_and_sanitized_probe_failures() {
     let simulator = simulator::Simulator::new(jpeg(32, 32)).unwrap();
     simulator.pause(std::time::Duration::from_millis(1)).await;
 }
+
+#[test]
+fn simulation_bypasses_the_icc_backend_and_never_acquires_native_cameras() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = free_cfg();
+    cfg.camera_backend = config::CameraBackend::Icc;
+    cfg.create(&path).unwrap();
+    let jpeg_path = dir.path().join("synthetic.jpg");
+    std::fs::write(&jpeg_path, jpeg(32, 32)).unwrap();
+    let mut options = options(Command::Probe, &path);
+    options.simulate = Some(jpeg_path);
+    let mut out = Vec::new();
+    // Runs on every platform, including where `icc` is unavailable: nothing native is touched.
+    execute(Ok(options), &mut out).unwrap();
+    assert!(String::from_utf8(out).unwrap().contains("PC Remote"));
+}
+
+#[test]
+fn icc_is_rejected_before_any_camera_access_where_it_cannot_run() {
+    // Off macOS the native entry point is a stub. On macOS the real one needs the main thread and
+    // refuses on a test thread before it touches anything native. The guard keeps that true.
+    assert_ne!(std::thread::current().name(), Some("main"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut cfg = free_cfg();
+    cfg.camera_backend = config::CameraBackend::Icc;
+    cfg.create(&path).unwrap();
+    for command in [Command::Probe, Command::Doctor, Command::Run] {
+        let mut out = Vec::new();
+        let error = execute(Ok(options(command, &path)), &mut out).unwrap_err();
+        assert!(matches!(error, Error::IccUnavailable), "{error:?}");
+        // No USB enumeration happened and nothing was printed: no `Detected cameras` line.
+        assert_eq!(String::from_utf8(out).unwrap(), "");
+    }
+}

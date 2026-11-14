@@ -3,7 +3,7 @@
 //! References:
 //! - <https://toml.io/>
 
-use super::{Config, Error, Secret};
+use super::{CameraBackend, Config, Error, Secret};
 use proptest::prelude::*;
 use std::fs;
 
@@ -231,4 +231,54 @@ fn full_resolution_snapshot_defaults_off_and_older_configs_still_load() {
             .streams
             .full_resolution_snapshot
     );
+}
+
+#[test]
+fn camera_backend_defaults_to_usb_and_selects_icc_only_when_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = Config::generate().unwrap();
+    assert_eq!(config.camera_backend, CameraBackend::Usb);
+    config.create(&path).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(content.contains("camera_backend = \"usb\""));
+    // A config written before the key existed still loads, as USB.
+    let older = content
+        .lines()
+        .filter(|line| !line.starts_with("camera_backend"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, &older).unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().camera_backend,
+        CameraBackend::Usb
+    );
+    fs::write(
+        &path,
+        older.replacen('\n', "\ncamera_backend = \"icc\"\n", 1),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().camera_backend,
+        CameraBackend::Icc
+    );
+    // No spelling variants and no fallback value: anything else is a parse error.
+    for bad in ["ICC", "auto", "libusb", ""] {
+        let text = older.replacen('\n', &format!("\ncamera_backend = \"{bad}\"\n"), 1);
+        fs::write(&path, text).unwrap();
+        assert!(Config::load(&path).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn icc_rejects_a_usb_serial_instead_of_ignoring_it() {
+    let mut config = Config::generate().unwrap();
+    config.camera_serial = Some("SYNTHETIC-SERIAL".into());
+    assert!(config.validate().is_ok());
+    config.camera_backend = CameraBackend::Icc;
+    let (key, value) = validation(config.validate().unwrap_err());
+    assert_eq!(key, "camera_serial");
+    assert!(!value.contains("SYNTHETIC-SERIAL"));
+    config.camera_serial = None;
+    assert!(config.validate().is_ok());
 }

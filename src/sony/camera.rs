@@ -420,7 +420,23 @@ async fn connect_phase<T: PtpSession>(session: &mut T, phase: u32) -> Result<(),
 /// Whether a failed `SDIOGetExtDeviceInfo` means "this generation is not accepted": a non-OK
 /// response, a stall or timeout, or a camera that kept answering busy or empty. Anything else (a disconnect, a malformed container) is
 /// fatal.
+///
+/// Over `ImageCaptureCore` a stall is not observable as such. A native failure of the request
+/// faults the session but leaves it closable, so it counts: the fallback closes with
+/// confirmation, reopens and replays the handshake. A caller deadline does *not* count: native
+/// work is still outstanding and the retired session may not be reused, so the connect fails
+/// and the supervisor's reconnect waits for native cleanup to settle. A model that stalls the
+/// newer request this way belongs in [`Quirks`], like the a7 III.
 fn is_refusal(err: &SonyError) -> bool {
+    #[cfg(feature = "macos-icc")]
+    if matches!(
+        err,
+        SonyError::Session(SessionError::Icc(
+            crate::transport::icc::IccError::NativeFailure
+        ))
+    ) {
+        return true;
+    }
     matches!(
         err,
         SonyError::ExtInfoUnavailable { .. }
@@ -449,6 +465,11 @@ async fn negotiate_ext_info<T: PtpSession>(
         return Err(first);
     };
     if !session.is_open() {
+        // A no-op once the session is closed (a USB reset ended it); a session that faulted but
+        // still holds a lease (`ImageCaptureCore`) is closed with confirmation before the reopen.
+        // A failed close is not reported here: it leaves the session retired or quarantined, and
+        // the reopen then fails with that state's own category.
+        let _ = session.close().await;
         session.open().await?;
         connect_phase(session, 1).await?;
         connect_phase(session, 2).await?;

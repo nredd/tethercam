@@ -1,10 +1,10 @@
 # Cooperative macOS camera acquisition
 
 The experimental `macos-icc` Cargo feature (off by default, macOS-only native code) implements this
-contract in `transport::icc`. It is not production support and no runtime selects it: runtime
-selection and commissioning are separate work in [#77](https://github.com/nredd/tethercam/issues/77).
-The work is tracked by [#72](https://github.com/nredd/tethercam/issues/72); this document does not
-close it.
+contract in `transport::icc`. It is not production support. A runtime selects it only through
+`camera_backend = "icc"` (see [Runtime selection](#runtime-selection-camera_backend--icc)); commissioning
+and the remaining hardware validation are tracked in [#77](https://github.com/nredd/tethercam/issues/77)
+and [#72](https://github.com/nredd/tethercam/issues/72); this document does not close either.
 ImageCaptureCore (ICC) provides a cooperative camera session and PTP command interface while
 Apple's camera helpers remain running. Raw USB interface claiming can conflict with those
 helpers. Killing or disabling them, installing a daemon, elevating capture privileges or using
@@ -66,6 +66,70 @@ Session semantics, all following from "ICC owns the pipes":
 Native code runs on the main thread (`run` blocks it in the run loop) and joins one worker, which can
 wait forever if the framework never calls back. There is no bounded-shutdown guarantee.
 
+## Runtime selection (`camera_backend = "icc"`)
+
+```toml
+# config.toml (synthetic values elsewhere; only this key is ICC-specific)
+camera_backend = "icc"   # "usb" (the default) or "icc"; never an automatic fallback
+```
+
+```sh
+cargo build --release --features macos-icc
+target/release/tethercam run --config ./camera.toml
+```
+
+- Needs macOS, a build with `macos-icc` (Rust 1.99 or newer) and the process's one native runtime.
+  Anywhere else `probe`, `doctor` and `run` fail at once with `camera_backend `icc` is unavailable`,
+  before any camera access, listener or enumeration. `--simulate` bypasses the backend entirely and
+  never starts native code. `setup` and `service` never read the backend
+- Selection: discovery must return exactly one camera, and that camera is used. Zero cameras waits like
+  USB does; several are refused (a warning with the count only), never "the first". The identifier is
+  never printed or logged. `camera_serial` is a raw-USB identity, so it is rejected with `icc` instead of
+  ignored. Any other device ICC lists as a camera (e.g. a phone, not verified) would count as a second candidate: disconnect it.
+  Exact selection by identifier is not exposed: there is nothing yet to learn the identifier from
+  without printing it
+- Threading: `ImageCaptureCore` needs the main thread's run loop and one native runtime per process. The
+  main thread therefore runs `transport::icc::run` and the whole existing application (camera
+  supervisor, RTSP, ONVIF, discovery, signal handling, graceful shutdown) runs as that function's
+  joined worker, on its own current-thread tokio runtime. The worker installs the tracing subscriber
+  and writes to the process stdout, because the main thread is parked in the run loop
+- Readiness follows the ordinary waiting model: the process comes up at once with RTSP and ONVIF bound
+  and answering "not ready" (`GET /tethercam/status` reports `waiting`), and the stream becomes ready
+  when the ICC session delivers its first live-view frame. No resolution is advertised before it
+- Foreground and the installed per-user LaunchAgent run the same command (`run --config`), so the
+  service templates are unchanged: select the backend in the service's config file
+- Shutdown stays joined: SIGINT or SIGTERM stops the supervisor, the Sony session is closed with
+  confirmation, the bridge handle is dropped and the native runtime returns. A timeout is never
+  cancellation, and nothing is killed, unloaded or bypassed. If the framework never calls back, that
+  join waits forever (below)
+- Reconnect: the supervisor's reconnect loop creates new sessions on the same runtime. After a confirmed
+  close the next session reopens on it. A caller deadline retires the session, and the next attempt
+  reports busy (with backoff) until native cleanup settles
+- Quarantine is terminal for the process. A camera removal (a pulled cable, power loss), a failed close or
+  a lost owner quarantines the runtime for the life of the process: the native layer can never be reused
+  and its run loop can then never return. The factory refuses further native work, the application shuts
+  down in order (RTSP and ONVIF stop, the session close is attempted) and the process exits with status
+  75 after printing `native camera runtime quarantined`. The LaunchAgent's `KeepAlive` restarts it after
+  its ten-second throttle. This `exit` is the one deliberate departure from joined shutdown, taken only
+  once the native owner has declared its state unresolvable. It is not validated on hardware
+- Sony protocol generation: a non-OK response to the 3.00 request falls back to 2.00 on the same session,
+  as over USB. A native failure of that request faults the session but leaves it closable, so the driver
+  closes with confirmation, reopens, replays the handshake and asks for 2.00. A caller *deadline* is not
+  a refusal: native work is still running, the retired session may not be reused, and the connect fails
+  until native cleanup settles. A body that needs 2.00 first and stalls the newer request that way
+  belongs in the model quirks, like the a7 III, which starts at 2.00
+- Access restriction: the open-time event drain keeps the *state* of what it drains. If the last restriction event before
+  the session opened says access is restricted, `open` closes the lease with confirmation and fails as
+  `camera access restricted` (the permission category) instead of surfacing later as a generic native
+  failure. Limit: a restriction event consumed earlier (by an event poll of a previous session or while no
+  session was open) is not remembered, so the next open can still succeed and the restriction surface
+  as a native failure then
+
+Not validated on hardware, and not claimed: a live Sony stream over ICC, the LaunchAgent context
+(GUI-session domain, camera consent, signing), screen lock and unlock, unplug and replug, deadlines and
+late callbacks, and any endurance. A quarantine cannot be recovered in process, and a missing native
+callback can block shutdown indefinitely. The experimental label stands.
+
 ### Validation status
 
 - AI-assisted independent source review of the `image-capture` crate (not a certification or formal audit)
@@ -77,7 +141,9 @@ wait forever if the framework never calls back. There is no bounded-shutdown gua
 - The thin `native` delegation is compiled only on macOS and needs a real device, so hosted coverage
   cannot execute it (see `docs/verification.md`). Its decisions (error mapping, event draining,
   conversions) are covered by macOS unit tests
-- Running this adapter against a camera is a hardware action reserved to the hardware owner:
+- Running this adapter against a camera is a hardware action reserved to the hardware owner. The
+  probe below drives the production adapter, and `tethercam run` with `camera_backend = "icc"` is the
+  end-to-end acceptance:
 
 ```sh
 cargo build --release --features macos-icc --example icc_sample
@@ -95,6 +161,16 @@ prints one line of counts and response codes, e.g.
 `candidates=1 cycles=2 device_info_ok=2 confirmed_closes=2 response_codes=0x2001,0x2001 result=ok`.
 It never prints identities or payload bytes, writes no settings, fires no shutter and runs no vendor handshake.
 Exit status is 0 for a pass, 1 for a failed sample and 2 for usage errors. CI never passes the flag.
+
+Add `--live-view` to run the live-view probe instead (`transport::icc::live_view_probe`): the production
+stack, `IccSession` under the Sony driver, for two cycles of handshake, live-view readiness, thirty
+decoded frames and a confirmed close, reopening on the same runtime. It does what the Sony live-view
+handshake does (it takes host priority) and fires no shutter. It prints counts and image dimensions only,
+e.g. `candidates=1 cycles=2 frames=60 size=640x424 size_changes=0 confirmed_closes=2 result=ok`:
+
+```sh
+target/release/examples/icc_sample --hardware-admitted --sole-candidate --live-view
+```
 
 ## Transaction boundary
 

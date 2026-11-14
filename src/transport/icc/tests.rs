@@ -1104,13 +1104,14 @@ fn a_cancelled_open_without_a_lease_is_never_reported_closed() {
 
 #[test]
 fn stale_events_from_earlier_sessions_never_reach_a_new_session() {
-    // One process-wide queue: a native error, an access restriction, an oversized event, the
-    // overflow flag and a stale PTP event all predate this open.
+    // One process-wide queue: a native error, an access restriction that was since lifted, an
+    // oversized event, the overflow flag and a stale PTP event all predate this open.
     let (out, shared) = run(
         |s| {
             s.events.extend([
                 Ok(Some(vec![6])),
                 Ok(Some(vec![10])),
+                Ok(Some(vec![9])),
                 Ok(Some(vec![12])),
                 Err(IccError::EventOverflow),
                 Ok(Some(ptp_event(0xC201, &[1]))),
@@ -1139,6 +1140,77 @@ fn stale_events_from_earlier_sessions_never_reach_a_new_session() {
         )
     );
     assert!(script(&shared).events.is_empty());
+}
+
+/// Open under a given pre-open event history, then try a command. Returns the open result, the
+/// command result and the recorded boundary calls.
+fn open_under(
+    events: &[Vec<u8>], close: Option<Result<(), IccError>>,
+) -> (
+    Result<(), SessionError>,
+    Result<(), SessionError>,
+    Vec<Call>,
+) {
+    let (out, shared) = run(
+        |s| {
+            s.events.extend(events.iter().cloned().map(|e| Ok(Some(e))));
+            s.close.extend(close);
+        },
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                let opened = s.open().await;
+                let work = s.transaction(0x1009, &[], None).await.map(|_| ());
+                (opened, work)
+            })
+        },
+    );
+    (out.0, out.1, calls(&shared))
+}
+
+#[test]
+fn an_access_restriction_that_still_holds_fails_the_open_as_permission() {
+    // Enabled and never lifted: the category survives the drain instead of a later generic
+    // native failure. The lease is closed with confirmation and nothing is submitted.
+    let (opened, work, calls) = open_under(&[vec![10]], None);
+    assert_eq!(opened, Err(icc(IccError::Permission)));
+    assert_eq!(work, Err(SessionError::NotOpen));
+    assert!(calls.contains(&Call::Close));
+    assert!(!calls.iter().any(|c| matches!(c, Call::Transact { .. })));
+    assert!(!calls.contains(&Call::LeaseDropped));
+
+    // The last of enabled and lifted decides.
+    let (opened, _, _) = open_under(&[vec![9], vec![10]], None);
+    assert_eq!(opened, Err(icc(IccError::Permission)));
+    let (opened, work, calls) = open_under(&[vec![10], vec![9]], None);
+    assert_eq!((opened, work), (Ok(()), Ok(())));
+    assert!(!calls.contains(&Call::Close));
+    // Unrelated tags and an empty event never change the state.
+    let (opened, _, _) = open_under(&[vec![10], vec![6], vec![], vec![8]], None);
+    assert_eq!(opened, Err(icc(IccError::Permission)));
+}
+
+#[test]
+fn a_failed_close_under_a_restriction_reports_the_worse_failure() {
+    let (opened, _, calls) = open_under(&[vec![10]], Some(Err(IccError::CleanupFailure)));
+    assert_eq!(opened, Err(icc(IccError::CleanupFailure)));
+    assert!(calls.contains(&Call::Close));
+}
+
+#[test]
+fn a_restricted_open_leaves_the_session_closed_so_a_later_open_can_succeed() {
+    let (out, _) = run(
+        |s| s.events.push_back(Ok(Some(vec![10]))),
+        |handle| {
+            block(async move {
+                let mut s = session(handle);
+                let first = s.open().await;
+                let second = s.open().await;
+                (first, second, s.is_open())
+            })
+        },
+    );
+    assert_eq!(out, (Err(icc(IccError::Permission)), Ok(()), true));
 }
 
 #[test]
@@ -1502,4 +1574,308 @@ fn an_unfinished_sample_does_not_pass() {
     );
     let mut broken = [0_u8; 0];
     assert!(receipt.write_to(&mut broken.as_mut_slice()).is_err());
+}
+
+// ---- Sony protocol-generation fallback over ICC ------------------------------------------
+
+use crate::sony::{Protocol, SonyError, op};
+use crate::transport::icc::fake::SimFaults;
+use crate::transport::sim::sony::Version300;
+
+/// Connect to a body that speaks 2.00 behind the boundary, asking for 3.00 first. Returns the
+/// negotiated protocol or the error, and whether the session was closed afterwards.
+fn connect_over_icc(sim: SonySimConfig, faults: SimFaults) -> (Result<Protocol, SonyError>, bool) {
+    let boundary = SimBoundary::with_faults(sony_camera(sim), faults);
+    run_with(boundary, |handle| {
+        block(async move {
+            let mut session = session(handle);
+            let result = SonyCamera::run(&mut session, config_fast(), async |camera| {
+                Ok(camera.protocol())
+            })
+            .await;
+            (result, !session.is_open())
+        })
+    })
+    .expect("owner ran")
+}
+
+fn body_300() -> SonySimConfig {
+    SonySimConfig {
+        max_version: 300,
+        ..SonySimConfig::default()
+    }
+}
+
+#[test]
+fn a_refused_newer_request_falls_back_on_the_same_icc_session() {
+    // A non-OK response is the camera's answer, not a failure: the session stays open.
+    for response in [0x201D, 0x2005] {
+        let sim = SonySimConfig {
+            version_300: Version300::Rejects(response),
+            ..body_300()
+        };
+        let (result, closed) = connect_over_icc(sim, SimFaults::default());
+        assert_eq!(result, Ok(Protocol::V200), "{response:#x}");
+        assert!(closed);
+    }
+}
+
+#[test]
+fn a_stalled_newer_request_falls_back_after_a_confirmed_close_and_reopen() {
+    // The simulated body stalls the pipe; the boundary can only report a native failure, which
+    // faults the session. The driver closes it with confirmation, reopens, replays the
+    // handshake and asks for 2.00.
+    let sim = SonySimConfig {
+        version_300: Version300::Stalls,
+        ..body_300()
+    };
+    let (result, closed) = connect_over_icc(sim, SimFaults::default());
+    assert_eq!(result, Ok(Protocol::V200));
+    assert!(closed);
+    // The same through an injected native failure of exactly the 3.00 request.
+    let faults = SimFaults {
+        transact: Some((
+            op::SDIO_GET_EXT_DEVICE_INFO,
+            Some(300),
+            IccError::NativeFailure,
+        )),
+        ..SimFaults::default()
+    };
+    let (result, closed) = connect_over_icc(body_300(), faults);
+    assert_eq!(result, Ok(Protocol::V200));
+    assert!(closed);
+}
+
+#[test]
+fn a_native_failure_that_also_fails_the_older_request_names_both_attempts() {
+    let faults = SimFaults {
+        transact: Some((op::SDIO_GET_EXT_DEVICE_INFO, None, IccError::NativeFailure)),
+        ..SimFaults::default()
+    };
+    let (result, closed) = connect_over_icc(body_300(), faults);
+    let refused = || Box::new(SonyError::Session(icc(IccError::NativeFailure)));
+    assert_eq!(
+        result,
+        Err(SonyError::ProtocolRefused {
+            requested: Protocol::V300,
+            requested_error: refused(),
+            fallback: Protocol::V200,
+            fallback_error: refused(),
+        })
+    );
+    assert!(closed);
+}
+
+#[test]
+fn a_deadline_on_the_newer_request_is_not_a_refusal_and_never_reuses_the_retired_session() {
+    // The native request may still be running, so the retired session cannot carry another one:
+    // the connect fails with the deadline and the supervisor's reconnect waits for cleanup.
+    let faults = SimFaults {
+        transact: Some((
+            op::SDIO_GET_EXT_DEVICE_INFO,
+            Some(300),
+            IccError::DeadlineExceeded,
+        )),
+        ..SimFaults::default()
+    };
+    let (result, _) = connect_over_icc(body_300(), faults);
+    assert_eq!(
+        result,
+        Err(SonyError::Session(icc(IccError::DeadlineExceeded)))
+    );
+}
+
+#[test]
+fn a_native_failure_when_the_fallback_cannot_close_the_session_ends_quarantined() {
+    // The newer request fails natively and then the confirming close does too: the session is
+    // quarantined, so the reopen is refused with that category and nothing is retried.
+    let faults = SimFaults {
+        transact: Some((
+            op::SDIO_GET_EXT_DEVICE_INFO,
+            Some(300),
+            IccError::NativeFailure,
+        )),
+        close: Some(IccError::CleanupFailure),
+    };
+    let (result, _) = connect_over_icc(body_300(), faults);
+    assert_eq!(result, Err(SonyError::Session(icc(IccError::Quarantined))));
+}
+
+// ---- live-view probe ---------------------------------------------------------------------
+
+fn probe_over(boundary: SimBoundary, cycles: usize, frames: usize) -> super::LiveReceipt {
+    run_with(boundary, |handle| {
+        block(async move {
+            super::live_view_probe(handle, &Selector::SoleCandidate, cycles, frames).await
+        })
+    })
+    .expect("owner ran")
+}
+
+fn live_sim(jpeg: Vec<u8>) -> SonySimConfig {
+    SonySimConfig {
+        warmup_reads: 0,
+        live_view_jpeg: jpeg,
+        ..SonySimConfig::default()
+    }
+}
+
+#[test]
+fn the_live_view_probe_decodes_frames_closes_and_reopens_without_naming_anything() {
+    let boundary = SimBoundary::new(sony_camera(live_sim(crate::supervisor::testing::jpeg(
+        48, 32,
+    ))));
+    let receipt = probe_over(boundary, 2, 3);
+    assert!(receipt.passed(2, 3), "{receipt:?}");
+    assert_eq!(
+        (receipt.candidates, receipt.size, receipt.size_changes),
+        (1, Some((48, 32)), 0)
+    );
+    let mut out = Vec::new();
+    receipt.write_to(&mut out).expect("write");
+    let line = String::from_utf8(out).expect("utf8");
+    assert_eq!(
+        line,
+        "candidates=1 cycles=2 frames=6 size=48x32 size_changes=0 confirmed_closes=2 result=ok\n"
+    );
+    assert!(!line.contains("synthetic"));
+    // Fewer frames than asked for, or any change of size, is not a pass.
+    assert!(!receipt.passed(2, 4));
+    assert!(!receipt.passed(3, 3));
+    let changed = super::LiveReceipt {
+        size_changes: 1,
+        ..receipt.clone()
+    };
+    assert!(!changed.passed(2, 3));
+}
+
+#[test]
+fn the_probe_counts_a_changed_frame_size() {
+    let decode = |w, h| {
+        let mut frame = crate::media::I420Frame::default();
+        crate::media::JpegDecoder::new()
+            .decode_into(&crate::supervisor::testing::jpeg(w, h), &mut frame)
+            .expect("decodes");
+        frame
+    };
+    let mut receipt = super::LiveReceipt::default();
+    receipt.note(&decode(32, 32));
+    receipt.note(&decode(32, 32));
+    receipt.note(&decode(64, 32));
+    assert_eq!(
+        (receipt.frames, receipt.size, receipt.size_changes),
+        (3, Some((32, 32)), 1)
+    );
+}
+
+#[test]
+fn probe_failures_are_categories_and_end_the_probe() {
+    // A frame that is not a decodable JPEG.
+    let receipt = probe_over(
+        SimBoundary::new(sony_camera(live_sim(vec![0xFF, 0xD8, 0xFF, 0xD9]))),
+        1,
+        1,
+    );
+    assert_eq!(receipt.failure, Some(super::ProbeError::Decode));
+    assert_eq!((receipt.frames, receipt.confirmed_closes), (0, 1));
+    let mut out = Vec::new();
+    receipt.write_to(&mut out).expect("write");
+    let line = String::from_utf8(out).expect("utf8");
+    assert!(
+        line.ends_with(
+            "size=0x0 size_changes=0 confirmed_closes=1 result=failed category=decode\n"
+        )
+    );
+
+    // A body outside PC Remote mode fails the handshake.
+    let sim = SonySimConfig {
+        advertise_sdio: false,
+        ..live_sim(Vec::new())
+    };
+    let receipt = probe_over(SimBoundary::new(sony_camera(sim)), 1, 1);
+    assert_eq!(
+        receipt.failure,
+        Some(super::ProbeError::Sony(SonyError::SdioUnsupported))
+    );
+    assert_eq!(
+        receipt.failure.as_ref().map(super::ProbeError::category),
+        Some("sony")
+    );
+
+    // Live view the body does not support, and a frame fetch the boundary fails.
+    let sim = SonySimConfig {
+        live_view: crate::transport::sim::sony::LiveViewMode::Unsupported,
+        ..live_sim(Vec::new())
+    };
+    let receipt = probe_over(SimBoundary::new(sony_camera(sim)), 1, 1);
+    assert_eq!(
+        receipt.failure.as_ref().map(super::ProbeError::category),
+        Some("sony")
+    );
+    let faults = SimFaults {
+        transact: Some((op::GET_OBJECT, None, IccError::NativeFailure)),
+        ..SimFaults::default()
+    };
+    let boundary = SimBoundary::with_faults(sony_camera(live_sim(Vec::new())), faults);
+    let receipt = probe_over(boundary, 1, 1);
+    assert_eq!(
+        receipt.failure.as_ref().map(super::ProbeError::category),
+        Some("sony")
+    );
+    assert_eq!(receipt.frames, 0);
+
+    // Discovery and selection failures, with the counts that explain them.
+    let (receipt, _) = run(
+        |s| s.discover.push_back(Ok(Vec::new())),
+        |handle| {
+            block(
+                async move { super::live_view_probe(handle, &Selector::SoleCandidate, 1, 1).await },
+            )
+        },
+    );
+    assert_eq!(
+        (
+            receipt.candidates,
+            receipt.failure.as_ref().map(super::ProbeError::category)
+        ),
+        (0, Some("discovery"))
+    );
+    let (receipt, _) = run(
+        |s| s.discover.push_back(Err(IccError::DeadlineExceeded)),
+        |handle| {
+            block(
+                async move { super::live_view_probe(handle, &Selector::SoleCandidate, 1, 1).await },
+            )
+        },
+    );
+    assert_eq!(
+        receipt.failure,
+        Some(super::ProbeError::Discovery(IccError::DeadlineExceeded))
+    );
+}
+
+#[test]
+fn the_probe_receipt_reports_a_failing_writer() {
+    use std::io::Write as _;
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("synthetic pipe failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    assert!(super::LiveReceipt::default().write_to(&mut Broken).is_err());
+    Broken.flush().unwrap();
+}
+
+#[test]
+fn the_native_entry_point_refuses_off_the_main_thread_without_running_the_worker() {
+    // Off macOS the entry point is a stub. On macOS the real one checks for the main thread
+    // before it touches anything native, so a test thread (never `main`) cannot start it.
+    // The guard keeps that true even if a harness ever ran a test inline.
+    assert_ne!(std::thread::current().name(), Some("main"));
+    // `drop` is the worker: it would consume the handle if it ever ran.
+    assert_eq!(super::run(drop::<IccHandle>), Err(IccError::Runtime));
 }

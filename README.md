@@ -70,7 +70,8 @@ identity, or loads the existing file without replacing it. It explicitly prints 
 the operator, so keep its output private. Without `--config`, the platform configuration directory
 is used. `probe` lists candidate USB modes and reports the selected body's remote-control capabilities
 and battery/USB power. `camera_serial` in the configuration selects an exact device; otherwise
-the first usable camera is chosen. USB serials and OS bus paths are not printed. `doctor` checks file
+the first usable camera is chosen. `camera_backend = "icc"` (default `"usb"`, no fallback) selects the
+experimental macOS `ImageCaptureCore` backend instead, see below. USB serials and OS bus paths are not printed. `doctor` checks file
 permissions and values, listener addresses/ports, a plausible UTC clock and camera readiness; it
 does not prove that NTP is synchronized. These foreground commands never install a daemon or
 background themselves; only the explicit `service` command performs native service operations.
@@ -189,8 +190,11 @@ diagnostics, separate from normal camera runtime. The optional `repo-tools` feat
 offline profiling summaries and release-tag validation. Default install/run behavior is unchanged.
 The experimental `macos-icc` feature (off by default, macOS and Rust 1.99 only) adds an `ImageCaptureCore`
 PTP session so Apple's camera helpers can keep running. It depends on the pinned `image-capture` crate,
-adds no local `unsafe`, is not selected by any runtime yet and carries no production support claim. See
-[`docs/macos-camera.md`](docs/macos-camera.md) for its limits and validation status.
+adds no local `unsafe` and carries no production support claim. Build with `--features macos-icc` and set
+`camera_backend = "icc"` in the configuration to run on it; `probe`, `doctor` and `run` otherwise fail
+before any camera access. It selects the sole camera ICC discovers and is not validated against a live
+camera. See [`docs/macos-camera.md`](docs/macos-camera.md) for configuration, threading, the quarantine
+policy, limits and validation status.
 See [`docs/verification.md`](docs/verification.md) for API, privilege, coverage, profiling and
 extracted-package verification contracts, and [`docs/usb.md`](docs/usb.md) for normal camera setup.
 

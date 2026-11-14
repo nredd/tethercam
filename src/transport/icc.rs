@@ -11,6 +11,7 @@
 //! - [`run_with`] and [`IccHandle`]: a single-flight bridge from async callers to the one
 //!   thread that owns the boundary
 //! - [`IccSession`]: validation, typed failure categories and the lifecycle state machine
+//! - [`live_view_probe`]: the hardware-owner acceptance consumer over the production stack
 //! - [`classify`]: total classification of tagged native events
 //! - `native` (macOS only): the thin delegation to the `image-capture` crate, plus `run` for
 //!   its main-thread entry point
@@ -29,11 +30,12 @@ mod error;
 mod event;
 #[cfg(target_os = "macos")]
 mod native;
+mod probe;
 mod sample;
 mod session;
 
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
@@ -45,5 +47,22 @@ pub use error::{Effect, IccError};
 pub use event::{Notice, classify};
 #[cfg(target_os = "macos")]
 pub use native::run;
-pub use sample::{Receipt, SampleError, Selector, read_only_sample};
+
+pub use probe::{LiveReceipt, ProbeError, live_view_probe};
+pub use sample::{DISCOVERY_WINDOW, Receipt, SampleError, Selector, read_only_sample};
 pub use session::IccSession;
+
+/// The main-thread native entry point exists only on macOS. Elsewhere there is no native runtime
+/// to start: this reports [`IccError::Runtime`] without running `user` or touching anything.
+///
+/// # Errors
+///
+/// Always [`IccError::Runtime`].
+#[cfg(not(target_os = "macos"))]
+pub fn run<F, T>(_user: F) -> Result<T, IccError>
+where
+    F: FnOnce(IccHandle) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Err(IccError::Runtime)
+}

@@ -152,15 +152,21 @@ under `coverage/`; it does not replace the enforcement result with a custom poli
 
 ### `macos-icc` coverage
 
-The portable ICC layers (`src/transport/icc/`, except `native.rs`) are fully covered on hosted Linux
-through deterministic fakes and the simulated Sony body. `native.rs` is `cfg(target_os = "macos")`, so
+The portable ICC layers (`src/transport/icc/`, except `native.rs`) and the backend wiring
+(`src/cli/icc.rs`: factory, reconnect and quarantine policy, worker, launch and its process exit) are fully
+covered on hosted Linux through deterministic fakes, the simulated Sony body and a stand-in for the
+main-thread runtime. Off macOS the real `run` entry point is a stub that reports the runtime unavailable,
+so even the real launch path up to that point runs there. `native.rs` is `cfg(target_os = "macos")`, so
 it is not compiled, and not in the report, on the required Linux coverage job. On macOS its error
 mapping, conversions and event draining are covered by unit tests, but its delegations onto
 `image-capture` (the `Boundary`/`Lease` impls and `run`) need a live `Client`, which exists only inside
 `native::run` on the main thread with a camera. A local macOS `make coverage` therefore reports those
 few lines as uncovered. This is a real gap, not an exclusion: no ignore regex, `coverage(off)` or other
-waiver covers it. It is closed only by the hardware-owner `icc_sample` run, see
-[`macos-camera.md`](macos-camera.md).
+waiver covers it. It is closed only by the hardware-owner `icc_sample` and `tethercam run` runs, see
+[`macos-camera.md`](macos-camera.md). No new macOS-only source was added for runtime selection. A
+deliberate no-camera `ImageCaptureCore` initialize and shutdown on a hosted macOS runner is not part of
+the CI inventory yet: adding it changes the macOS job set and is coordinated with the macOS coverage job
+(PR [#100](https://github.com/nredd/tethercam/pull/100)).
 
 ## Diagnostics and profiling
 
