@@ -162,3 +162,51 @@ fn dispatcher_uses_the_injected_bus_and_simulation_never_enumerates_it() {
     std::fs::remove_file(&path).unwrap();
     assert!(dispatch(&options, &cfg, &mut out, FakeBus::with_camera(0x0c34)).is_err());
 }
+
+struct NoteFailure;
+impl Write for NoteFailure {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.starts_with(b"Raw USB") {
+            Err(std::io::Error::other("synthetic note write failure"))
+        } else {
+            Ok(bytes.len())
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_usb_listing_reports_modes_and_points_at_camera_serial() {
+    let mut bus = FakeBus::with_camera(0x0c34);
+    bus.devices = Ok(vec![summary(0x0c03, &[]), summary(0x0c34, &[STILL_IMAGE])]);
+    let mut bytes = Vec::new();
+    list(&bus, &mut bytes).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("Detected cameras: 2"), "{text}");
+    assert!(text.contains("`camera_serial`"), "{text}");
+    assert!(
+        !text.contains("SERIAL0000") && !text.contains("bus-1"),
+        "{text}"
+    );
+    assert!(list(&bus, &mut NoteFailure).is_err());
+    NoteFailure.flush().unwrap();
+    bus.devices = Err(UsbError::Busy);
+    assert!(list(&bus, &mut Vec::new()).is_err());
+    // Through the dispatcher: no signals, no session, and the simulator is not consulted.
+    let options = Options {
+        command: Command::Cameras { describe: true },
+        config: None,
+        simulate: None,
+        no_discovery: false,
+    };
+    let mut out = Vec::new();
+    let bus = FakeBus::with_camera(0x0c34);
+    dispatch(&options, &Config::generate().unwrap(), &mut out, bus).unwrap();
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("Detected cameras: 1")
+    );
+}

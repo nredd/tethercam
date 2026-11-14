@@ -74,6 +74,7 @@ wait forever if the framework never calls back. There is no bounded-shutdown gua
 ```toml
 # config.toml (synthetic values elsewhere; only this key is ICC-specific)
 camera_backend = "icc"   # "usb" (the default) or "icc"; never an automatic fallback
+# camera_id = "..."      # optional exact device, from `tethercam cameras` (below)
 ```
 
 ```sh
@@ -87,18 +88,19 @@ target/release/tethercam run --config ./camera.toml
   application started (e.g. its worker panicked), the error is `camera_backend `icc` failed after it
   started` instead, so a platform or build is not blamed for a run that happened. `--simulate` bypasses the backend entirely and
   never starts native code. `setup` and `service` never read the backend
-- Selection: discovery must return exactly one camera, and that camera is used. Zero cameras waits like
-  USB does; several are refused (a warning with the count only), never "the first". The identifier is
-  never printed or logged. `camera_serial` is a raw-USB identity, so it is rejected with `icc` instead of
-  ignored. Any other device ICC lists as a camera (e.g. a phone on a charging cable, not verified)
-  counts as a candidate. With the Sony body also attached that is two candidates, refused as ambiguous:
-  disconnect it. Alone it is the sole candidate and is opened, then refused at the Sony handshake
-  (`camera does not advertise the Sony SDIO extension`), which can raise a trust or access prompt on
-  that device. A refused handshake is retried every 60 s, not every backoff cycle (5 s cap), so such a
-  device is reopened at most once a minute for as long as it stays attached. A Sony body outside PC
-  Remote mode is refused the same way and is picked up within a minute of switching mode. Disconnect the
-  other device to stop it entirely. Exact selection by identifier is not exposed: there is nothing yet
-  to learn the identifier from without printing it
+- Selection: see [Listing and selecting cameras](#listing-and-selecting-cameras). With `camera_id` unset,
+  discovery must return exactly one camera, and that camera is used. Zero cameras waits like USB does;
+  several are refused (a warning with the count only, and an error that names `tethercam cameras`), never
+  "the first". `camera_serial` is a raw-USB identity, so it is rejected with `icc` instead of ignored.
+  Any other device ICC lists as a camera (e.g. a phone on a charging cable, not verified) counts as a
+  candidate. With the Sony body also attached that is two candidates, refused as ambiguous: select the
+  camera with `camera_id`, or disconnect the other device. Alone it is the sole candidate and is opened,
+  then refused at the Sony handshake (`camera does not advertise the Sony SDIO extension`), which can
+  raise a trust or access prompt on that device. A refused handshake is retried every 60 s, not every
+  backoff cycle (5 s cap), so such a device is reopened at most once a minute for as long as it stays
+  attached. A Sony body outside PC Remote mode is refused the same way and is picked up within a minute
+  of switching mode. With `camera_id` set to the camera, a phone is never opened at all, so none of this
+  applies to it
 - Threading: `ImageCaptureCore` needs the main thread's run loop and one native runtime per process. The
   main thread therefore runs `transport::icc::run` and the whole existing application (camera
   supervisor, RTSP, ONVIF, discovery, signal handling, graceful shutdown) runs as that function's
@@ -148,7 +150,8 @@ target/release/tethercam run --config ./camera.toml
   session was open) is not remembered, so the next open can still succeed and the restriction surface
   as a native failure then
 
-Not validated on hardware, and not claimed: a live Sony stream over ICC, the LaunchAgent context
+Not validated on hardware, and not claimed: listing and exact selection (including whether the identifier
+survives replug, reboot or a camera power-cycle), a live Sony stream over ICC, the LaunchAgent context
 (GUI-session domain, camera consent, signing), screen lock and unlock, unplug and replug, deadlines and
 late callbacks, and any endurance. A quarantine cannot be recovered in process, and a missing native
 callback can block shutdown indefinitely. The experimental label stands.
@@ -175,7 +178,8 @@ target/release/examples/icc_sample
 # hardware owner only. Either select the camera only if discovery finds exactly one, so the identifier
 # is never handled (zero or several candidates fail with exit 1 and counts only, never "the first"):
 target/release/examples/icc_sample --hardware-admitted --sole-candidate
-# or name it exactly; the identifier stays in the environment (mutually exclusive with --sole-candidate):
+# or name it exactly, the identifier `tethercam cameras` prints and `camera_id` holds, same selection as
+# the service; it stays in the environment (mutually exclusive with --sole-candidate):
 TETHERCAM_ICC_DEVICE_ID=<exact identifier> target/release/examples/icc_sample --hardware-admitted
 ```
 
@@ -194,6 +198,80 @@ e.g. `candidates=1 cycles=2 frames=60 size=640x424 size_changes=0 confirmed_clos
 ```sh
 target/release/examples/icc_sample --hardware-admitted --sole-candidate --live-view
 ```
+
+## Listing and selecting cameras
+
+```sh
+tethercam cameras --config ./camera.toml
+tethercam cameras --config ./camera.toml --describe
+```
+
+Discovery returns only opaque identifiers: no name, vendor or type, and no way to get one without opening
+a session. So the listing prints one line per device, an index and the exact identifier (synthetic here):
+
+```
+Cameras found: 2
+1  0F6A2C1E-0000-4000-8000-000000000001
+2  0F6A2C1E-0000-4000-8000-000000000002
+Set camera_id in the configuration to one of these identifiers; --describe opens each device briefly to show its make and model, and a phone can show a trust prompt.
+```
+
+- The identifier is printed ONLY by this command, to the terminal of whoever ran it. It is never logged, put
+  in tracing, status output, errors or CI output. The configuration file already holds credentials and is
+  owner-only, which is where it belongs. The index is for reading the listing only; the configuration takes
+  the identifier. It is not a stable position
+- `--describe` is an explicit opt-in. Each listed device is opened read-only, asked the standard PTP
+  `GetDeviceInfo` (`0x1001`) and closed with confirmation, and its manufacturer and model are printed
+  (`2  <identifier>  Synthetic Maker Model X`). The serial number in that dataset is never printed. Opening
+  a device can raise a trust prompt on it, which is why a phone is only touched when asked. A device that
+  refuses or fails is printed as `not a supported camera (<category>)` with `access restricted`, `timed out`,
+  `refused`, `failed` or `no device information`, and the listing goes on. Make and model are cleaned of
+  control characters and cut to 64 characters. With `camera_id` set only the selected device is described
+  (the others show `not described (not selected by camera_id)` and are never opened), as the service
+  ignores them; unset the key to describe them all
+- Bounded: at most 64 devices (the native limit, more is an error), and 10 s per step (open,
+  `GetDeviceInfo`, close) per device. A deadline or failed close leaves native cleanup unsettled, so the
+  remaining devices are listed as `not described (native cleanup pending)` rather than opened into a busy
+  refusal. A stop (SIGINT, SIGTERM) is honoured between devices, never mid-command. A quarantine ends the
+  command as `native camera runtime quarantined` and exit status 75, like every other command
+- Without `--describe` nothing is opened, so listing never touches a phone
+- With `camera_id` set, the listing marks that device `(selected by camera_id)`, or says it matches none
+- On `camera_backend = "usb"` it prints the same counts and modes as `probe`, and a note that raw USB
+  selects by `camera_serial`; serial numbers are not printed and `--describe` is ignored. Listing USB
+  serials is out of scope. With `icc` on an unsupported platform or build the command fails like the others,
+  with `camera_backend `icc` is unavailable`, before any camera access
+
+Selecting one, in the configuration:
+
+```toml
+camera_backend = "icc"
+camera_id = "0F6A2C1E-0000-4000-8000-000000000002"   # exact, as printed by `tethercam cameras`
+```
+
+| Situation | `camera_id` unset | `camera_id` set |
+| --- | --- | --- |
+| nothing attached | waits (`waiting`, not ready) | waits |
+| only the selected device | used | used |
+| several, including the selected one | refused, count only, names `tethercam cameras` | the selected one is used; the others are never opened |
+| several, not the selected one | refused, as above | waits; never falls back to another device |
+| exactly one other device | that device is used | waits; the other device is never opened |
+
+- `camera_id` is rejected with `camera_backend = "usb"` (as `camera_serial` is with `icc`), and when empty,
+  padded with whitespace, over 1024 bytes or containing control characters. These are config validation
+  errors raised before any camera access, and they never print the value. An existing configuration
+  without the key keeps working. `setup` does not write or require it
+- The same selection serves `run`, `probe` and `doctor`, and the gated `icc_sample` example (exact
+  identifier in `TETHERCAM_ICC_DEVICE_ID`, or `--sole-candidate`), which share one `Selector` and its choice logic
+- Stability of the identifier is NOT established. `image-capture` documents it only as the exact
+  framework identifier and takes it from the camera object's `UUIDString`; Apple documents that as "a
+  string representation of the Universally Unique ID of the device" and promises nothing about it across
+  replug, reboot or camera power-cycle (a separate `persistentIDString` property exists, which this crate
+  does not expose). If it changes on replug, `camera_id` keeps matching nothing and the service waits
+  forever after the camera comes back, and exact selection by it is only fit for one attachment. This must
+  be checked on hardware (list, replug, list; power-cycle the camera, list; reboot, list) before
+  relying on it. Names would help distinguish devices, and are requested upstream
+  ([image-capture#8](https://github.com/nredd/image-capture/issues/8)); the configuration format does not
+  need to change when they arrive
 
 ## Transaction boundary
 

@@ -67,7 +67,7 @@ fn every_discovery_failure_maps_to_a_sanitized_open_category() {
         (IccError::Disconnected, OpenError::Disconnected),
         (IccError::NotFound, OpenError::Disconnected),
         (IccError::Quarantined, OpenError::Disconnected),
-        (IccError::Ambiguous, OpenError::Discovery),
+        (IccError::Ambiguous, OpenError::Ambiguous),
         (IccError::NativeFailure, OpenError::Discovery),
         (IccError::Runtime, OpenError::Discovery),
     ] {
@@ -97,7 +97,7 @@ fn discovery_outcomes_leave_the_handle_with_the_factory() {
     let out = run_with(fake, |handle| {
         tracing::dispatcher::with_default(&dispatch, || {
             runtime().block_on(async {
-                let (mut factory, fatal) = IccFactory::new(handle);
+                let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
                 let mut seen = Vec::new();
                 for _ in 0..4 {
                     seen.push(attempt(&mut factory).await);
@@ -116,7 +116,7 @@ fn discovery_outcomes_leave_the_handle_with_the_factory() {
         (
             vec![
                 Ok(true),
-                Err(OpenError::Discovery),
+                Err(OpenError::Ambiguous),
                 Err(OpenError::Permission),
                 Err(OpenError::Busy),
                 Err(OpenError::Busy),
@@ -148,7 +148,7 @@ fn an_error_or_a_reached_camera_also_ends_a_run_of_busy_answers() {
     });
     let flags = run_with(fake, |handle| {
         paused_runtime().block_on(async {
-            let (mut factory, fatal) = IccFactory::new(handle);
+            let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
             let step = BUSY_LIMIT * 4 / 5;
             let mut flags = Vec::new();
             // Busy, a refusal, busy: the refusal ended the first run.
@@ -183,7 +183,7 @@ fn a_quarantine_is_terminal_and_refuses_every_later_discovery() {
     let out = run_with(fake, |handle| {
         tracing::dispatcher::with_default(&dispatch, || {
             runtime().block_on(async {
-                let (mut factory, fatal) = IccFactory::new(handle);
+                let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
                 let first = attempt(&mut factory).await;
                 let flagged = *fatal.borrow();
                 let second = attempt(&mut factory).await;
@@ -221,7 +221,7 @@ fn a_run_of_busy_answers_past_the_limit_is_fatal_through_the_quarantine_flag() {
     let out = run_with(fake, |handle| {
         tracing::dispatcher::with_default(&dispatch, || {
             paused_runtime().block_on(async {
-                let (mut factory, fatal) = IccFactory::new(handle);
+                let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
                 // Busy at the start of the run, then up to one tick short of the limit.
                 let first = attempt(&mut factory).await;
                 tokio::time::advance(BUSY_LIMIT.saturating_sub(Duration::from_secs(1))).await;
@@ -281,7 +281,7 @@ fn any_other_outcome_ends_a_run_of_busy_answers() {
     });
     let flags = run_with(fake, |handle| {
         paused_runtime().block_on(async {
-            let (mut factory, fatal) = IccFactory::new(handle);
+            let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
             let mut flags = Vec::new();
             for _ in 0..6 {
                 let _ = attempt(&mut factory).await;
@@ -303,7 +303,7 @@ fn sessions_reopen_on_the_one_runtime_after_a_confirmed_close() {
     let out = run_with(boundary, |handle| {
         runtime().block_on(async {
             use crate::sony::{SonyCamera, SonyConfig};
-            let (mut factory, fatal) = IccFactory::new(handle);
+            let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
             let mut protocols = Vec::new();
             for _ in 0..2 {
                 let found = factory.connect().await.unwrap().unwrap();
@@ -338,7 +338,7 @@ fn a_quarantined_session_flags_the_factory_when_released() {
     );
     let out = run_with(boundary, |handle| {
         runtime().block_on(async {
-            let (mut factory, fatal) = IccFactory::new(handle);
+            let (mut factory, fatal) = IccFactory::new(handle, Selector::SoleCandidate);
             let found = factory.connect().await.unwrap().unwrap();
             let mut session =
                 factory.session(found, SessionConfig::default(), std::time::Instant::now);
@@ -508,7 +508,12 @@ fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_b
 #[test]
 fn the_backend_slows_reconnects_after_a_refused_handshake() {
     let (fake, _) = Fake::new();
-    let delay = run_with(fake, |handle| IccFactory::new(handle).0.refusal_delay()).unwrap();
+    let delay = run_with(fake, |handle| {
+        IccFactory::new(handle, Selector::SoleCandidate)
+            .0
+            .refusal_delay()
+    })
+    .unwrap();
     assert_eq!(delay, Some(REFUSAL_DELAY));
     assert!(REFUSAL_DELAY > Duration::from_secs(5));
 }

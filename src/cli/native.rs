@@ -53,6 +53,17 @@ pub(super) fn report<B: Bus>(bus: &B, out: &mut dyn Write) -> Result<(), Error> 
     Ok(())
 }
 
+/// The raw-USB listing: counts and modes as `probe` reports them, plus where selection lives.
+/// Serials stay unprinted, so the operator reads them from the camera or the OS.
+pub(super) fn list<B: Bus>(bus: &B, out: &mut dyn Write) -> Result<(), Error> {
+    report(bus, out)?;
+    writeln!(
+        out,
+        "Raw USB selects by `camera_serial` (the camera's USB serial number), never printed here; --describe is for camera_backend = \"icc\"."
+    )?;
+    Ok(())
+}
+
 pub(super) struct Native<B> {
     bus: B,
     serial: Option<String>,

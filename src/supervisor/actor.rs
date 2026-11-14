@@ -41,6 +41,11 @@ pub enum OpenError {
     /// Enumeration, descriptor validation or another native setup operation failed.
     #[error("camera discovery failed")]
     Discovery,
+    /// Several candidate cameras are attached and none was selected.
+    #[error(
+        "more than one camera found; run `tethercam cameras` and select one in the configuration"
+    )]
+    Ambiguous,
 }
 
 /// A transport factory. Connecting must not open a PTP session; only the actor does that.

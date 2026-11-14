@@ -63,6 +63,33 @@ fn rejects_ambiguous_and_duplicate_syntax() {
     assert!(Options::parse(std::iter::repeat_with(|| OsString::from("run"))).is_err());
 }
 
+#[test]
+fn cameras_takes_only_a_config_and_an_explicit_describe() {
+    let plain = parse(&["cameras", "--config", "/synthetic/config.toml"]).unwrap();
+    assert_eq!(plain.command, Command::Cameras { describe: false });
+    assert_eq!(plain.config, Some("/synthetic/config.toml".into()));
+    for args in [
+        vec!["cameras", "--describe"],
+        vec!["cameras", "--describe", "--config", "a"],
+        vec!["cameras", "--config", "a", "--describe"],
+    ] {
+        let options = parse(&args).unwrap();
+        assert_eq!(options.command, Command::Cameras { describe: true });
+    }
+    for args in [
+        vec!["cameras", "--describe", "--describe"],
+        vec!["cameras", "--simulate", "a"],
+        vec!["cameras", "--no-discovery"],
+        vec!["run", "--describe"],
+        vec!["probe", "--describe"],
+        vec!["setup", "--describe"],
+        vec!["--help", "--describe"],
+        vec!["--version", "--describe"],
+    ] {
+        assert_eq!(parse(&args), Err(ParseError::Invalid), "{args:?}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_commands_fail_and_paths_survive() {

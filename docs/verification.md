@@ -153,7 +153,9 @@ under `coverage/`; it does not replace the enforcement result with a custom poli
 ### `macos-icc` coverage
 
 The portable ICC layers (`src/transport/icc/`, except `native.rs`) and the backend wiring
-(`src/cli/icc.rs`: factory, reconnect and quarantine policy, worker, launch and its process exit) are fully
+(`src/cli/icc.rs`: factory, selection, reconnect and quarantine policy, worker, launch and its process exit;
+`src/cli/cameras.rs`: the `cameras` listing and its opt-in `--describe`, whose output path runs against
+scripted boundaries and never starts `ImageCaptureCore`) are fully
 covered on hosted Linux through deterministic fakes, the simulated Sony body and a stand-in for the
 main-thread runtime. Off macOS the real `run` entry point is a stub that reports the runtime unavailable,
 so even the real launch path up to that point runs there. `native.rs` is `cfg(target_os = "macos")`, so
