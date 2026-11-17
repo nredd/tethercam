@@ -40,7 +40,7 @@ NOT verified, and not claimed:
 ## Camera checklist
 
 These settings come from the earlier docs and the code's USB mode check. They were not individually
-confirmed on the measured run beyond the camera working with them as the owner had set it. On the
+confirmed on the measured run, and the camera's actual settings were not recorded. On the
 camera, with the body powered:
 
 1. Menu -> Setup -> USB Connection -> **PC Remote**. The software refuses the body in MTP and
