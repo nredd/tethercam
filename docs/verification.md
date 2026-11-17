@@ -129,6 +129,11 @@ source tests. The sole local constraint remains exactly `src/transport/usb/nusb_
 and only when `CI` is absent and VHCI is absent. It is announced loudly; any `CI` value disables
 that exception. Hosted Linux requires the adapter's full coverage too.
 
+macOS: there is no macOS coverage job yet. `src/transport/usb/nusb_backend.rs` (0/195 lines on the
+`xcode-27` image: it only runs through Linux VHCI/USB/IP) and `src/transport/icc/native.rs` (needs a
+live camera) are uncovered natively, and no exclusion is allowed, so hosted Linux `coverage` remains
+the only coverage gate. Tracked in [#126](https://github.com/nredd/tethercam/issues/126).
+
 Toolchain: `rust-toolchain.toml` pins one exact stable release (plus the `clippy`, `rustfmt` and
 `llvm-tools-preview` components and the two cross targets) for every gate, and LLVM region
 accounting changes between rustc releases (e.g. rustc 1.99.1 and 1.100.0 disagree on the inline

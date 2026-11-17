@@ -9,9 +9,9 @@ after the new jobs have completed successfully and the current merge train is st
 | Workflow | Required contexts | Gate |
 | --- | --- | --- |
 | `fmt.yml` | `fmt` | `make fmt-check` |
-| `lint.yml` | `clippy (ubuntu-latest)`, `clippy (macos-latest)` | `make lint` |
-| `check.yml` | `native-check (ubuntu-latest)`, `native-check (macos-latest)` | `make check`, all targets and features |
-| `test.yml` | `test (ubuntu-latest)`, `test (ubuntu-24.04-arm)`, `test (macos-latest)` | `make test`, nextest and doctests |
+| `lint.yml` | `clippy (ubuntu-latest)`, `clippy (macos)` | `make lint` |
+| `check.yml` | `native-check (ubuntu-latest)`, `native-check (macos)` | `make check`, all targets and features |
+| `test.yml` | `test (ubuntu-latest)`, `test (ubuntu-24.04-arm)`, `test (macos)` | `make test`, nextest and doctests |
 | `test.yml` | `msrv` | Library and binary check on Rust 1.90 |
 | `test.yml` | `policy` | `cargo test --test repository_policy` |
 | `docs.yml` | `rustdoc` | `make doc`, warnings denied |
@@ -19,6 +19,53 @@ after the new jobs have completed successfully and the current merge train is st
 | `cross.yml` | `check (aarch64-unknown-linux-gnu)`, `check (armv7-unknown-linux-gnueabihf)` | Embedded cross checks, all features |
 | `deny.yml` | `deny` | `make deny` (`cargo deny check`) on the pinned toolchain |
 | `coverage.yml` | `coverage` | `make coverage`, exact 100% per-file lines/functions/regions across the actual `src/` root, including test modules; implicit filename exclusions disabled |
+
+## macOS 27 legs
+
+Every macOS leg runs on the `xcode-27` hosted label: Apple Silicon (arm64) only, macOS 27, Xcode 27 (image
+[readme](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)).
+GitHub does not publish a `macos-27` label: Xcode-based images are named for the Xcode major, not
+the OS. Contexts never embed the label or version: matrix legs use the value `macos` and map it to
+the label in `runs-on`. The next image bump edits the
+workflows and `.github/actions/assert-xcode-27`, never the ruleset.
+
+The composite action `.github/actions/assert-xcode-27` runs right after checkout in each leg, prints
+`sw_vers` and `xcodebuild -version`, and fails unless the arch is `arm64` and the OS and Xcode majors
+are both 27, so a retargeted label cannot silently gate on another image. `tests/repository_policy.rs`
+requires it in every leg and rejects any other `macos*` matrix value or label.
+
+The image is a scarce hosted pool, so only gates that add information on macOS get a leg.
+
+| Gate | macOS 27 leg | Why |
+| --- | --- | --- |
+| `clippy`, `native-check`, `test` | `macos` replaces `macos-latest` in the existing matrices | Same gates, newer image; no duplicate macOS 26 leg |
+| `coverage` | none | Deferred to [#126](https://github.com/nredd/tethercam/issues/126); hosted Linux `coverage` stays the strict 100% gate, unchanged |
+| `rustdoc` | none | `clippy` and `native-check` already compile the macOS `cfg` code with all features; only a macOS-only intra-doc link could differ |
+| `bench` | none | `clippy --all-targets` compiles every benchmark on macOS; the smoke run is platform independent |
+| `msrv` | none | Known gap: macOS-only `cfg` code is not checked on Rust 1.90; add a leg when macOS-only code grows |
+| `fmt`, `policy` | none | `rustfmt` and the policy test read repository files and are platform independent; a second run is pure duplication |
+| `deny` | none | `deny.toml` sets no `targets`, so the Linux job already audits the all-platform dependency graph; the pinned action is a Docker action that does not run on macOS |
+| `cross` | none | Cross-compiles to Linux targets only; a macOS host adds nothing |
+
+macOS coverage is honestly pending, not excluded. A native macOS run of `make coverage` leaves
+`src/transport/usb/nusb_backend.rs` (compiled on macOS, exercised only through Linux VHCI/USB/IP; 0/195 lines on the `xcode-27` image)
+and `src/transport/icc/native.rs` (needs a live camera) uncovered, so a macOS coverage leg would be
+red. The leg is deferred to [#126](https://github.com/nredd/tethercam/issues/126), which needs
+seams rather than exclusions.
+
+## Transition from `macos-latest`
+
+The live ruleset requires `clippy (macos-latest)`, `native-check (macos-latest)` and
+`test (macos-latest)`. Matrix contexts are named after their axis value, so replacing the value
+renames the context and a PR that renames them cannot go green under the live ruleset. The parent
+edits the live ruleset in place before merging, once the new contexts have completed green on the
+PR head (the `PUT` below, with the payload from this PR):
+
+- Add `clippy (macos)`, `native-check (macos)`, `test (macos)`
+- Remove `clippy (macos-latest)`, `native-check (macos-latest)`, `test (macos-latest)`
+- Every other context keeps its name
+
+Open PRs must be rebased onto the merged workflows to report the new contexts.
 
 All 16 checks are individual GitHub Actions jobs, not an optional aggregate. Actions app ID
 `15368` was read from this repository's real check runs; every context is bound to it. No
