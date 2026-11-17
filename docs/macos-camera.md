@@ -167,9 +167,9 @@ target/release/tethercam run --config ./camera.toml
   session was open) is not remembered, so the next open can still succeed and the restriction surface
   as a native failure then
 
-Not validated on hardware, and not claimed: listing and exact selection (including whether the identifier
-survives replug, reboot or a camera power-cycle), a live Sony stream over ICC, the LaunchAgent context
-(GUI-session domain, camera consent, signing), screen lock and unlock, unplug and replug, deadlines and
+Not validated on hardware, and not claimed (listing, exact selection, a live Sony stream and a LaunchAgent
+install with graceful restart were each seen once, see Validation status): whether the identifier
+survives replug, reboot or a camera power-cycle, signing, screen lock and unlock, unplug and replug, deadlines and
 late callbacks, and any endurance. A quarantine cannot be recovered in process, and a missing native
 callback can block shutdown indefinitely. The experimental label stands.
 
@@ -178,6 +178,15 @@ callback can block shutdown indefinitely. The experimental label stands.
 - AI-assisted independent source review of the `image-capture` crate (not a certification or formal audit)
 - ONE short real-camera sample of that crate: discovery, two open / `GetDeviceInfo` / confirmed-close
   cycles with a same-process reopen, helpers untouched
+- One owner run on an a7 III (Mac mini, USB-C, `image-capture` 0.1.0, `main` e48ae46), counts only:
+  `cameras` listing and exact `camera_id` selection; two `GetDeviceInfo` cycles with confirmed
+  closes; the live-view probe (60 frames, 2 cycles, 1024x680, 2 confirmed closes); authenticated
+  RTSP H.264 viewed; UniFi Protect adoption with moving playback; Home Assistant snapshots; an
+  installed LaunchAgent whose graceful `SIGTERM` was followed by an automatic restart with a new
+  `run_id` and `ready`; and a 6 h 27 min partial soak, stopped by the owner, during which the host
+  NIC dropped and the stream recovered with no observed process restart. See the
+  [quickstart](macos-quickstart.md). Still NOT validated: 24 h or any endurance, battery telemetry
+  (null), screen lock, reboot, camera power-cycle, USB replug, and identifier stability across them
 - Hosted tests prove the state machine, bridge, framing and failure paths with deterministic fakes and
   the simulated Sony body behind the seam. They do not prove native memory safety, callback delivery,
   framework behavior, disconnect ordering or deployment permissions

@@ -33,8 +33,10 @@ interface is claimed.
 
 ## macOS
 
-No driver and no entitlement. If a system daemon holds the camera, opening reports it as in
-use; unplug and replug the camera.
+Raw USB needs no driver and no entitlement, but Apple's camera helpers can hold the interface and
+make opening report the camera as in use. Do not kill them or replug as a fix. Use the cooperative
+`ImageCaptureCore` backend (`camera_backend = "icc"`) instead: see the
+[macOS quickstart](macos-quickstart.md) and [`macos-camera.md`](macos-camera.md).
 
 `UsbTransport::reset` rejects a timeout whose deadline exceeds the clock range with
 `TransportError::Other` before issuing any USB operation. The transport remains usable.

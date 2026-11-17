@@ -153,8 +153,8 @@ with status 75, and `KeepAlive` restarts it after the throttle. So does a native
 completes: if every discovery is answered busy for 300 s, the service restarts the same way
 (`icc_busy_limit_exceeded` in the log) instead of sitting at `waiting` until killed by hand. Under `icc` a stop waits for the native
 join, which can wait forever if the framework never calls back; `ExitTimeOut` 0 keeps launchd from
-sending `SIGKILL`. LaunchAgent execution, camera consent and signing, and screen lock are not validated
-on hardware. One-shot commands (`tethercam cameras`, `probe`, `doctor`) under `icc` are bounded the other
+sending `SIGKILL`. One graceful `SIGTERM` stop followed by an automatic restart (new `run_id`, `ready`) was
+observed on hardware; signing, screen lock and reboot are not validated. One-shot commands (`tethercam cameras`, `probe`, `doctor`) under `icc` are bounded the other
 way: if native cleanup has not settled 60 s after the command's output is written, they exit with status
 69 and a notice, never hanging; the service is not watched this way.
 
