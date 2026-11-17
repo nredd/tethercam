@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 - Reject partial media decodes when FFmpeg reports an error.
 - Prepare and clean up hosted USB/IP prerequisites for the release gate.
+- Bound hung tests: `.config/nextest.toml` terminates a test after 120 s (2x its 60 s slow period), 2.4x the slowest real test. Test the coverage gate's region-only failure and its hint output errors, and document its report, unsupported toolchain layouts and generic-function coverage (#96, #102).
 
 Next release: `0.0.2`.
 

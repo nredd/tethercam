@@ -83,6 +83,16 @@ fn gate(root: &Path) -> std::io::Result<Output> {
         .output()
 }
 
+/// An executed line whose `else` branch never runs: line and function coverage stay complete.
+const REGION_ONLY: &str = "pub fn used() -> u32 { if std::hint::black_box(true) { 1 } else { 2 } }\n#[cfg(test)] mod tests;\n";
+
+/// One `data[0].totals` entry of the unfiltered JSON the failed gate left behind.
+fn totals(root: &Path, kind: &str) -> serde_json::Value {
+    let json = fs::read_to_string(root.join("coverage/coverage.json")).expect("json report");
+    let report: serde_json::Value = serde_json::from_str(&json).expect("report json");
+    report["data"][0]["totals"][kind].clone()
+}
+
 #[test]
 fn native_gate_rejects_uncovered_nested_tests_support_empty_and_stale_profiles() {
     let temp = tempfile::tempdir().expect("fixture");
@@ -121,10 +131,12 @@ fn native_gate_rejects_uncovered_nested_tests_support_empty_and_stale_profiles()
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    for (path, content) in [
-        ("src/lib.rs", format!("{source}pub fn uncovered() -> u32 {{ 42 }}\n")),
-        ("src/tests/mod.rs", "#[test] fn exercised() { assert_eq!(crate::used(), 1); }\nfn uncovered_test_helper() -> u32 { 42 }\n".into()),
-        ("src/test_support.rs", "pub fn uncovered_support() -> u32 { 42 }\n".into()),
+    for (path, content, region_only) in [
+        ("src/lib.rs", format!("{source}pub fn uncovered() -> u32 {{ 42 }}\n"), false),
+        ("src/tests/mod.rs", "#[test] fn exercised() { assert_eq!(crate::used(), 1); }\nfn uncovered_test_helper() -> u32 { 42 }\n".into(), false),
+        ("src/test_support.rs", "pub fn uncovered_support() -> u32 { 42 }\n".into(), false),
+        // The #88 case: the line runs, only the `else` region on it never does.
+        ("src/lib.rs", REGION_ONLY.into(), true),
     ] {
         fs::write(root.join("src/lib.rs"), if path == "src/test_support.rs" { format!("{source}pub mod test_support;\n") } else { source.into() }).expect("reset");
         fs::write(root.join("src/tests/mod.rs"), "#[test] fn exercised() { assert_eq!(crate::used(), 1); }\n").expect("reset tests");
@@ -137,7 +149,16 @@ fn native_gate_rejects_uncovered_nested_tests_support_empty_and_stale_profiles()
         assert!(stdout.contains("TOOLCHAIN: rustc "), "{stdout}");
         assert!(stdout.contains("coverage/uncovered.txt"), "{stdout}");
         let report = fs::read_to_string(root.join("coverage/uncovered.txt")).expect("text report");
-        assert!(report.contains("^0") || report.contains("|      0|"), "{report}");
+        if region_only {
+            // Every line executed: only the region counters can have failed the gate.
+            let lines = totals(root, "lines");
+            assert_eq!(lines["count"], lines["covered"], "not region-only: {lines}");
+            let regions = totals(root, "regions");
+            assert!(regions["covered"].as_u64() < regions["count"].as_u64(), "{regions}");
+            assert!(report.contains("^0"), "{report}");
+        } else {
+            assert!(report.contains("|      0|"), "{report}");
+        }
     }
     // Cleaning removes old green profiles. An empty collection cannot reuse their success.
     assert!(

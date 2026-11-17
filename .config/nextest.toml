@@ -1,0 +1,9 @@
+# A hung test would otherwise block a local or CI run until the job timeout.
+#
+# The slowest real test is `soak::a_stalled_stream_is_reported_as_a_long_gap_by_real_ffprobe`,
+# about 50 s by design (it stops the service for 45 s). The tool integration tests are far
+# faster. Each 60 s period is reported as SLOW; the test is killed after two of them (120 s),
+# 2.4x the slowest real test. `tests/repository_policy.rs` enforces the headroom, and the
+# measurements are in `docs/verification.md`.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }

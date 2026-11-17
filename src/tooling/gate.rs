@@ -221,21 +221,30 @@ mod tests {
         }
     }
 
-    /// Accepts this many complete lines, then fails.
+    /// Accepts this many complete lines, fails the next write once, then accepts everything.
+    /// Failing once keeps a swallowed hint error from being masked by the following hint.
     #[cfg(unix)]
-    struct FailAfterLines(usize);
+    struct FailAfterLines(usize, bool);
     #[cfg(unix)]
     impl Write for FailAfterLines {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.0 == 0 {
+            if self.0 == 0 && !self.1 {
+                self.1 = true;
                 return Err(std::io::Error::other("synthetic output failure"));
             }
-            self.0 -= usize::from(bytes.contains(&b'\n'));
+            self.0 = self.0.saturating_sub(usize::from(bytes.contains(&b'\n')));
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The injected `Write` failure, as opposed to any other `Err`.
+    #[cfg(unix)]
+    fn is_output_failure(error: &Error) -> bool {
+        matches!(error, Error::Io(io) if io.to_string() == "synthetic output failure"
+            || io.to_string() == "injected")
     }
 
     #[cfg(unix)]
@@ -396,24 +405,42 @@ mod tests {
         let text = String::from_utf8(output).expect("text");
         assert!(!text.contains("grep"));
         assert!(text.contains("`rust-toolchain.toml`"));
-        // Operator output failures surface from each hint.
-        assert!(
-            invoke(
+        // Operator output failures surface from each hint, not the gate's own failure. After
+        // `TOOLCHAIN` the first hint is line two when the text report succeeds, else the
+        // toolchain hint; losing it must not be masked by "native coverage gate failed".
+        for (cargo, accepted) in [(&text_ok, 1), (&text_ok, 2), (&false_cargo, 1)] {
+            let error = invoke(
                 temp.path(),
                 home,
                 &tc,
-                &text_ok,
+                cargo,
                 false,
-                &mut FailAfterLines(1)
+                &mut FailAfterLines(accepted, false),
             )
-            .is_err()
-        );
-        FailAfterLines(0).flush().expect("flush");
+            .expect_err("hint write must fail");
+            assert!(is_output_failure(&error), "{accepted}: {error:?}");
+        }
+        // Control: with room for every line the failure is the gate's own.
+        let error = invoke(
+            temp.path(),
+            home,
+            &tc,
+            &text_ok,
+            false,
+            &mut FailAfterLines(3, false),
+        )
+        .expect_err("gate fails");
+        assert!(matches!(
+            error,
+            Error::Invalid("native coverage gate failed")
+        ));
+        FailAfterLines(0, false).flush().expect("flush");
         let ignore = "x";
-        assert!(report_failure(temp.path(), &text_ok, ignore, &mut crate::tests::Broken).is_err());
-        assert!(
-            report_failure(temp.path(), &false_cargo, ignore, &mut crate::tests::Broken).is_err()
-        );
+        for cargo in [&text_ok, &false_cargo] {
+            let error = report_failure(temp.path(), cargo, ignore, &mut crate::tests::Broken)
+                .expect_err("hint write must fail");
+            assert!(is_output_failure(&error), "{error:?}");
+        }
         assert!(
             invoke(
                 temp.path(),
