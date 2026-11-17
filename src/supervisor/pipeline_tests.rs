@@ -323,3 +323,38 @@ async fn a_changed_live_view_size_fails_the_pipeline_even_with_no_subscriber() {
         "frame is '48x32', encoder expects '32x32'"
     );
 }
+
+#[tokio::test]
+async fn the_first_frame_check_agrees_with_prepare_for_every_stream_setting() {
+    let frames = [
+        jpeg(32, 32),
+        jpeg(33, 33),
+        b"not a jpeg".to_vec(),
+        jpeg(2048, 16),
+    ];
+    for frame in &frames {
+        for (h264, mjpeg) in [(true, true), (true, false), (false, true), (false, false)] {
+            let settings = Streams {
+                frame_rate: 15,
+                bitrate: 100_000,
+                h264,
+                mjpeg,
+                full_resolution_snapshot: false,
+            };
+            let (_actor, control) = Supervisor::new(
+                Factory::new(Vec::new()),
+                SonyConfig::default(),
+                SessionConfig::default(),
+                Duration::from_millis(10),
+            )
+            .unwrap();
+            let prepared = Pipeline::prepare(frame, &settings, control).map(drop);
+            assert_eq!(
+                check_first_frame(frame, &settings).is_ok(),
+                prepared.is_ok(),
+                "h264 {h264} mjpeg {mjpeg} frame {} bytes",
+                frame.len()
+            );
+        }
+    }
+}

@@ -7,11 +7,12 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 
 use super::Error;
-use crate::config::Config;
+use super::first_frame::FirstFrameCause;
+use crate::config::{Config, Streams};
 use crate::onvif::discovery::{self, EndpointReference, Interface, ServiceAddress};
 use crate::ptp::session::SessionConfig;
-use crate::sony::{SonyCamera, SonyConfig};
-use crate::supervisor::CameraFactory;
+use crate::sony::{Battery, Capabilities, Protocol, SonyCamera, SonyConfig, SonyError};
+use crate::supervisor::{CameraFactory, check_first_frame};
 
 pub(super) fn level(level: &str) -> tracing::Level {
     match level {
@@ -36,19 +37,88 @@ pub(super) fn check_host(cfg: &Config, now: i64) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) async fn probe<F: CameraFactory>(
-    mut factory: F, out: &mut dyn Write,
+pub(super) async fn probe<F: CameraFactory>(factory: F, out: &mut dyn Write) -> Result<(), Error> {
+    let (protocol, capabilities, battery, _) = inspect(factory, SonyConfig::default(), false)
+        .await?
+        .map_err(|_| Error::Camera)?;
+    report(out, protocol, &capabilities, battery)
+}
+
+/// `probe` plus the step `run` waits on: fetch the first live-view frame and apply `run`'s own
+/// check of it under `streams`. A failure names its likely cause ([`FirstFrameCause`]) instead of
+/// the generic camera error. The driver's deadlines are injected so a missing frame is testable
+/// fast.
+pub(super) async fn doctor_camera<F: CameraFactory>(
+    factory: F, config: SonyConfig, streams: &Streams, out: &mut dyn Write,
 ) -> Result<(), Error> {
+    let (protocol, capabilities, battery, frame) = inspect(factory, config, true)
+        .await?
+        .map_err(|failure| Error::FirstFrame(failure.cause(streams)))?;
+    // The very check `run` makes of its first frame, so ready here means `run` accepts it.
+    frame
+        .map_or(Ok(()), |frame| check_first_frame(&frame, streams))
+        .map_err(|error| Error::FirstFrame(FirstFrameCause::of_pipeline(&error)))?;
+    report(out, protocol, &capabilities, battery)
+}
+
+/// A failed walk of the session: the driver error, whether it came while waiting for the first
+/// frame (as opposed to for live view to become ready), and the frame if one was fetched. The
+/// driver's error wins over a close error, so an error with a frame in hand is the close.
+struct Failure {
+    error: SonyError,
+    waiting_for_frame: bool,
+    frame: Option<Vec<u8>>,
+}
+
+impl Failure {
+    fn cause(&self, streams: &Streams) -> FirstFrameCause {
+        match &self.frame {
+            None => FirstFrameCause::of(&self.error, self.waiting_for_frame),
+            // A frame run would reject is the more actionable finding. Otherwise only the
+            // close failed: never ready, and never blamed on the missing frame.
+            Some(frame) => check_first_frame(frame, streams).map_or_else(
+                |error| FirstFrameCause::of_pipeline(&error),
+                |()| FirstFrameCause::CloseFailed,
+            ),
+        }
+    }
+}
+
+type Inspected = (Protocol, Capabilities, Option<Battery>, Option<Vec<u8>>);
+
+/// Open the camera and walk the session as far as `check_frame` asks. The outer error is the
+/// factory's; the inner one is the [`Failure`].
+async fn inspect<F: CameraFactory>(
+    mut factory: F, config: SonyConfig, check_frame: bool,
+) -> Result<Result<Inspected, Failure>, Error> {
     let transport = factory.connect().await?.ok_or(Error::NoCamera)?;
     let mut session = factory.session(transport, SessionConfig::default(), std::time::Instant::now);
-    let report = SonyCamera::run(&mut session, SonyConfig::default(), async |camera| {
+    let mut waiting_for_frame = false;
+    let mut frame = None;
+    let report = SonyCamera::run(&mut session, config, async |camera| {
         camera.wait_live_view_ready().await?;
+        if check_frame {
+            waiting_for_frame = true;
+            frame = Some(camera.next_live_view_frame().await?);
+        }
         Ok((camera.protocol(), camera.capabilities(), camera.battery()))
     })
     .await;
     let transport = factory.recover(session);
     factory.release(transport);
-    let (protocol, capabilities, battery) = report.map_err(|_| Error::Camera)?;
+    Ok(match report {
+        Ok((protocol, capabilities, battery)) => Ok((protocol, capabilities, battery, frame)),
+        Err(error) => Err(Failure {
+            error,
+            waiting_for_frame,
+            frame,
+        }),
+    })
+}
+
+fn report(
+    out: &mut dyn Write, protocol: Protocol, capabilities: &Capabilities, battery: Option<Battery>,
+) -> Result<(), Error> {
     writeln!(
         out,
         "Camera: PC Remote; protocol {protocol:?}\nCapabilities: {capabilities:?}\nBattery/power: {battery:?}"
