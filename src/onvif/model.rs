@@ -91,6 +91,32 @@ pub struct DeviceDescription {
     pub interface: NetworkInterface,
 }
 
+impl DeviceDescription {
+    /// Fixed discovery scopes shared with the Device service.
+    pub(crate) fn scopes(&self) -> Vec<String> {
+        let encode = |s: &str| {
+            s.bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') {
+                        char::from(b).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>()
+        };
+        vec![
+            "onvif://www.onvif.org/Profile/Streaming".to_owned(),
+            "onvif://www.onvif.org/type/video_encoder".to_owned(),
+            format!("onvif://www.onvif.org/name/{}", encode(&self.model)),
+            format!(
+                "onvif://www.onvif.org/hardware/{}",
+                encode(&self.hardware_id)
+            ),
+        ]
+    }
+}
+
 /// A validated device and profile set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceModel {

@@ -155,6 +155,61 @@ fn unnamed_discovery_skips_loopback_and_ipv4_link_local_unless_asked_for() {
 }
 
 #[test]
+fn discovery_announces_and_matches_device_scopes() {
+    use crate::onvif::discovery::{Engine, SystemEntropy};
+    use std::time::Instant;
+
+    let cfg = Config::generate().unwrap();
+    let discovery = discovery(&cfg, vec![interface("test0", "192.0.2.1", true)]).unwrap();
+    let scopes = [
+        "onvif://www.onvif.org/Profile/Streaming",
+        "onvif://www.onvif.org/type/video_encoder",
+        "onvif://www.onvif.org/name/USB%20camera%20bridge",
+        "onvif://www.onvif.org/hardware/tethercam",
+    ];
+    let model = crate::supervisor::model(&cfg, 640, 480).unwrap();
+    let ctx = crate::onvif::service::Context {
+        model: &model,
+        local: "192.0.2.1:8080".parse().unwrap(),
+        now: 0,
+        snapshot: true,
+        authenticated: true,
+    };
+    let op = crate::onvif::soap::Element {
+        namespace: Some(crate::onvif::soap::NS_DEVICE.into()),
+        name: "GetScopes".into(),
+        text: String::new(),
+        attributes: vec![],
+        children: vec![],
+    };
+    let response = crate::onvif::device::handle(&op, &ctx).unwrap();
+    for scope in scopes {
+        assert!(response.contains(scope));
+    }
+    assert_eq!(response.matches("<tt:ScopeItem>").count(), scopes.len());
+    let mut engine = Engine::new(discovery, SystemEntropy::default());
+    let now = Instant::now();
+    for hello in engine.hello(now) {
+        let xml = String::from_utf8(hello.payload).unwrap();
+        for scope in scopes {
+            assert!(xml.contains(scope), "missing {scope} in {xml}");
+        }
+    }
+    for (n, scope) in scopes.iter().enumerate() {
+        let probe = format!(
+            r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"><e:Header><w:MessageID>uuid:11111111-2222-3333-4444-{n:012}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Scopes>{scope}</d:Scopes></d:Probe></e:Body></e:Envelope>"#
+        );
+        let response = engine
+            .handle(now, "192.0.2.2:1234".parse().unwrap(), probe.as_bytes())
+            .unwrap();
+        let xml = String::from_utf8(response.payload).unwrap();
+        for expected in scopes {
+            assert!(xml.contains(expected));
+        }
+    }
+}
+
+#[test]
 fn discovery_uses_only_selected_local_interfaces_and_stored_identity() {
     let mut cfg = Config::generate().unwrap();
     let interfaces = vec![

@@ -17,4 +17,7 @@ pub(crate) mod testing;
 pub use actor::{CameraFactory, CameraStatus, Control, OpenError, Supervisor, SupervisorError};
 pub use counters::CounterSnapshot;
 pub use pipeline::{PipelineError, RuntimeSource};
+pub(crate) use runtime::device_description;
+#[cfg(test)]
+pub(crate) use runtime::model;
 pub use runtime::{RunError, serve};

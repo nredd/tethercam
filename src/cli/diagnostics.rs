@@ -98,7 +98,7 @@ pub(super) fn discovery(
     let endpoint = EndpointReference::from_uuid(cfg.endpoint_uuid);
     discovery::Config::new(
         endpoint,
-        vec!["onvif://www.onvif.org/type/video_encoder".into()],
+        crate::supervisor::device_description(cfg).scopes(),
         interfaces,
         ServiceAddress {
             port: cfg.onvif_port,

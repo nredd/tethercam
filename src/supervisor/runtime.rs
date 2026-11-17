@@ -74,7 +74,7 @@ pub enum RunError {
     Output(#[from] io::Error),
 }
 
-fn model(cfg: &Config, width: u32, height: u32) -> Result<DeviceModel, RunError> {
+pub(crate) fn device_description(cfg: &Config) -> DeviceDescription {
     let [first, rest @ ..] = *cfg.endpoint_uuid.as_bytes();
     let hw_address = std::iter::once((first | 0x02) & 0xfe)
         .chain(rest)
@@ -82,6 +82,21 @@ fn model(cfg: &Config, width: u32, height: u32) -> Result<DeviceModel, RunError>
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(":");
+    DeviceDescription {
+        manufacturer: "tethercam".into(),
+        model: "USB camera bridge".into(),
+        firmware_version: env!("CARGO_PKG_VERSION").into(),
+        serial_number: cfg.endpoint_uuid.to_string(),
+        hardware_id: "tethercam".into(),
+        hostname: cfg.device_name.clone(),
+        interface: NetworkInterface {
+            name: cfg.interface.clone().unwrap_or_else(|| "default".into()),
+            hw_address,
+        },
+    }
+}
+
+pub(crate) fn model(cfg: &Config, width: u32, height: u32) -> Result<DeviceModel, RunError> {
     let profile = |token: &str, codec| StreamProfile {
         name: token.into(),
         token: token.into(),
@@ -100,18 +115,7 @@ fn model(cfg: &Config, width: u32, height: u32) -> Result<DeviceModel, RunError>
         profiles.push(profile("mjpeg", VideoCodec::Jpeg));
     }
     Ok(DeviceModel::new(
-        DeviceDescription {
-            manufacturer: "tethercam".into(),
-            model: "USB camera bridge".into(),
-            firmware_version: env!("CARGO_PKG_VERSION").into(),
-            serial_number: cfg.endpoint_uuid.to_string(),
-            hardware_id: "tethercam".into(),
-            hostname: cfg.device_name.clone(),
-            interface: NetworkInterface {
-                name: cfg.interface.clone().unwrap_or_else(|| "default".into()),
-                hw_address,
-            },
-        },
+        device_description(cfg),
         profiles,
         cfg.rtsp_port,
     )?)
