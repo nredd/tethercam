@@ -495,19 +495,17 @@ impl<F: CameraFactory> Supervisor<F> {
 
     fn latest_frame(&self) -> Result<Vec<u8>, SnapshotError> {
         let slot = self.frames.borrow();
-        let frame = slot.as_deref().ok_or(SnapshotError)?;
+        let frame = slot.as_deref();
         // Same rule as the media pipeline's per-frame check, applied before the reply: the
         // pipeline ends the run on a changed size, but a snapshot must never be served first
         // under the profile described for another size. An unreadable header is not a size.
-        if let (Some(published), Ok(actual)) = (
-            self.format.get(),
-            crate::media::JpegDecoder::dimensions(frame),
-        ) && actual != *published
+        let actual = frame.and_then(|frame| crate::media::JpegDecoder::dimensions(frame).ok());
+        if matches!((self.format.get(), actual), (Some(published), Some(actual)) if actual != *published)
         {
             tracing::warn!(event = "snapshot_size_mismatch");
             return Err(SnapshotError);
         }
-        Ok(frame.to_vec())
+        frame.map(<[u8]>::to_vec).ok_or(SnapshotError)
     }
 
     /// Capture one still. Only failures that provably left the shutter released keep the

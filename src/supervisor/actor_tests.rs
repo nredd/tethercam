@@ -1050,3 +1050,13 @@ async fn a_snapshot_without_a_readable_header_is_not_judged_by_size() {
         control.shutdown();
     });
 }
+
+/// A request that passed `Control::snapshot`'s slot check just before the session's slot was
+/// cleared reaches `latest_frame` with nothing to serve: refused, published size or not.
+#[test]
+fn an_empty_frame_slot_refuses_the_snapshot() {
+    let (actor, control) = actor(Factory::new(Vec::new()));
+    assert_eq!(actor.latest_frame(), Err(SnapshotError));
+    control.publish_format(32, 32);
+    assert_eq!(actor.latest_frame(), Err(SnapshotError));
+}
