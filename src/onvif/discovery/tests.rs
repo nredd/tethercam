@@ -320,44 +320,82 @@ fn message_id(payload: &[u8]) -> String {
 fn every_announcement_and_match_carries_one_stable_endpoint_and_a_fresh_message_id() {
     // What a capture analysis compares (#112): the endpoint reference is the identity and must
     // not vary between advertisements; the WS-Addressing `MessageID` is per message and must.
+    const LEGACY: &str = "http://schemas.xmlsoap.org/ws/2005/04/discovery";
+    const STANDARD: &str = "http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01";
+    let legacy_resolve = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"><e:Header><w:MessageID>uuid:77777777-2222-3333-4444-555555555555</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Resolve</w:Action></e:Header><e:Body><d:Resolve><w:EndpointReference><w:Address>urn:uuid:01234567-89ab-4def-8123-456789abcdef</w:Address></w:EndpointReference></d:Resolve></e:Body></e:Envelope>"#;
     let mut e = engine();
     let t0 = Instant::now();
-    let mut out = e.hello(t0);
-    for (n, probe) in [
-        with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000001"),
-        with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000002"),
-        PROBE_ONVIF.to_owned(),
-        RESOLVE.to_owned(),
-    ]
-    .iter()
-    .enumerate()
-    {
+    let mut out: Vec<_> = e
+        .hello(t0)
+        .into_iter()
+        .zip([(LEGACY, "Hello"), (STANDARD, "Hello")])
+        .collect();
+    let requests = [
+        (
+            with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000001"),
+            "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000001",
+            STANDARD,
+            "ProbeMatches",
+        ),
+        (
+            with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000002"),
+            "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000002",
+            STANDARD,
+            "ProbeMatches",
+        ),
+        (
+            PROBE_ONVIF.to_owned(),
+            "uuid:11111111-2222-3333-4444-555555555555",
+            LEGACY,
+            "ProbeMatches",
+        ),
+        (
+            RESOLVE.to_owned(),
+            "urn:uuid:99999999-bbbb-cccc-dddd-eeeeeeeeeeee",
+            STANDARD,
+            "ResolveMatches",
+        ),
+        (
+            legacy_resolve.to_owned(),
+            "uuid:77777777-2222-3333-4444-555555555555",
+            LEGACY,
+            "ResolveMatches",
+        ),
+    ];
+    let mut relates = vec![None, None];
+    for (n, (request, id, namespace, action)) in requests.iter().enumerate() {
         let source = peer(20 + u8::try_from(n).unwrap());
-        out.push(e.handle(t0, source, probe.as_bytes()).unwrap());
+        out.push((
+            e.handle(t0, source, request.as_bytes()).unwrap(),
+            (*namespace, *action),
+        ));
+        relates.push(Some(*id));
     }
-    assert_eq!(out.len(), 6, "a `Hello` per dialect plus four answers");
+    assert_eq!(out.len(), 7, "a `Hello` per dialect plus five answers");
     let mut ids = Vec::new();
-    for message in &out {
+    for ((message, (namespace, action)), relates_to) in out.iter().zip(relates) {
         let text = String::from_utf8(message.payload.clone()).unwrap();
         assert_eq!(
             text.matches(ENDPOINT).count(),
             1,
             "one endpoint reference: {text}"
         );
+        // The dialect is the one the message must speak, and only that one.
+        let other = if *namespace == LEGACY {
+            STANDARD
+        } else {
+            LEGACY
+        };
+        assert!(text.contains(&format!("{namespace}/{action}")), "{text}");
+        assert!(!text.contains(other), "{text}");
+        // Every answer echoes its own request's `MessageID` as `RelatesTo`.
+        if let Some(request) = relates_to {
+            assert!(text.contains(&format!("<a:RelatesTo>{request}</a:RelatesTo>")));
+        }
         ids.push(message_id(&message.payload));
     }
     let distinct: HashSet<_> = ids.iter().collect();
     assert_eq!(distinct.len(), ids.len(), "no `MessageID` repeats: {ids:?}");
-    // Every answer echoes its own request's `MessageID` as `RelatesTo`.
-    for (message, request) in out[2..].iter().zip([
-        "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000001",
-        "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000002",
-        "uuid:11111111-2222-3333-4444-555555555555",
-        "urn:uuid:99999999-bbbb-cccc-dddd-eeeeeeeeeeee",
-    ]) {
-        let text = String::from_utf8(message.payload.clone()).unwrap();
-        assert!(text.contains(&format!("<a:RelatesTo>{request}</a:RelatesTo>")));
-    }
 }
 
 #[test]

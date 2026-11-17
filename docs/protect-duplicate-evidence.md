@@ -48,10 +48,15 @@ One window at a time, passive, on the `tethercam` host or a mirror port. Filter 
 only (UDP 3702, both groups, plus unicast). Hard caps, whichever comes first:
 
 ```sh
-tcpdump -i <iface> -n -s 1400 -c 200 -G 600 -W 1 -w <private>/window1.pcap 'udp port 3702'
+tcpdump -i <iface> -n -s 4200 -c 200 -G 600 -W 1 -w <private>/window1.pcap 'udp port 3702'
 ```
 
-That is 200 packets, 10 minutes, 1400 bytes each. Start it first, then note `t0` (wall clock, UTC,
+That is 200 packets and 10 minutes. The snap length fits the largest accepted datagram
+(`MAX_PACKET`, 4096 bytes of payload) plus Ethernet, VLAN, IPv6 and UDP headers, so a packet is
+stored whole, at most 4200 bytes each (under 1 MiB in total). A stored packet whose captured
+length is below its original length is truncated: mark it `truncated` in the notes and leave it
+out of every equality comparison and count, never read a partial envelope as an identity.
+Start it first, then note `t0` (wall clock, UTC,
 seconds), then run the trigger:
 
 - Window 1, observation only: do nothing for the window, only watch the Devices view
@@ -73,6 +78,10 @@ Expected, so not findings:
 - `Hello` once per served interface and dialect at startup, each after a random delay up to
   500 ms, so two per interface on a restart, plus the same pair when an interface appears while
   running
+- On a graceful stop the service sends `Bye` per served interface and dialect (the same pair
+  count as `Hello`), so a restart shows those before the new `Hello`s. A crash, kill or power loss
+  sends none, and a missing `Bye` there is not a finding. No `Bye` is sent when an interface
+  vanishes
 - Replies are unicast to the prober and at most one per accepted probe. Retried or repeated copies
   of one `MessageID` are answered once. Whether Protect re-probes periodically is not established:
   record it, do not assume it
@@ -122,8 +131,12 @@ Each is a hypothesis to test next, not a conclusion:
 
 - Identity fields differ between advertisements: bridge-side. Report the shape (which field,
   between which labelled messages), then add a regression test with the fix
-- Identical on the wire, and a row appeared with no `T` advertisement in the preceding seconds:
-  controller-side caching or refresh. Nothing for the bridge to change
+- Identical on the wire, and a row appeared with no `T` advertisement on UDP 3702 in the
+  preceding seconds: inconclusive. The capture cannot see unicast or HTTP traffic between the
+  controller and the camera elsewhere (another port, another host, a mirror gap), so it neither
+  shows controller-side caching nor clears the bridge. Do not blame the cache or exonerate the
+  bridge; seek controller-side evidence (what Protect reports for the row, or its logs if the owner
+  chooses to look) before any conclusion
 - Identical on the wire, and a row appeared right after a `ProbeMatches`: Protect may key on
   something other than the endpoint reference (source or `XAddrs` address, scopes, ONVIF
   responses). Needs controller-side evidence before any change
