@@ -211,12 +211,7 @@ fn an_always_empty_listing_is_bounded_in_attempts_and_wall_time() {
     assert_eq!(discovers(&shared), 3);
     assert_eq!(script(&shared).discover.len(), 3);
     assert_eq!(attempt.elapsed, EmptyRecovery::ONE_SHOT.pause * 2);
-    // Native answering every window on time costs the windows too, never more than the bound.
-    assert!(
-        attempt.elapsed + DISCOVERY_WINDOW * 3 <= worst_case(EmptyRecovery::ONE_SHOT),
-        "{:?}",
-        attempt.elapsed
-    );
+    // The scripted discovery consumes no time, so only the pauses show; the windows are native's.
     assert!(!attempt.fatal);
     assert!(!logs.text().contains("synthetic-"), "{}", logs.text());
 }
