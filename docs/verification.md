@@ -142,9 +142,10 @@ asks cargo-llvm-cov for the same filtered text report in `coverage/uncovered.txt
 unexecuted region) and, if that command succeeds, prints `grep -n -B1 '\^0' coverage/uncovered.txt`.
 The report is **not** written when the gate fails before the native run (missing Cargo home,
 unreadable toolchain, unwritable `coverage/`), or when the text command itself fails; a stale
-report is removed at the start of every run, so a file there always belongs to the last failed
-run. The `TOOLCHAIN:` line is printed once the toolchain is known and the rustup hint with every
-native failure.
+report is removed only once a run reaches that step (after the `TOOLCHAIN:` line, so not when the
+Cargo home, working directory or toolchain query fails first); in that case an older report can
+remain, so trust `coverage/uncovered.txt` only after a run that printed `TOOLCHAIN:`. The rustup
+hint accompanies every native failure.
 
 Toolchain sources are excluded only under `/rustc/` and `<sysroot>/lib/rustlib/src/` (the latter
 when `rust-src` is installed; Homebrew's rustc ships it there). A distro `rustc` that maps the
@@ -156,13 +157,15 @@ with a spurious miss. It never admits a real one, but it is another reason the g
 supported on rustup only.
 
 Generic functions: line and function coverage merge instantiations, region coverage does not. A
-branch exercised only by another instantiation still counts as an unexecuted region, so a
-function can show every line covered and fail `--fail-uncovered-regions`. Checked with a
-two-instantiation fixture: `pick::<u8>(true)` plus `pick::<u16>(false)` left 1 of 7 regions
-uncovered with 100% lines and functions; adding `pick::<u8>(false)` and `pick::<u16>(true)`
-cleared it. Workaround: drive every branch through every instantiation, or avoid the
-monomorphization, e.g. take `&[Interface]` instead of a generic filter, as `announce` in
-`src/onvif/discovery.rs` does (PR [#120](https://github.com/nredd/tethercam/pull/120)).
+branch exercised only by a different instantiation than the rest still counts as an unexecuted
+region, so a function can show every line covered and fail `--fail-uncovered-regions`. Checked
+with a fixture (`pick::<T>(first: bool)` with one `if`/`else`): `pick::<u8>(true)` plus
+`pick::<u16>(false)` left 1 of 7 regions uncovered with 100% lines and functions, while
+`pick::<u8>(true)`, `pick::<u8>(false)` and `pick::<u16>(true)` left 0 of 20. The report is
+therefore not a union of instantiations; one instantiation that covers every branch is enough.
+Workaround: cover every branch within at least one instantiation, or avoid the monomorphization,
+e.g. take `&[Interface]` instead of a generic filter, as `announce` in `src/onvif/discovery.rs`
+does (PR [#120](https://github.com/nredd/tethercam/pull/120)).
 
 Acceptance tests run native instrumented fixture crates: uncovered ordinary source, test support
 and nested source tests fail; empty/cleaned/stale data cannot silently reuse success; malformed
@@ -196,7 +199,9 @@ the CI inventory yet: adding it changes the macOS job set and is coordinated wit
 
 `.config/nextest.toml` gives the default profile `slow-timeout = { period = "60s", terminate-after = 2 }`:
 a test still running after 60 s is reported `SLOW`, and after 120 s nextest terminates it
-(`TIMEOUT`), so one hang no longer holds a local or CI run until the job timeout. Sizing, from
+(`TIMEOUT`), so one hang in a nextest-run test (`make test`'s nextest step, `make coverage`) no
+longer holds a run until the job timeout. It does not cover `cargo test --doc`, plain `cargo test`
+or other non-nextest steps; those still depend on the workflow `timeout-minutes`. Sizing, from
 `cargo nextest run --all-features` (plain, then `cargo llvm-cov nextest`), `-j2`, macOS arm64,
 rustc 1.100.0:
 
