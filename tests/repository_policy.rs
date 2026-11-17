@@ -1115,3 +1115,72 @@ fn hand_selected_and_extra_toolchain_setup_fails() -> Result<(), Box<dyn Error>>
     }
     Ok(())
 }
+
+/// Slowest real test, measured: `soak::a_stalled_stream_is_reported_as_a_long_gap_by_real_ffprobe`
+/// sleeps 50 s by design. See "Hung tests" in `docs/verification.md` before changing this.
+const SLOWEST_REAL_TEST_SECS: u64 = 50;
+
+/// One hung test must end a run well before the shortest CI job timeout (10 minutes).
+const LONGEST_ALLOWED_HANG_SECS: u64 = 300;
+
+/// The default nextest profile terminates a hung test, and only after clear headroom over the
+/// slowest real test, so a loaded runner never kills a healthy one.
+fn validate_nextest(config: &str) -> Result<(), String> {
+    let config: toml::Value = toml::from_str(config).map_err(|error| error.to_string())?;
+    let slow = config
+        .get("profile")
+        .and_then(|profile| profile.get("default"))
+        .and_then(|profile| profile.get("slow-timeout"))
+        .ok_or("`profile.default.slow-timeout` is required")?;
+    let period = slow
+        .get("period")
+        .and_then(toml::Value::as_str)
+        .and_then(|period| period.strip_suffix('s'))
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .ok_or("`period` must be whole seconds, e.g. \"60s\"")?;
+    let after = slow
+        .get("terminate-after")
+        .and_then(toml::Value::as_integer)
+        .and_then(|after| u64::try_from(after).ok())
+        .filter(|after| *after > 0)
+        .ok_or("`terminate-after` is required: without it a hung test is only reported")?;
+    let window = period.saturating_mul(after);
+    require(
+        window >= 2 * SLOWEST_REAL_TEST_SECS,
+        "terminate window needs at least 2x headroom over the slowest real test",
+    )?;
+    require(
+        window <= LONGEST_ALLOWED_HANG_SECS,
+        "terminate window must stay well inside the CI job timeouts",
+    )
+}
+
+#[test]
+fn nextest_terminates_hung_tests_with_headroom() -> Result<(), Box<dyn Error>> {
+    validate_nextest(include_str!("../.config/nextest.toml"))?;
+    let valid = "[profile.default]\nslow-timeout = { period = \"60s\", terminate-after = 2 }\n";
+    validate_nextest(valid)?;
+    for (config, expected) in [
+        ("[profile.default]\nslow-timeout = \"60s\"\n", "period"),
+        (
+            "[profile.default]\nslow-timeout = { period = \"60s\" }\n",
+            "terminate-after",
+        ),
+        (
+            "[profile.default]\nslow-timeout = { period = \"60s\", terminate-after = 0 }\n",
+            "terminate-after",
+        ),
+        (
+            "[profile.default]\nslow-timeout = { period = \"30s\", terminate-after = 2 }\n",
+            "headroom",
+        ),
+        (
+            "[profile.default]\nslow-timeout = { period = \"60s\", terminate-after = 10 }\n",
+            "CI job timeouts",
+        ),
+    ] {
+        let error = validate_nextest(config).expect_err(config);
+        assert!(error.contains(expected), "{config}: {error}");
+    }
+    Ok(())
+}

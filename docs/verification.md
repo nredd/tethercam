@@ -136,11 +136,37 @@ arguments of a `log::warn!`), so an unpinned local run can pass where CI fails, 
 Use rustup, which honors the file and installs the pin on first use; there is nothing to
 `rustup update`. The gate prints a `TOOLCHAIN:` line; it must match the CI log. A non-rustup
 install (distro, Homebrew) ignores the file, has no `llvm-tools-preview` (cargo-llvm-cov fails
-early and says so) and is unsupported for the gates, though its sysroot `rust-src` sources are
-excluded like `/rustc/` ones. The native
-summary lists uncovered *lines* only, so a region-only failure names no file. On any failure the
-gate also writes the same filtered text report to `coverage/uncovered.txt` and prints
-`grep -n -B1 '\^0' coverage/uncovered.txt`; `^0` marks an unexecuted region.
+early and says so) and is unsupported for the gates. The native summary lists uncovered *lines*
+only, so a region-only failure names no file. When the native gate runs and fails, the gate also
+asks cargo-llvm-cov for the same filtered text report in `coverage/uncovered.txt` (`^0` marks an
+unexecuted region) and, if that command succeeds, prints `grep -n -B1 '\^0' coverage/uncovered.txt`.
+The report is **not** written when the gate fails before the native run (missing Cargo home,
+unreadable toolchain, unwritable `coverage/`), or when the text command itself fails; a stale
+report is removed only once a run reaches that step (after the `TOOLCHAIN:` line, so not when the
+Cargo home, working directory or toolchain query fails first); in that case an older report can
+remain, so trust `coverage/uncovered.txt` only after a run that printed `TOOLCHAIN:` and then
+reported the native gate's own failure (`native coverage gate failed`). The rustup
+hint accompanies every native failure.
+
+Toolchain sources are excluded only under `/rustc/` and `<sysroot>/lib/rustlib/src/` (the latter
+when `rust-src` is installed; Homebrew's rustc ships it there). A distro `rustc` that maps the
+standard library elsewhere (e.g. under `/usr/src/`) is not recognised. That layout is unverified:
+it could not be reproduced here, so nothing in this repository claims it works.
+That fails closed: an exclusion can only remove files from the report, so an unrecognised
+standard-library path stays in scope and its uncovered generic and inline code fails the gate
+with a spurious miss. It never admits a real one, but it is another reason the gates are
+supported on rustup only.
+
+Generic functions: line and function coverage merge instantiations, region coverage does not. A
+branch exercised only by a different instantiation than the rest still counts as an unexecuted
+region, so a function can show every line covered and fail `--fail-uncovered-regions`. Checked
+with a fixture (`pick::<T>(first: bool)` with one `if`/`else`): `pick::<u8>(true)` plus
+`pick::<u16>(false)` left 1 of 7 regions uncovered with 100% lines and functions, while
+`pick::<u8>(true)`, `pick::<u8>(false)` and `pick::<u16>(true)` left 0 of 20. The report is
+therefore not a union of instantiations; one instantiation that covers every branch is enough.
+Workaround: cover every branch within at least one instantiation, or avoid the monomorphization,
+e.g. take `&[Interface]` instead of a generic filter, as `announce` in `src/onvif/discovery.rs`
+does (PR [#120](https://github.com/nredd/tethercam/pull/120)).
 
 Acceptance tests run native instrumented fixture crates: uncovered ordinary source, test support
 and nested source tests fail; empty/cleaned/stale data cannot silently reuse success; malformed
@@ -169,6 +195,31 @@ waiver covers it. It is closed only by the hardware-owner `icc_sample` and `teth
 deliberate no-camera `ImageCaptureCore` initialize and shutdown on a hosted macOS runner is not part of
 the CI inventory yet: adding it changes the macOS job set and is coordinated with the macOS coverage job
 (PR [#100](https://github.com/nredd/tethercam/pull/100)).
+
+## Hung tests
+
+`.config/nextest.toml` gives the default profile `slow-timeout = { period = "60s", terminate-after = 2 }`:
+a test still running after 60 s is reported `SLOW`, and after 120 s nextest terminates it
+(`TIMEOUT`), so one hang in a nextest-run test (`make test`'s nextest step, `make coverage`) no
+longer holds a run until the job timeout. It does not cover `cargo test --doc`, plain `cargo test`
+or other non-nextest steps; those still depend on the workflow `timeout-minutes`. Sizing, from
+`cargo nextest run --all-features` (plain, then `cargo llvm-cov nextest`), `-j2`, macOS arm64,
+rustc 1.100.0:
+
+- `soak::a_stalled_stream_is_reported_as_a_long_gap_by_real_ffprobe`: 50.1 s both ways. It stops
+  the service for 45 s by design and needs a local `ffprobe`; without one it returns at once
+- `tests::installed_fixtures_exec_while_other_threads_fork`: 9.5 s plain, 10.6 s instrumented
+- `soak::a_real_ffprobe_segment_counts_the_streamed_frames`: 8.6 s plain
+- `tooling::native_gate_rejects_uncovered_...` (nested instrumented crates): 6.6 s plain, 8.2 s
+  instrumented
+- everything else: under 6 s
+
+120 s is 2.4x the slowest real test; instrumentation did not slow it, since it is sleep-bound.
+`tests/repository_policy.rs` requires at least 2x that test's 50 s and at most 300 s, and
+`terminate-after`, so shrinking the window below the headroom or dropping termination fails
+the suite. If a real test legitimately grows, raise `period` and update the constant and this
+list in the same change. Proof it terminates (scratch `--config-file` with `period = "5s"`):
+`SLOW [> 5.000s]`, `TERMINATING [> 10.000s]`, `TIMEOUT [ 10.003s]`, no process left behind.
 
 ## Diagnostics and profiling
 
