@@ -350,7 +350,7 @@ pub(super) struct Plan {
 type StopSignal = io::Result<Pin<Box<dyn Future<Output = ()>>>>;
 
 /// The worker side: scoped logging, a runtime of its own, and OS signals registered in it.
-pub(super) fn worker_with(
+fn worker_with(
     handle: IccHandle, plan: &Plan, out: &mut dyn Write,
     runtime: io::Result<tokio::runtime::Runtime>, stop: fn() -> StopSignal,
 ) -> Result<(), Error> {
