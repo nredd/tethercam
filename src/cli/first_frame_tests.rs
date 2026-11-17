@@ -155,6 +155,39 @@ async fn doctor_rejects_the_frames_run_would_reject() {
     assert!(check(false, false).await.is_ok());
 }
 
+/// How many bulk-out transfers a clean `doctor` makes; the last one is `CloseSession`.
+async fn bulk_outs_in_a_clean_run() -> usize {
+    let factory = Factory::new(vec![sony_camera(body())]);
+    let released = factory.released.clone();
+    let mut out = Vec::new();
+    diagnostics::doctor_camera(factory, fast(), &streams(true, true), &mut out)
+        .await
+        .unwrap();
+    let cameras = released.lock().unwrap();
+    cameras[0].bulk_out_transfers().len()
+}
+
+#[tokio::test]
+async fn a_close_failure_after_a_good_frame_is_not_blamed_on_the_frame() {
+    let commands = bulk_outs_in_a_clean_run().await;
+    let mut camera = sony_camera(body());
+    // Everything succeeds up to the final command, `CloseSession`.
+    camera.inject(Endpoint::BulkOut, commands - 1, Fault::Disconnect);
+    let (result, out) = doctor(camera).await;
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        Cause::CloseFailed.to_string()
+    );
+    assert!(!out.contains("Camera: PC Remote"), "never ready: {out}");
+    // A frame run would reject still wins over the close failure.
+    let mut camera = sony_camera(SonySimConfig {
+        live_view_jpeg: jpeg(33, 33),
+        ..body()
+    });
+    camera.inject(Endpoint::BulkOut, commands - 1, Fault::Disconnect);
+    assert_eq!(message(camera).await, Cause::Decode.to_string());
+}
+
 #[tokio::test]
 async fn injected_transport_faults_name_timeout_and_disconnect() {
     let mut camera = sony_camera(body());
@@ -184,11 +217,17 @@ fn every_cause_is_actionable_and_free_of_identifiers() {
         Cause::Unclassified,
         Cause::Encoder,
         Cause::Framing,
+        Cause::CloseFailed,
     ];
     let mut seen = std::collections::HashSet::new();
     for cause in all {
         let text = cause.to_string();
-        assert!(text.starts_with("no first frame: "), "{text}");
+        let prefix = if cause == Cause::CloseFailed {
+            "frame received"
+        } else {
+            "no first frame: "
+        };
+        assert!(text.starts_with(prefix), "{text}");
         assert!(text.is_ascii() && !text.contains('{'), "{text}");
         assert!(seen.insert(text), "duplicate message for {cause:?}");
     }

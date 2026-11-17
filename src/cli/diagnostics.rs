@@ -51,12 +51,9 @@ pub(super) async fn probe<F: CameraFactory>(factory: F, out: &mut dyn Write) -> 
 pub(super) async fn doctor_camera<F: CameraFactory>(
     factory: F, config: SonyConfig, streams: &Streams, out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let (protocol, capabilities, battery, frame) =
-        inspect(factory, config, true)
-            .await?
-            .map_err(|(error, waiting_for_frame)| {
-                Error::FirstFrame(FirstFrameCause::of(&error, waiting_for_frame))
-            })?;
+    let (protocol, capabilities, battery, frame) = inspect(factory, config, true)
+        .await?
+        .map_err(|failure| Error::FirstFrame(failure.cause(streams)))?;
     // The very check `run` makes of its first frame, so ready here means `run` accepts it.
     frame
         .map_or(Ok(()), |frame| check_first_frame(&frame, streams))
@@ -64,14 +61,36 @@ pub(super) async fn doctor_camera<F: CameraFactory>(
     report(out, protocol, &capabilities, battery)
 }
 
+/// A failed walk of the session: the driver error, whether it came while waiting for the first
+/// frame (as opposed to for live view to become ready), and the frame if one was fetched. The
+/// driver's error wins over a close error, so an error with a frame in hand is the close.
+struct Failure {
+    error: SonyError,
+    waiting_for_frame: bool,
+    frame: Option<Vec<u8>>,
+}
+
+impl Failure {
+    fn cause(&self, streams: &Streams) -> FirstFrameCause {
+        match &self.frame {
+            None => FirstFrameCause::of(&self.error, self.waiting_for_frame),
+            // A frame run would reject is the more actionable finding. Otherwise only the
+            // close failed: never ready, and never blamed on the missing frame.
+            Some(frame) => check_first_frame(frame, streams).map_or_else(
+                |error| FirstFrameCause::of_pipeline(&error),
+                |()| FirstFrameCause::CloseFailed,
+            ),
+        }
+    }
+}
+
 type Inspected = (Protocol, Capabilities, Option<Battery>, Option<Vec<u8>>);
 
 /// Open the camera and walk the session as far as `check_frame` asks. The outer error is the
-/// factory's; the inner one carries the driver failure and whether it came while waiting for the
-/// first frame, as opposed to for live view to become ready.
+/// factory's; the inner one is the [`Failure`].
 async fn inspect<F: CameraFactory>(
     mut factory: F, config: SonyConfig, check_frame: bool,
-) -> Result<Result<Inspected, (SonyError, bool)>, Error> {
+) -> Result<Result<Inspected, Failure>, Error> {
     let transport = factory.connect().await?.ok_or(Error::NoCamera)?;
     let mut session = factory.session(transport, SessionConfig::default(), std::time::Instant::now);
     let mut waiting_for_frame = false;
@@ -87,9 +106,14 @@ async fn inspect<F: CameraFactory>(
     .await;
     let transport = factory.recover(session);
     factory.release(transport);
-    Ok(report
-        .map(|(protocol, capabilities, battery)| (protocol, capabilities, battery, frame))
-        .map_err(|error| (error, waiting_for_frame)))
+    Ok(match report {
+        Ok((protocol, capabilities, battery)) => Ok((protocol, capabilities, battery, frame)),
+        Err(error) => Err(Failure {
+            error,
+            waiting_for_frame,
+            frame,
+        }),
+    })
 }
 
 fn report(

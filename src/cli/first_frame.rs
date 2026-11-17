@@ -87,6 +87,11 @@ pub enum FirstFrameCause {
         "no first frame: a frame arrived but the H.264 encoder rejects its size or the `streams` settings; check `streams` in the configuration"
     )]
     Encoder,
+    /// A frame `run` accepts arrived, but closing the session failed.
+    #[error(
+        "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
+    )]
+    CloseFailed,
     /// The USB data was malformed or out of sequence.
     #[error(
         "no first frame: the camera's USB data was malformed or out of sequence, cause unestablished (cable, port or an unsupported body); retry with another cable or port and report it if it repeats"
