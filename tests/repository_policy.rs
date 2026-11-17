@@ -1144,14 +1144,14 @@ fn validate_macos_legs(workflows: &Workflows) -> Result<usize, String> {
                 .map_or(&[][..], Vec::as_slice);
             let matrixed = matrix.contains(&json!("macos"));
             require(
-                !runs_on.contains("macos") || runs_on == MACOS_RUNS_ON,
+                !(runs_on.contains("macos") || runs_on.contains("xcode"))
+                    || runs_on == MACOS_RUNS_ON,
                 &format!("{at}: macOS legs use the `xcode-27` label, not an older image"),
             )?;
             require(
-                matrix
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .all(|os| !os.starts_with("macos") || os == "macos"),
+                matrix.iter().filter_map(Value::as_str).all(|os| {
+                    !(os.starts_with("macos") || os.starts_with("xcode")) || os == "macos"
+                }),
                 &format!("{at}: the only macOS matrix value is `macos`"),
             )?;
             require(
@@ -1172,6 +1172,10 @@ fn validate_macos_legs(workflows: &Workflows) -> Result<usize, String> {
                 steps[proof].get("if") == Some(&json!("runner.os == 'macOS'")),
                 &format!("{at}: proof must run only on the macOS leg of the matrix"),
             )?;
+            require(
+                steps[proof].get("continue-on-error").is_none(),
+                &format!("{at}: proof must not tolerate failure"),
+            )?;
         }
     }
     Ok(legs)
@@ -1190,7 +1194,7 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
         "add new macOS legs to this count and to the docs table"
     );
     // Each mutation breaks exactly one rule of `validate_macos_legs`.
-    let mutations: [(&str, &str, Mutation); 6] = [
+    let mutations: [(&str, &str, Mutation); 9] = [
         ("lint.yml", "clippy", |job| {
             job["runs-on"] = json!("macos-latest");
         }),
@@ -1213,6 +1217,15 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
         ("lint.yml", "clippy", |job| {
             job["steps"][1]["if"] = json!("always()");
         }),
+        ("lint.yml", "clippy", |job| {
+            job["steps"][1]["continue-on-error"] = json!(true);
+        }),
+        ("test.yml", "msrv", |job| {
+            job["runs-on"] = json!("xcode-26");
+        }),
+        ("lint.yml", "clippy", |job| {
+            job["strategy"]["matrix"]["os"][1] = json!("xcode26");
+        }),
     ];
     for (file, id, mutate) in mutations {
         let mut mutated = workflows.clone();
@@ -1229,6 +1242,30 @@ fn macos_legs_run_on_the_xcode_27_image_and_prove_it() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+/// The exact guard lines of the proof script. Each must appear verbatim as its own line, so a
+/// `|| true` suffix or a weakened comparison no longer matches. Bounded to this one script, not a
+/// shell parser.
+const PROOF_GUARDS: [&str; 5] = [
+    "set -eu",
+    r#"test "$arch" = arm64 || { echo "::error::expected arm64, got '$arch'"; exit 1; }"#,
+    r#"test "$os_major" = 27 || { echo "::error::expected macOS 27, got '$os_major'"; exit 1; }"#,
+    r#"test "$xcode_major" = 27 || { echo "::error::expected Xcode 27, got '$xcode_major'"; exit 1; }"#,
+    "xcodebuild -version",
+];
+
+fn validate_proof_script(script: &str) -> Result<(), String> {
+    for guard in PROOF_GUARDS {
+        require(
+            script.lines().any(|line| line.trim() == guard),
+            &format!("proof script is missing the exact line `{guard}`"),
+        )?;
+    }
+    require(
+        !script.contains("|| true") && !script.contains("set +e"),
+        "proof script must not bypass its guards",
+    )
+}
+
 #[test]
 fn xcode_27_proof_action_checks_arch_and_both_majors() -> Result<(), Box<dyn Error>> {
     let action: Value = serde_saphyr::from_str(include_str!(
@@ -1239,18 +1276,26 @@ fn xcode_27_proof_action_checks_arch_and_both_majors() -> Result<(), Box<dyn Err
         .as_array()
         .ok_or("proof action has no steps")?;
     assert_eq!(steps.len(), 1);
+    assert!(
+        steps[0].get("continue-on-error").is_none(),
+        "proof action step must not tolerate failure"
+    );
     let script = steps[0]["run"]
         .as_str()
         .ok_or("proof action step has no script")?;
-    for needle in [
-        "sw_vers\n",
-        "xcodebuild -version\n",
-        "test \"$arch\" = arm64",
-        "test \"$os_major\" = 27",
-        "test \"$xcode_major\" = 27",
-    ] {
-        assert!(script.contains(needle), "missing {needle}");
+    validate_proof_script(script)?;
+    assert!(script.contains("sw_vers\n"), "missing sw_vers");
+    for guard in &PROOF_GUARDS[1..4] {
+        for bad in [
+            format!("{guard} || true"),
+            guard.replace(" || {", " ; true || {"),
+            "true".to_owned(),
+        ] {
+            let mutated = script.replace(guard, &bad);
+            assert!(validate_proof_script(&mutated).is_err(), "accepted {bad}");
+        }
     }
+    assert!(validate_proof_script(&format!("set +e\n{script}")).is_err());
     Ok(())
 }
 
