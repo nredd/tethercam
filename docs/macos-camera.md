@@ -169,7 +169,7 @@ target/release/tethercam run --config ./camera.toml
 
 Not validated on hardware, and not claimed (listing, exact selection, a live Sony stream and a LaunchAgent
 install with graceful restart were each seen once, see Validation status): whether the identifier
-survives replug, reboot or a camera power-cycle, signing, screen lock and unlock, unplug and replug, deadlines and
+survives replug, reboot or a camera power-cycle, camera consent, signing, screen lock and unlock, unplug and replug, deadlines and
 late callbacks, and any endurance. A quarantine cannot be recovered in process, and a missing native
 callback can block shutdown indefinitely. The experimental label stands.
 

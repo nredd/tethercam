@@ -1,7 +1,7 @@
 # UniFi Protect
 
-Third-party camera adoption, as observed. Protect's third-party camera support is
-ONVIF-based; the vendor's article is
+Third-party camera adoption, as observed. Per the vendor, third-party camera support is
+ONVIF-based (not traced here); the vendor's article is
 [here](https://help.ui.com/hc/en-us/articles/26301104828439-Third-Party-Cameras-in-UniFi-Protect).
 Addresses are synthetic. Start from the [macOS quickstart](macos-quickstart.md): the service must
 be `ready` and listening on the LAN first.
@@ -40,6 +40,8 @@ verified run, so it is not proven to fix it. Do not delete the config to "fix" a
 identity adds another camera.
 
 ## Troubleshooting
+
+Design expectations, not observed in the measured run:
 
 - Not discovered: subnet, VLAN, multicast, `onvif_address`; the camera is silent until ready
 - Credential rejected: re-read `camera.toml` privately; the installed service uses its own fixed

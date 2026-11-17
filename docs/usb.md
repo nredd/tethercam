@@ -34,7 +34,7 @@ interface is claimed.
 ## macOS
 
 Raw USB needs no driver and no entitlement, but Apple's camera helpers can hold the interface and
-make opening report the camera as in use. Do not kill them or replug as a fix. Use the cooperative
+make opening report the camera as in use. Design guidance, not measured: do not kill them or replug as a fix. Use the cooperative
 `ImageCaptureCore` backend (`camera_backend = "icc"`) instead: see the
 [macOS quickstart](macos-quickstart.md) and [`macos-camera.md`](macos-camera.md).
 

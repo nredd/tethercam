@@ -56,6 +56,10 @@ your camera disappears, look at its power-off and sleep settings first and repor
 
 ## Steps
 
+These are the intended procedure. Only the outcomes under "Verified on that hardware" were measured;
+the rest, including the service behavior described below, is design as documented in
+[`service.md`](service.md) and [`macos-camera.md`](macos-camera.md), not separately measured.
+
 1. Install from source: `cargo install --path . --features macos-icc` in a checkout (Rust 1.99
    or newer for the `icc` feature; published 0.0.1 has no `icc` backend, it arrives with 0.0.2; see
    the [README](../README.md#install))
@@ -134,6 +138,8 @@ The default `streams.bitrate` is 2 Mbps for the H.264 stream. Older notes of "ab
 [`encoder-evaluation.md`](encoder-evaluation.md) are that evaluation's target, not the default.
 
 ## Troubleshooting
+
+Design expectations, not observed in the measured run:
 
 - `doctor` does not yet name the likely cause when the first frame never arrives (remaining part of [#86](https://github.com/nredd/tethercam/issues/86)); read `camera_open_failed` in the log
 - `waiting` forever: not in PC Remote, camera asleep or off, wrong `camera_id` (it matches nothing
