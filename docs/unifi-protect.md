@@ -41,6 +41,7 @@ Protect may show the same camera more than once. This is an open 1.0 blocker
 ([#115](https://github.com/nredd/tethercam/pull/115)) merged but was not running during the
 verified run, so it is not proven to fix it. Unverified expectation: replacing the config generates a new
 identity, which Protect would likely treat as another camera, so do not delete it to "fix" a duplicate.
+To gather evidence safely, follow the [duplicate rows evidence runbook](protect-duplicate-evidence.md).
 
 ## Troubleshooting
 
