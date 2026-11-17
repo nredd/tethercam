@@ -309,6 +309,57 @@ fn resolve_answers_only_for_our_endpoint() {
     );
 }
 
+/// The text of the first `<a:MessageID>` in an outgoing envelope.
+fn message_id(payload: &[u8]) -> String {
+    let text = String::from_utf8(payload.to_vec()).unwrap();
+    let (_, rest) = text.split_once("<a:MessageID>").unwrap();
+    rest.split_once("</a:MessageID>").unwrap().0.to_owned()
+}
+
+#[test]
+fn every_announcement_and_match_carries_one_stable_endpoint_and_a_fresh_message_id() {
+    // What a capture analysis compares (#112): the endpoint reference is the identity and must
+    // not vary between advertisements; the WS-Addressing `MessageID` is per message and must.
+    let mut e = engine();
+    let t0 = Instant::now();
+    let mut out = e.hello(t0);
+    for (n, probe) in [
+        with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000001"),
+        with_id(PROBE_ANY, "aaaaaaaa-bbbb-cccc-dddd-000000000002"),
+        PROBE_ONVIF.to_owned(),
+        RESOLVE.to_owned(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let peer = peer(20 + u8::try_from(n).unwrap());
+        out.push(e.handle(t0, peer, probe.as_bytes()).unwrap());
+    }
+    assert_eq!(out.len(), 6, "a `Hello` per dialect plus four answers");
+    let mut ids = Vec::new();
+    for message in &out {
+        let text = String::from_utf8(message.payload.clone()).unwrap();
+        assert_eq!(
+            text.matches(ENDPOINT).count(),
+            1,
+            "one endpoint reference: {text}"
+        );
+        ids.push(message_id(&message.payload));
+    }
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(distinct.len(), ids.len(), "no `MessageID` repeats: {ids:?}");
+    // Every answer echoes its own request's `MessageID`, never another's or its own.
+    for (message, request) in out[2..].iter().zip([
+        "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000001",
+        "urn:uuid:aaaaaaaa-bbbb-cccc-dddd-000000000002",
+        "uuid:11111111-2222-3333-4444-555555555555",
+        "urn:uuid:99999999-bbbb-cccc-dddd-eeeeeeeeeeee",
+    ]) {
+        let text = String::from_utf8(message.payload.clone()).unwrap();
+        assert!(text.contains(&format!("<a:RelatesTo>{request}</a:RelatesTo>")));
+    }
+}
+
 #[test]
 fn duplicate_message_ids_are_answered_once_even_across_sources() {
     let mut e = engine();

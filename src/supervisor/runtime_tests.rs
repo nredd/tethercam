@@ -220,6 +220,25 @@ use crate::transport::sim::sony::{SonySimConfig, sony_camera};
 use tokio::sync::oneshot;
 use tracing::instrument::WithSubscriber;
 
+#[test]
+fn the_onvif_identity_is_a_pure_function_of_the_endpoint_uuid() {
+    // What Protect can see over ONVIF must not drift between runs (#112): the serial and the
+    // network `HwAddress` come from `endpoint_uuid` alone, never from the clock or entropy. The
+    // address is locally administered and unicast, so it is never mistaken for a real NIC.
+    let mut config = cfg();
+    config.endpoint_uuid = uuid::Uuid::from_u128(0x0123_4567_89ab_4def_8123_4567_89ab_cdef);
+    let first = device_description(&config);
+    assert_eq!(first.serial_number, "01234567-89ab-4def-8123-456789abcdef");
+    assert_eq!(first.interface.hw_address, "02:23:45:67:89:ab");
+    let reloaded = device_description(&config);
+    assert_eq!(first.serial_number, reloaded.serial_number);
+    assert_eq!(first.interface.hw_address, reloaded.interface.hw_address);
+    config.endpoint_uuid = uuid::Uuid::from_u128(0x0133_4567_89ab_4def_8123_4567_89ab_cdef);
+    let other = device_description(&config);
+    assert_ne!(first.serial_number, other.serial_number);
+    assert_ne!(first.interface.hw_address, other.interface.hw_address);
+}
+
 fn cfg() -> Config {
     let mut cfg = Config::generate().unwrap();
     cfg.rtsp_address = "127.0.0.1".parse().unwrap();
