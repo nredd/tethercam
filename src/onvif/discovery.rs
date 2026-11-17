@@ -928,8 +928,9 @@ impl<E: Entropy> Engine<E> {
 
     /// Forget that `out`'s request was answered because its reply never left (discarded, refused
     /// or failed to send), so the client's retransmit is answered. Only the insertions this reply
-    /// made are removed: an entry recorded again since (after eviction or expiry) stays. Everything else already
-    /// answered stays suppressed, and the rate limits stay, so retries remain bounded.
+    /// made are removed: an entry recorded again since (after eviction or expiry) stays.
+    /// Everything else already answered stays suppressed, and the rate limits stay, so retries
+    /// remain bounded.
     fn forget(&mut self, out: &Outgoing) {
         if let Some(replied) = &out.replied {
             self.raw.remove(&replied.raw_key, replied.raw_token);
@@ -1091,8 +1092,9 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     }
 
     /// The interfaces served right now, in socket order.
+    #[cfg(test)]
     #[must_use]
-    pub fn interfaces(&self) -> &[Interface] {
+    pub(crate) fn interfaces(&self) -> &[Interface] {
         self.engine.config.interfaces()
     }
 
@@ -1140,9 +1142,16 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
         Ok(())
     }
 
+    /// Drop everything queued. Replies are forgotten as answered, so their retries are answered.
+    fn discard_pending(&mut self) {
+        for out in std::mem::take(&mut self.pending) {
+            self.engine.forget(&out);
+        }
+    }
+
     /// Send `Bye` on every interface immediately and discard queued replies.
     pub fn shutdown(&mut self) {
-        self.pending.clear();
+        self.discard_pending();
         let now = self.clock.now();
         for out in self.engine.bye(now) {
             self.send(&out);
@@ -1159,7 +1168,7 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
         // now, not the ones from the startup snapshot.
         self.next_poll = self.clock.now();
         self.poll_watch();
-        self.pending.clear();
+        self.discard_pending();
         self.start();
         let mut result = Ok(());
         while !stop.load(Ordering::Relaxed) {

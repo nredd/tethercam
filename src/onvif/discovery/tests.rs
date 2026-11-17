@@ -937,6 +937,27 @@ fn shutdown_discards_queued_replies() {
 }
 
 #[test]
+fn replies_discarded_by_shutdown_or_run_do_not_suppress_the_retransmit() {
+    for restart in [false, true] {
+        let mut r = rig();
+        r.wire
+            .0
+            .borrow_mut()
+            .inbox
+            .push_back((peer(20), PROBE_ONVIF.as_bytes().to_vec()));
+        r.responder.step(POLL).unwrap();
+        if restart {
+            // `run` starts clean: a reply queued before it is discarded.
+            r.responder.run(&AtomicBool::new(true)).unwrap();
+        } else {
+            r.responder.shutdown();
+        }
+        r.wire.0.borrow_mut().sent.clear();
+        assert_eq!(deliver(&mut r, peer(20), PROBE_ONVIF), 1, "answered");
+    }
+}
+
+#[test]
 fn an_unbound_interface_does_not_claim_its_subnet() {
     // Wired and wireless on one /24; the first one could not join the group.
     let both = config_with(vec![iface(10), iface(11)]);
