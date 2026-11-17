@@ -171,5 +171,7 @@ Stop, record what was seen, and report it unresolved when any holds:
 
 To #112 and #33, in the writing style of those issues and with nothing private: window count,
 trigger, row-count timeline in seconds from `t0`, counts of advertisements per source label,
-dialect and interface, the equality table, and which interpretation above applies or that none does.
+dialect and interface, the equality table, the count of `fragmented` or `truncated` packets and
+whether each window is insufficient evidence (a missing reply always is), and which interpretation
+above applies or that none does.
 State that no hardware acceptance is claimed. Do not close either issue from this.
