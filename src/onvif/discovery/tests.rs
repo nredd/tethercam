@@ -1156,6 +1156,10 @@ fn masking_out_a_routable_address_strands_no_link_local_sibling() {
 fn a_watch_debug_hides_the_closure_and_clamps_the_interval() {
     let watch = Watch::new(Duration::ZERO, || None);
     assert_eq!(watch.0.every, Duration::from_millis(1));
+    assert_eq!(
+        Watch::new(Duration::MAX, || None).0.every,
+        Duration::from_secs(86_400)
+    );
     assert!(format!("{watch:?}").starts_with("Watch { every: 1ms"));
 }
 

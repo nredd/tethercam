@@ -369,19 +369,17 @@ struct WatchInner {
 }
 
 impl Watch {
-    /// Re-enumerate with `poll` every `every` (at least one millisecond).
+    /// Re-enumerate with `poll` every `every`, clamped to between one millisecond and one day.
     #[must_use]
     pub fn new(
         every: Duration, poll: impl Fn() -> Option<Vec<Interface>> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(WatchInner {
-            every: every.max(Duration::from_millis(1)),
+            every: every.clamp(Duration::from_millis(1), Duration::from_secs(86_400)),
             poll: Box::new(poll),
         }))
     }
-}
 
-impl Watch {
     /// The interfaces to serve right now, or `None` if they could not be enumerated.
     #[must_use]
     pub fn poll(&self) -> Option<Vec<Interface>> {
