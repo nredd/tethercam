@@ -55,7 +55,7 @@ That is 200 packets, 10 minutes, 1400 bytes each. Start it first, then note `t0`
 seconds), then run the trigger:
 
 - Window 1, observation only: do nothing for the window, only watch the Devices view
-- Window 2, one service restart by the owner (as documented in
+- Window 2, one service restart by the owner, however the service was installed (see
   [service](service.md)); never a re-adoption
 
 Record each Protect row-count change as `t0 + N s`, with what the owner was doing (refresh,
@@ -71,14 +71,18 @@ reference address, `XAddrs`, `Scopes`, `AppSequence` `InstanceId` and `MessageNu
 Expected, so not findings:
 
 - `Hello` once per served interface and dialect at startup, each after a random delay up to
-  500 ms, so two per interface on a restart
+  500 ms, so two per interface on a restart, plus the same pair when an interface appears while
+  running
 - Replies are unicast to the prober and at most one per accepted probe. Retried or repeated copies
-  of one `MessageID` are answered once. Controllers refresh with new probes, so a probe sequence
-  repeats over time
+  of one `MessageID` are answered once. Whether Protect re-probes periodically is not established:
+  record it, do not assume it
 - `InstanceId` is the start time in seconds, so it changes across a restart and `MessageNumber`
   counts up within a run
-- `XAddrs` differ per interface (it carries the address on the interface the probe arrived on) and
-  IPv6 link-local addresses are never advertised
+- `XAddrs` may differ per interface: a reply carries the address of the interface inferred from the
+  sender's subnet, not one observed (an open #33 concern), and IPv6 link-local addresses are never
+  advertised
+- `Scopes` in a match may follow the probe that caused it; compare `Hello`s with each other, and a
+  match with its own probe
 
 Multiple advertisements, each answered separately:
 
@@ -95,8 +99,9 @@ The endpoint reference is the device identity: identical in every `Hello`, `Prob
 `ResolveMatches` and the request to `Resolve`, across restarts (it is persisted as
 `endpoint_uuid`). The WS-Addressing `MessageID` identifies one message and must be fresh every
 time; `RelatesTo` must equal the request's `MessageID`. A fresh `MessageID` is correct protocol
-behaviour, not a bug. Do not make it constant: peers suppress repeated `MessageID`s as duplicates
-and a constant value would break discovery, and it would not touch the identity.
+behaviour, not a bug. Do not make it constant: this responder de-duplicates incoming `MessageID`s
+(Protect's handling is unknown), so a constant value is at best unproven, and it would not touch
+the identity.
 
 ## Private identity comparison
 
@@ -105,7 +110,7 @@ private note, each cell `same` or `differs` with the labels that differ:
 
 - Endpoint reference: all advertisements, both dialects, both windows
 - `XAddrs` host, port, path: per interface
-- `Scopes`: all advertisements
+- `Scopes`: all `Hello`s, and each match against its own probe
 - ONVIF `GetDeviceInformation` serial equals the endpoint reference's UUID, and `GetNetworkInterfaces`
   `HwAddress` equals the value derived from it (first byte `(b | 0x02) & 0xfe`, next five bytes
   unchanged). Check against the private config, never print the config

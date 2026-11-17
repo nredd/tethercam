@@ -8,7 +8,7 @@ use super::message::fixtures::{PROBE_ANY, PROBE_ONVIF, RESOLVE};
 use super::*;
 use proptest::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 
@@ -346,7 +346,7 @@ fn every_announcement_and_match_carries_one_stable_endpoint_and_a_fresh_message_
         );
         ids.push(message_id(&message.payload));
     }
-    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    let distinct: HashSet<_> = ids.iter().collect();
     assert_eq!(distinct.len(), ids.len(), "no `MessageID` repeats: {ids:?}");
     // Every answer echoes its own request's `MessageID` as `RelatesTo`.
     for (message, request) in out[2..].iter().zip([
