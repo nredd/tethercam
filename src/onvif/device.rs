@@ -155,23 +155,7 @@ fn scopes(ctx: &Context<'_>) -> String {
             escape(s)
         )
     };
-    let enc = |s: &str| {
-        s.bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_') {
-                    char::from(b).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect::<String>()
-    };
-    let list = [
-        "onvif://www.onvif.org/Profile/Streaming".to_owned(),
-        "onvif://www.onvif.org/type/video_encoder".to_owned(),
-        format!("onvif://www.onvif.org/name/{}", enc(&d.model)),
-        format!("onvif://www.onvif.org/hardware/{}", enc(&d.hardware_id)),
-    ];
+    let list = d.scopes();
     format!(
         "<tds:GetScopesResponse>{}</tds:GetScopesResponse>",
         list.iter().map(|s| item(s)).collect::<String>()

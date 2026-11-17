@@ -139,8 +139,10 @@ cargo run -- doctor --config ./camera.toml --simulate ./synthetic.jpg
 cargo run -- run --config ./camera.toml --simulate ./synthetic.jpg --no-discovery
 ```
 
-WS-Discovery listens on every up interface of the `onvif_address` family. With `interface` unset
-and `onvif_address` unspecified, loopback and IPv4 link-local addresses are skipped. An interface
+WS-Discovery advertises the same fixed profile, type, name and hardware scopes as `GetScopes`;
+clients can filter probes by any of those scopes. Discovery listens on every up interface of the
+`onvif_address` family. With `interface` unset and `onvif_address` unspecified, loopback and IPv4
+link-local addresses are skipped. An interface
 that cannot bind or join the multicast group is skipped with a logged warning; discovery fails
 only when none is usable. Set `interface` to an exact OS name to listen on that one interface
 only, loopback and link-local included, e.g. `interface = "en0"` on macOS or

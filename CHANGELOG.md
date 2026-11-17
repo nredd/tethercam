@@ -13,6 +13,8 @@ Next release: `0.0.2`.
 
 ### Fixed
 
+- Advertise the fixed profile, name and hardware scopes in WS-Discovery and match filtered probes consistently with `GetScopes`
+
 - Make one-shot `icc` commands (`cameras`, `probe`, `doctor`) always exit: when the command's output is written but native cleanup has not settled after 60 s (a step hit its deadline and the framework never completed it) they print a counts-only notice and exit with the new status 69 through the quarantine exit path, instead of printing their answer and hanging. A settled command still exits cleanly with status 0. The service keeps its 300 s busy limit
 - De-duplicate discovery in every `icc` selector: one device the framework reports twice is one device, so exact selection of it (previously "several cameras") works, and `cameras` shows one line flagged `(reported N times)`. Two different devices are still several
 - Show an identifier that `camera_id` validation would refuse as `(identifier not selectable)` in `cameras` instead of printing it raw, and never open it, so a control character or separator cannot forge list lines
