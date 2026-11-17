@@ -279,14 +279,17 @@ fn discovery_uses_only_selected_local_interfaces_and_stored_identity() {
     cfg.interface = Some("absent".into());
     let none = discovery(&cfg, interfaces).unwrap();
     assert_eq!(none.interfaces().len(), 0);
-    // More addresses than the responder serves is still a startup error.
+    // More addresses than the responder serves are cut, not refused, so a restart still serves.
     cfg.interface = None;
     cfg.onvif_address = "0.0.0.0".parse().unwrap();
     let crowded = (1..=9)
         .map(|n| interface("test0", &format!("192.0.2.{n}"), true))
         .collect();
+    assert_eq!(discovery(&cfg, crowded).unwrap().interfaces().len(), 8);
+    // An address that can never be advertised is still refused.
+    let unusable = vec![interface("test0", "0.0.0.0", true)];
     assert_eq!(
-        kind(&discovery(&cfg, crowded).unwrap_err()),
+        kind(&discovery(&cfg, unusable).unwrap_err()),
         kind(&Error::Interface)
     );
 }

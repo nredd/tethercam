@@ -153,7 +153,7 @@ pub(super) fn discovery(
             path: "/onvif/device_service".into(),
         },
     )
-    .and_then(|c| c.with_interfaces(interfaces))
+    .and_then(|c| c.with_interfaces_capped(interfaces, &[]))
     .map_err(|_| Error::Interface)
 }
 

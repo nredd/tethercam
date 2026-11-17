@@ -106,6 +106,9 @@ const RAW_CAPACITY: usize = 64;
 const POLL: Duration = Duration::from_millis(100);
 /// Longest wait before retrying an interface that cannot bind.
 const MAX_RETRY: Duration = Duration::from_secs(300);
+/// Shortest and longest interval a [`Watch`] accepts.
+const MIN_WATCH: Duration = Duration::from_millis(1);
+const MAX_WATCH: Duration = Duration::from_secs(86_400);
 /// Default time between interface re-enumerations when a [`Watch`] is attached.
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -377,7 +380,7 @@ impl Watch {
         every: Duration, poll: impl Fn() -> Option<Vec<Interface>> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(WatchInner {
-            every: every.clamp(Duration::from_millis(1), Duration::from_secs(86_400)),
+            every: every.clamp(MIN_WATCH, MAX_WATCH),
             poll: Box::new(poll),
         }))
     }

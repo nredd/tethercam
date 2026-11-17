@@ -95,7 +95,7 @@ impl UdpTransport {
         Self::bind_reusing(interfaces, port, join, None)
     }
 
-    /// The socket `old` already holds for `interface`, if it bound one.
+    /// The socket this transport already holds for `interface`, if it bound one.
     fn socket_for(&self, interface: &Interface) -> Option<&UdpSocket> {
         let at = self
             .interfaces
