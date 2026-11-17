@@ -22,10 +22,8 @@ after the new jobs have completed successfully and the current merge train is st
 
 ## macOS 27 legs
 
-Every macOS leg runs on the `xcode-27` hosted label: Apple Silicon (arm64) only, macOS 27, Xcode
-27.0 to 27.2 installed with 27.1 the default (image
-[readme](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md),
-[GA changelog](https://github.blog/changelog/2026-10-15-xcode-27-runner-image-generally-available/)).
+Every macOS leg runs on the `xcode-27` hosted label: Apple Silicon (arm64) only, macOS 27, Xcode 27 (image
+[readme](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)).
 GitHub does not publish a `macos-27` label: Xcode-based images are named for the Xcode major, not
 the OS. Contexts never embed the label or version: matrix legs use the value `macos` and map it to
 the label in `runs-on`. The next image bump edits the
@@ -50,7 +48,7 @@ The image is a scarce hosted pool, so only gates that add information on macOS g
 | `cross` | none | Cross-compiles to Linux targets only; a macOS host adds nothing |
 
 macOS coverage is honestly pending, not excluded. A native macOS run of `make coverage` leaves
-`src/transport/usb/nusb_backend.rs` (compiled on macOS, exercised only through Linux VHCI/USB/IP)
+`src/transport/usb/nusb_backend.rs` (compiled on macOS, exercised only through Linux VHCI/USB/IP; 0/195 lines on the `xcode-27` image)
 and `src/transport/icc/native.rs` (needs a live camera) uncovered, so a macOS coverage leg would be
 red. The leg is deferred to [#126](https://github.com/nredd/tethercam/issues/126), which needs
 seams rather than exclusions.
