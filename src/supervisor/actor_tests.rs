@@ -1028,3 +1028,25 @@ async fn live_snapshots_are_refused_when_their_size_differs_from_the_published_p
         }
     }
 }
+
+/// A frame without a readable header has no size to compare: it is left to the pipeline, which
+/// reports it, exactly as the pipeline's own size check does.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_without_a_readable_header_is_not_judged_by_size() {
+    use crate::transport::sim::sony::Defect;
+    let (actor, control) = actor(Factory::new(vec![sony_camera(SonySimConfig {
+        warmup_reads: 0,
+        defect: Defect::BadLiveViewAfterFirst,
+        live_view_jpeg: crate::supervisor::testing::jpeg(32, 32),
+        ..SonySimConfig::default()
+    })]));
+    let (_factory, ()) = tokio::join!(Box::pin(actor.run()), async {
+        ready(&control).await;
+        control.publish_format(32, 32);
+        tokio::time::sleep(Duration::from_secs(60)).await; // stale: fetches the bad frame
+        let caller = control.clone();
+        let reply = tokio::task::spawn_blocking(move || caller.snapshot("main"));
+        assert_eq!(reply.await.unwrap().unwrap(), vec![0xff, 0xd8, 0xff, 0xd9]);
+        control.shutdown();
+    });
+}
