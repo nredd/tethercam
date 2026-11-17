@@ -99,7 +99,7 @@ fn term_resistant_clients_are_killed_and_reaped_but_server_cleanup_stays_joined(
 fn inspect_rejects_a_corrupt_frame_after_valid_data() {
     let (temp, program, _) = fixture();
     let decoder = temp.path().join("decode-corrupt");
-    fs::copy(&program, &decoder).expect("copy decoder fixture");
+    crate::tests::install_executable(&program, &decoder);
     let tools = Tools {
         server: timed::TimedServer::start,
         helper: &program,
@@ -153,7 +153,7 @@ fn every_verification_plan_uses_owned_children_and_protected_files() {
         ("fail", "ffprobe", "snapshot"),
     ] {
         let path = temp.path().join(name);
-        fs::copy(&program, &path).expect("copy fixture");
+        crate::tests::install_executable(&program, &path);
         let failing = Tools {
             server: timed::TimedServer::start,
             helper: &program,
@@ -299,7 +299,7 @@ fn every_verifier_io_failure_returns_a_failure_instead_of_a_partial_success() {
         );
     }
     let failed = temp.path().join("fail");
-    fs::copy(&program, &failed).expect("copy");
+    crate::tests::install_executable(&program, &failed);
     let failing = Tools {
         ffmpeg: &failed,
         ..tools
@@ -319,7 +319,7 @@ fn every_verifier_io_failure_returns_a_failure_instead_of_a_partial_success() {
         ("remove200", "authenticated-status.txt"),
     ] {
         let remover = temp.path().join(name);
-        fs::copy(&program, &remover).expect("copy");
+        crate::tests::install_executable(&program, &remover);
         let output = temp.path().join(format!("missing-{name}"));
         fs::write(
             remover.with_extension("remove"),
@@ -403,7 +403,7 @@ fn unauthenticated_and_authenticated_curl_process_failures_are_fatal() {
     let (temp, program, cfg) = fixture();
     for name in ["fail", "fail-auth"] {
         let curl = temp.path().join(name);
-        fs::copy(&program, &curl).expect("fixture");
+        crate::tests::install_executable(&program, &curl);
         let tools = Tools {
             server: timed::TimedServer::start,
             helper: &program,

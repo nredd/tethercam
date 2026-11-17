@@ -910,7 +910,7 @@ mod tests {
 
     fn copy_as(program: &Path, dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
-        fs::copy(program, &path).expect("copy fixture");
+        crate::tests::install_executable(program, &path);
         path
     }
 

@@ -182,7 +182,7 @@ fn native_template_validator() {
         // Verify the actual first-token path against an existing executable. Unlike later
         // argv, systemd does not environment-expand this token, so `$` must stay single.
         let executable = temp.path().join("native $ & % tool");
-        fs::copy("/usr/bin/true", &executable).unwrap();
+        symlink("/usr/bin/true", &executable).unwrap();
         for user in [false, true] {
             let path = temp.path().join("tethercam.service");
             fs::write(

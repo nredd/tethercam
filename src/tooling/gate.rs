@@ -240,11 +240,7 @@ mod tests {
 
     #[cfg(unix)]
     fn script(dir: &Path, name: &str, body: &str) -> OsString {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
-        path.into()
+        crate::tests::install_script(dir, name, body).into()
     }
 
     #[test]
