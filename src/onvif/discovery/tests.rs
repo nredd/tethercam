@@ -332,8 +332,8 @@ fn every_announcement_and_match_carries_one_stable_endpoint_and_a_fresh_message_
     .iter()
     .enumerate()
     {
-        let peer = peer(20 + u8::try_from(n).unwrap());
-        out.push(e.handle(t0, peer, probe.as_bytes()).unwrap());
+        let source = peer(20 + u8::try_from(n).unwrap());
+        out.push(e.handle(t0, source, probe.as_bytes()).unwrap());
     }
     assert_eq!(out.len(), 6, "a `Hello` per dialect plus four answers");
     let mut ids = Vec::new();

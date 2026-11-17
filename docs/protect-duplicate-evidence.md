@@ -81,8 +81,7 @@ Expected, so not findings:
 - `XAddrs` may differ per interface: a reply carries the address of the interface inferred from the
   sender's subnet, not one observed (an open #33 concern), and IPv6 link-local addresses are never
   advertised
-- `Scopes` in a match may follow the probe that caused it; compare `Hello`s with each other, and a
-  match with its own probe
+- `Scopes` are always the configured list, in every `Hello` and match: a difference is a finding
 
 Multiple advertisements, each answered separately:
 
@@ -110,7 +109,7 @@ private note, each cell `same` or `differs` with the labels that differ:
 
 - Endpoint reference: all advertisements, both dialects, both windows
 - `XAddrs` host, port, path: per interface
-- `Scopes`: all `Hello`s, and each match against its own probe
+- `Scopes`: all advertisements
 - ONVIF `GetDeviceInformation` serial equals the endpoint reference's UUID, and `GetNetworkInterfaces`
   `HwAddress` equals the value derived from it (first byte `(b | 0x02) & 0xfe`, next five bytes
   unchanged). Check against the private config, never print the config
