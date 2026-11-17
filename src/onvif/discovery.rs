@@ -834,13 +834,14 @@ impl<E: Entropy> Engine<E> {
         self.announce(now, true, |_| true)
     }
 
-    /// Serve `config`'s interfaces from now on and announce only those not served before.
+    /// Serve `interfaces` from now on and announce those not served before, or all of them with
+    /// `all` (a `Hello` that was still queued is gone, so a retained interface needs it too).
     ///
     /// Probe history, rate limits and sequence numbers carry over, so a client's retry after the
     /// change is still de-duplicated and the camera keeps one `AppSequence` instance.
-    fn retarget(&mut self, now: Instant, config: Config) -> Vec<Outgoing> {
-        let before = std::mem::replace(&mut self.config.interfaces, config.interfaces);
-        self.announce(now, true, |i| !before.contains(i))
+    fn retarget(&mut self, now: Instant, interfaces: Vec<Interface>, all: bool) -> Vec<Outgoing> {
+        let before = std::mem::replace(&mut self.config.interfaces, interfaces);
+        self.announce(now, true, |i| all || !before.contains(i))
     }
 
     /// `Bye` announcements, due immediately.
@@ -942,6 +943,8 @@ pub struct Responder<T, E, C> {
     last_wanted: Vec<Interface>,
     /// What the transport was last asked to serve (before masking out failed binds).
     desired: Vec<Interface>,
+    /// Whether the last rebind skipped an interface, which is then retried at every poll.
+    unbound: bool,
 }
 
 /// Whether `a` and `b` hold the same interfaces, in any order.
@@ -967,6 +970,7 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
             next_poll,
             last_wanted: desired.clone(),
             desired,
+            unbound: false,
         }
     }
 
@@ -1047,8 +1051,9 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     /// Re-enumerate interfaces when the [`Watch`] interval has elapsed.
     ///
     /// A failed enumeration keeps the current set. A set the responder cannot serve (too many
-    /// interfaces) is logged once and kept out. A failed socket rebuild keeps the old sockets and
-    /// is retried at the next poll.
+    /// interfaces) is logged once and kept out. When no socket can be built at all, nothing is
+    /// advertised (never a vanished address) until a later poll succeeds, and an interface that
+    /// cannot bind is retried at every poll.
     fn poll_watch(&mut self) {
         let Some(watch) = self.watch.clone() else {
             return;
@@ -1061,7 +1066,7 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
         let Some(wanted) = watch.poll() else {
             return;
         };
-        if same_interfaces(&wanted, &self.last_wanted) {
+        if same_interfaces(&wanted, &self.last_wanted) && !self.unbound {
             return;
         }
         let config = match self.engine.config.clone().with_interfaces(wanted.clone()) {
@@ -1073,28 +1078,32 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
             }
         };
         let desired = config.interfaces.clone();
-        if same_interfaces(&desired, &self.desired) {
+        if same_interfaces(&desired, &self.desired) && !self.unbound {
             self.last_wanted = wanted;
             return;
         }
+        // Queued replies and announcements carry indices into the old interface list.
+        let hello_queued = self.pending.iter().any(|p| p.dest.ip().is_multicast());
+        self.pending.clear();
         let usable = match self.transport.rebind(&desired) {
             Ok(usable) => usable,
             Err(error) => {
-                log::warn!("Keeping the current discovery sockets, rebinding failed: {error}");
+                log::warn!("Discovery has no usable socket, advertising nothing: {error}");
+                self.engine.retarget(now, Vec::new(), false);
+                self.desired = Vec::new();
+                self.unbound = true;
                 return;
             }
         };
+        let served = config.with_usable_interfaces(&usable).interfaces;
         log::warn!(
             "Discovery now serves {} interface(s) (was {})",
-            desired.len(),
-            self.desired.len()
+            served.len(),
+            self.engine.config.interfaces.len()
         );
-        // Queued replies and announcements carry indices into the old interface list.
-        self.pending.clear();
-        let hellos = self
-            .engine
-            .retarget(now, config.with_usable_interfaces(&usable));
+        let hellos = self.engine.retarget(now, served, hello_queued);
         self.pending.extend(hellos);
+        self.unbound = usable.contains(&false);
         self.last_wanted = wanted;
         self.desired = desired;
     }

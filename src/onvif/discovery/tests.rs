@@ -1295,26 +1295,57 @@ fn a_failed_enumeration_or_unservable_set_keeps_the_current_one() {
 }
 
 #[test]
-fn a_failed_rebind_keeps_the_old_sockets_and_retries() {
+fn a_failed_rebind_advertises_nothing_and_is_retried() {
     let (mut rig, wanted) = watched(vec![iface(10)]);
     *wanted.lock().unwrap() = Some(vec![wifi()]);
     rig.wire.0.borrow_mut().fail_rebind = true;
     assert_eq!(tick(&mut rig), Vec::new());
-    assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
+    assert_eq!(rig.responder.engine.config.interfaces().len(), 0);
+    assert!(
+        probe_xaddr(&mut rig, peer(20), 1).is_none(),
+        "no stale address"
+    );
+    // Even a return to the previous set does not leave it silent.
+    *wanted.lock().unwrap() = Some(vec![iface(10)]);
     rig.wire.0.borrow_mut().fail_rebind = false;
     assert_eq!(tick(&mut rig).len(), 2);
-    assert_eq!(rig.responder.engine.config.interfaces(), [wifi()]);
+    assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
 }
 
 #[test]
-fn an_interface_that_cannot_bind_claims_no_subnet_and_is_not_rebound_every_poll() {
+fn an_interface_that_cannot_bind_claims_no_subnet_and_is_retried_until_it_binds() {
     let (mut rig, wanted) = watched(vec![iface(10)]);
     rig.wire.0.borrow_mut().usable_mask = Some(vec![true, false]);
     *wanted.lock().unwrap() = Some(vec![iface(10), wifi()]);
     assert_eq!(tick(&mut rig), Vec::new(), "wired is not new");
     assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
     assert_eq!(tick(&mut rig), Vec::new());
-    assert_eq!(rig.wire.0.borrow().rebinds.len(), 1);
+    assert_eq!(
+        rig.wire.0.borrow().rebinds.len(),
+        2,
+        "retried at every poll"
+    );
+    rig.wire.0.borrow_mut().usable_mask = None;
+    let sent = tick(&mut rig);
+    assert_eq!(sent.len(), 2, "only the interface that now binds");
+    assert!(sent.iter().all(|(_, _, p)| p.contains("198.51.100.20")));
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), 3, "settled");
+}
+
+#[test]
+fn a_change_before_the_first_hello_went_out_still_announces_every_interface() {
+    let wanted = Arc::new(std::sync::Mutex::new(Some(vec![iface(10), wifi()])));
+    let source = Arc::clone(&wanted);
+    let watch = Watch::new(WATCH_EVERY, move || source.lock().unwrap().clone());
+    let mut rig = rig_with(config_with(vec![iface(10)]).with_watch(watch));
+    rig.responder.start();
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    let sent = std::mem::take(&mut rig.wire.0.borrow_mut().sent);
+    assert_eq!(sent.len(), 4, "both dialects on both interfaces");
 }
 
 #[test]
