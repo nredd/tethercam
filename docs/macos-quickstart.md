@@ -16,13 +16,16 @@ Verified on that hardware:
 - The live-view probe: 60 frames over 2 cycles at 1024x680, 2 confirmed closes
 - Authenticated RTSP H.264 played, viewed by the owner
 - UniFi Protect adopted it as a third-party camera with the generated credentials. It showed
-  online and recording, and the owner confirmed moving playback
+  online and recording (state as reported by Protect and the Home Assistant entity, not a check of
+  recorded playback or retention), and the owner confirmed moving playback
 - Home Assistant snapshots: the ONVIF config flow, and the camera Home Assistant imported
   automatically from Protect, each returned a real 1024x680 JPEG (HTTP 200)
 - `tethercam service install` (launchd), then a graceful `SIGTERM` stop; `KeepAlive` brought it
   back with a new `run_id` and status `ready`
-- A 6 h 27 min partial soak. The host's network interface dropped out during it; the stream
-  recovered with no observed process restart
+- A 6 h 27 min partial soak, stopped by the owner: 385 segments, 251 successful and 134 failed, and
+  134 failed status reads, with no observed process restart. Most failures coincided with the host's
+  network interface being absent, and a later brief outage has no established cause. The stream
+  recovered afterwards. Failures are not an endurance result
 
 NOT verified, and not claimed:
 
@@ -119,7 +122,7 @@ tethercam service uninstall
 
 The camera is only reachable while the host's network link is up. By design the listeners and
 WS-Discovery are bound at start to the configured addresses (not measured here). During the partial soak the host's
-network interface disappeared and the stream recovered with no observed process restart. That is
+network interface disappeared (most failures, totals above) and the stream recovered with no observed process restart. That is
 one observation, not a guarantee: how listeners and discovery behave across interface changes is
 untested here and tracked in [#116](https://github.com/nredd/tethercam/issues/116). Until that
 lands, treat a pinned address (`rtsp_address`, `onvif_address`, `interface`) as bound at start and

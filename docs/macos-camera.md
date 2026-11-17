@@ -183,8 +183,10 @@ callback can block shutdown indefinitely. The experimental label stands.
   closes; the live-view probe (60 frames, 2 cycles, 1024x680, 2 confirmed closes); authenticated
   RTSP H.264 viewed; UniFi Protect adoption with moving playback; Home Assistant snapshots; an
   installed LaunchAgent whose graceful `SIGTERM` was followed by an automatic restart with a new
-  `run_id` and `ready`; and a 6 h 27 min partial soak, stopped by the owner, during which the host
-  NIC dropped and the stream recovered with no observed process restart. See the
+  `run_id` and `ready`; and a 6 h 27 min partial soak, stopped by the owner (385 segments, 251
+  successful, 134 failed; 134 failed status reads; no observed process restart; most failures coincided
+  with the host NIC being absent, a later brief outage has no established cause), after which the
+  stream recovered. See the
   [quickstart](macos-quickstart.md). Still NOT validated: 24 h or any endurance, battery telemetry
   (null), screen lock, reboot, camera power-cycle, USB replug, and identifier stability across them
 - Hosted tests prove the state machine, bridge, framing and failure paths with deterministic fakes and

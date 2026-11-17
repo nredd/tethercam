@@ -14,7 +14,8 @@ reported by the owner and not recorded in detail; Protect's UI changes between v
 - In Protect's Devices view, the camera appeared as a third-party camera with a Click to Adopt
   action. Adopting it asks for camera credentials: enter the generated `tethercam` username and
   password
-- It came up online and recording. The owner confirmed moving playback in Protect
+- It came up online and recording (state reported by Protect and the Home Assistant entity; recorded
+  playback and retention were not checked). The owner confirmed moving playback in Protect
 - Adoption by IP ("Advanced Adoption") and a per-call ONVIF trace were NOT recorded here. Which
   calls Protect makes, how it picks HQ and LQ, and which codecs it accepts beyond H.264 Baseline at
   1024x680 are not documented yet
