@@ -50,6 +50,13 @@ struct Wire {
     fail_sends: bool,
     fail_receives: bool,
     stop_on_receive: Option<std::sync::Arc<AtomicBool>>,
+    rebinds: Vec<Vec<Interface>>,
+    fail_rebind: bool,
+    unbindable: Vec<Interface>,
+    /// The interfaces the sockets are open on, in socket order (what `UdpTransport` keeps).
+    bound: Vec<Interface>,
+    /// The interface each datagram actually left from.
+    left_from: Vec<Option<Interface>>,
 }
 
 #[derive(Clone, Default)]
@@ -76,7 +83,41 @@ impl Transport for MemTransport {
         if wire.fail_sends {
             return Err(std::io::Error::other("unreachable").into());
         }
+        let socket = wire.bound.get(interface).copied();
+        wire.left_from.push(socket);
         wire.sent.push((interface, dest, payload.to_vec()));
+        Ok(())
+    }
+
+    fn rebind(&mut self, interfaces: &[Interface]) -> Result<Vec<bool>, Error> {
+        let mut wire = self.0.borrow_mut();
+        if wire.fail_rebind {
+            return Err(std::io::Error::other("rebind failed").into());
+        }
+        wire.rebinds.push(interfaces.to_vec());
+        let usable: Vec<bool> = interfaces
+            .iter()
+            .map(|i| !wire.unbindable.contains(i))
+            .collect();
+        wire.bound = interfaces
+            .iter()
+            .zip(&usable)
+            .filter(|(_, usable)| **usable)
+            .map(|(i, _)| *i)
+            .collect();
+        Ok(usable)
+    }
+}
+
+/// A transport that keeps the trait's default `rebind`.
+struct Bare;
+
+impl Transport for Bare {
+    fn recv(&mut self, _buf: &mut [u8], _timeout: Duration) -> Result<Option<Datagram>, Error> {
+        Ok(None)
+    }
+
+    fn send(&mut self, _: usize, _: SocketAddr, _: &[u8]) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -1049,4 +1090,559 @@ proptest! {
             prop_assert_eq!(out.dest, peer(octet));
         }
     }
+}
+
+fn svc() -> ServiceAddress {
+    ServiceAddress {
+        port: 8080,
+        path: "/onvif/device_service".to_owned(),
+    }
+}
+
+fn endpoint() -> EndpointReference {
+    EndpointReference::parse(ENDPOINT).unwrap()
+}
+
+#[test]
+fn the_default_rebind_has_nothing_to_set_up() {
+    assert_eq!(Bare.rebind(&[iface(10), iface(11)]).unwrap(), [true, true]);
+    assert_eq!(Bare.recv(&mut [0; 1], Duration::ZERO).unwrap(), None);
+    Bare.send(0, peer(1), b"").unwrap();
+}
+
+#[test]
+fn an_idle_config_serves_nothing_until_given_interfaces() {
+    let idle = Config::idle(endpoint(), scopes(), svc()).unwrap();
+    assert_eq!(idle.interfaces().len(), 0);
+    let served = idle.with_interfaces(vec![iface(10)]).unwrap();
+    assert_eq!(served.interfaces(), [iface(10)]);
+    let emptied = served.with_interfaces(vec![]).unwrap();
+    assert_eq!(emptied.interfaces().len(), 0);
+    assert_eq!(
+        Config::idle(endpoint(), vec!["no scheme".into()], svc()).unwrap_err(),
+        ConfigError::InvalidScope("no scheme".into())
+    );
+    let long_path = ServiceAddress {
+        port: 1,
+        path: "relative".into(),
+    };
+    assert_eq!(
+        Config::idle(endpoint(), scopes(), long_path).unwrap_err(),
+        ConfigError::InvalidServicePath("relative".into())
+    );
+    let too_many = (0..=8).map(|n| iface(10 + n)).collect();
+    assert_eq!(
+        Config::idle(endpoint(), scopes(), svc())
+            .unwrap()
+            .with_interfaces(too_many)
+            .unwrap_err(),
+        ConfigError::TooManyInterfaces
+    );
+    let bad = Interface {
+        addr: Ipv4Addr::UNSPECIFIED.into(),
+        prefix_len: 24,
+        index: 1,
+    };
+    assert_eq!(
+        Config::idle(endpoint(), scopes(), svc())
+            .unwrap()
+            .with_interfaces(vec![bad])
+            .unwrap_err(),
+        ConfigError::InvalidInterface(bad.addr)
+    );
+}
+
+#[test]
+fn masking_out_a_routable_address_strands_no_link_local_sibling() {
+    let v6 = |addr: &str| Interface {
+        addr: addr.parse().unwrap(),
+        prefix_len: 64,
+        index: 3,
+    };
+    let config = config_with(vec![v6("fe80::1"), v6("2001:db8::1")]);
+    assert_eq!(config.interfaces().len(), 2);
+    let masked = config.with_usable_interfaces(&[true, false]);
+    assert_eq!(masked.interfaces().len(), 0);
+}
+
+#[test]
+fn a_watch_debug_hides_the_closure_and_clamps_the_interval() {
+    let watch = Watch::new(Duration::ZERO, || None);
+    assert_eq!(watch.0.every, Duration::from_millis(1));
+    assert_eq!(
+        Watch::new(Duration::MAX, || None).0.every,
+        Duration::from_secs(86_400)
+    );
+    assert!(format!("{watch:?}").starts_with("Watch { every: 1ms"));
+}
+
+const WATCH_EVERY: Duration = Duration::from_secs(5);
+
+/// A responder whose watch reads `wanted`, started with `initial`.
+fn watched(initial: Vec<Interface>) -> (Rig, Arc<std::sync::Mutex<Option<Vec<Interface>>>>) {
+    test_log::install();
+    let wanted = Arc::new(std::sync::Mutex::new(Some(initial.clone())));
+    let source = Arc::clone(&wanted);
+    let watch = Watch::new(WATCH_EVERY, move || source.lock().unwrap().clone());
+    let mut rig = rig_with(config_with(initial).with_watch(watch));
+    rig.responder.start();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    rig.wire.0.borrow_mut().sent.clear();
+    (rig, wanted)
+}
+
+fn wifi() -> Interface {
+    Interface {
+        addr: Ipv4Addr::new(198, 51, 100, 20).into(),
+        prefix_len: 24,
+        index: 2,
+    }
+}
+
+/// Let the watch interval and the announcement delay pass, then take what was sent.
+fn tick(rig: &mut Rig) -> Vec<(usize, SocketAddr, String)> {
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    std::mem::take(&mut rig.wire.0.borrow_mut().sent)
+        .into_iter()
+        .map(|(i, d, p)| (i, d, String::from_utf8(p).unwrap()))
+        .collect()
+}
+
+/// Probe from `from`; the advertised `XAddrs` of the reply, if any.
+fn probe_xaddr(rig: &mut Rig, from: SocketAddr, id: u32) -> Option<String> {
+    let doc = PROBE_ONVIF.replace(
+        "11111111-2222-3333-4444-555555555555",
+        &format!("11111111-2222-3333-4444-{id:012}"),
+    );
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((from, doc.into_bytes()));
+    rig.responder.step(POLL).unwrap();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    let sent = std::mem::take(&mut rig.wire.0.borrow_mut().sent);
+    let reply = String::from_utf8(sent.first()?.2.clone()).unwrap();
+    assert_eq!(sent.len(), 1);
+    Some(reply)
+}
+
+#[test]
+fn losing_the_preferred_interface_fails_over_and_restoring_it_recovers() {
+    let wired = iface(10);
+    let (mut rig, wanted) = watched(vec![wired]);
+    let lan = peer(20);
+    let wifi_peer = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 30), 40000));
+    assert!(
+        probe_xaddr(&mut rig, lan, 1)
+            .unwrap()
+            .contains("192.0.2.10:8080")
+    );
+
+    // The dock loses power: only Wi-Fi remains. It is announced, the wired address is not.
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    let sent = tick(&mut rig);
+    assert_eq!(
+        sent.len(),
+        2,
+        "one `Hello` per dialect on the new interface"
+    );
+    for (interface, dest, payload) in &sent {
+        assert_eq!((*interface, *dest), (0, wifi().group()));
+        assert!(payload.contains("198.51.100.20:8080") && payload.contains("Hello"));
+        assert!(!payload.contains("192.0.2.10"));
+    }
+    assert_eq!(rig.responder.engine.config.interfaces(), [wifi()]);
+    assert!(probe_xaddr(&mut rig, peer(21), 2).is_none(), "stale subnet");
+    let reply = probe_xaddr(&mut rig, wifi_peer, 3).unwrap();
+    assert!(reply.contains("198.51.100.20:8080") && !reply.contains("192.0.2.10"));
+
+    // The dock returns: wired is announced again, Wi-Fi is not re-announced.
+    *wanted.lock().unwrap() = Some(vec![wired, wifi()]);
+    let sent = tick(&mut rig);
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent.iter()
+            .all(|(i, _, p)| *i == 0 && p.contains("192.0.2.10:8080"))
+    );
+    assert!(
+        probe_xaddr(&mut rig, lan, 4)
+            .unwrap()
+            .contains("192.0.2.10:8080")
+    );
+
+    // An unchanged set is neither rebound nor re-announced.
+    let rebinds = rig.wire.0.borrow().rebinds.len();
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), rebinds);
+}
+
+#[test]
+fn every_interface_vanishing_silences_discovery_until_one_returns() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![]);
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.responder.engine.config.interfaces().len(), 0);
+    assert!(probe_xaddr(&mut rig, peer(20), 1).is_none());
+    *wanted.lock().unwrap() = Some(vec![iface(10)]);
+    assert_eq!(tick(&mut rig).len(), 2);
+    assert!(probe_xaddr(&mut rig, peer(20), 2).is_some());
+}
+
+#[test]
+fn a_failed_enumeration_keeps_the_current_set() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = None;
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), 0);
+}
+
+#[test]
+fn a_crowded_host_never_keeps_an_interface_that_vanished() {
+    // Eight served: the wired one and seven bridges.
+    let current: Vec<_> = (0..8).map(|n| iface(10 + n)).collect();
+    let (mut rig, wanted) = watched(current.clone());
+    // The wired one disappears; Wi-Fi and one more bridge appear: nine present.
+    let mut present: Vec<_> = current[1..].to_vec();
+    present.extend([wifi(), iface(30)]);
+    assert_eq!(present.len(), 9);
+    *wanted.lock().unwrap() = Some(present);
+    tick(&mut rig);
+    let served = rig.responder.engine.config.interfaces().to_vec();
+    assert_eq!(served.len(), 8);
+    assert!(
+        !served.contains(&current[0]),
+        "the vanished address is gone"
+    );
+    assert!(
+        current[1..].iter().all(|i| served.contains(i)),
+        "still present, still served"
+    );
+    assert!(
+        served.contains(&wifi()),
+        "the first newcomer takes the free slot"
+    );
+    // Selection is deterministic: the same enumeration again changes nothing.
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.responder.engine.config.interfaces(), served);
+}
+
+#[test]
+fn a_set_of_all_new_interfaces_past_the_limit_is_cut_not_refused() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some((0..9).map(|n| iface(40 + n)).collect());
+    tick(&mut rig);
+    let served = rig.responder.engine.config.interfaces();
+    assert_eq!(served.len(), 8);
+    assert!(!served.contains(&iface(10)));
+}
+
+#[test]
+fn an_invalid_interface_advertises_nothing_instead_of_the_old_set() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    let bad = Interface {
+        addr: Ipv4Addr::UNSPECIFIED.into(),
+        prefix_len: 24,
+        index: 1,
+    };
+    *wanted.lock().unwrap() = Some(vec![wifi(), bad]);
+    tick(&mut rig);
+    assert_eq!(rig.responder.engine.config.interfaces().len(), 0);
+    assert!(probe_xaddr(&mut rig, peer(20), 1).is_none());
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    assert_eq!(tick(&mut rig).len(), 2);
+}
+
+#[test]
+fn a_failed_rebind_advertises_nothing_and_is_retried() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    rig.wire.0.borrow_mut().fail_rebind = true;
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.responder.engine.config.interfaces().len(), 0);
+    assert!(
+        probe_xaddr(&mut rig, peer(20), 1).is_none(),
+        "no stale address"
+    );
+    // Even a return to the previous set does not leave it silent.
+    *wanted.lock().unwrap() = Some(vec![iface(10)]);
+    rig.wire.0.borrow_mut().fail_rebind = false;
+    assert_eq!(tick(&mut rig).len(), 2);
+    assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
+}
+
+#[test]
+fn an_interface_that_cannot_bind_claims_no_subnet_and_is_retried_until_it_binds() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    rig.wire.0.borrow_mut().unbindable = vec![wifi()];
+    *wanted.lock().unwrap() = Some(vec![iface(10), wifi()]);
+    assert_eq!(tick(&mut rig), Vec::new(), "wired is not new");
+    assert_eq!(rig.responder.engine.config.interfaces(), [iface(10)]);
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(
+        rig.wire.0.borrow().rebinds.len(),
+        4, // two rebinds per attempt: the set, then the masked list
+        "retried after a backoff"
+    );
+    rig.wire.0.borrow_mut().unbindable.clear();
+    // The retry delay doubles (5 s, 10 s): wait it out.
+    rig.clock.advance(WATCH_EVERY * 2);
+    let sent = tick(&mut rig);
+    assert_eq!(sent.len(), 2, "only the interface that now binds");
+    assert!(sent.iter().all(|(_, _, p)| p.contains("198.51.100.20")));
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), 5, "settled");
+}
+
+#[test]
+fn a_change_before_the_first_hello_went_out_still_announces_every_interface() {
+    let wanted = Arc::new(std::sync::Mutex::new(Some(vec![iface(10), wifi()])));
+    let source = Arc::clone(&wanted);
+    let watch = Watch::new(WATCH_EVERY, move || source.lock().unwrap().clone());
+    let mut rig = rig_with(config_with(vec![iface(10)]).with_watch(watch));
+    rig.responder.start();
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    let sent = std::mem::take(&mut rig.wire.0.borrow_mut().sent);
+    assert_eq!(sent.len(), 4, "both dialects on both interfaces");
+}
+
+#[test]
+fn run_polls_the_watch_between_steps() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    let stop = Arc::new(AtomicBool::new(false));
+    rig.wire.0.borrow_mut().stop_on_receive = Some(Arc::clone(&stop));
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.run(&stop).unwrap();
+    assert_eq!(rig.responder.engine.config.interfaces(), [wifi()]);
+}
+
+#[test]
+fn polling_before_the_interval_or_for_an_equivalent_set_changes_nothing() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    rig.responder.poll_watch();
+    assert_eq!(
+        rig.responder.engine.config.interfaces(),
+        [iface(10)],
+        "not due"
+    );
+    // A lone link-local IPv6 address is dropped by normalization: same served set.
+    let lone_link_local = Interface {
+        addr: "fe80::1".parse().unwrap(),
+        prefix_len: 64,
+        index: 9,
+    };
+    *wanted.lock().unwrap() = Some(vec![iface(10), lone_link_local]);
+    assert_eq!(tick(&mut rig), Vec::new());
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), 0);
+    assert_eq!(tick(&mut rig), Vec::new());
+}
+
+#[test]
+fn an_idle_responder_says_it_is_waiting() {
+    test_log::install();
+    let idle = Config::idle(endpoint(), scopes(), svc()).unwrap();
+    let mut r = rig_with(idle);
+    r.responder.start();
+    r.clock.advance(MAX_DELAY);
+    r.responder.step(POLL).unwrap();
+    assert_eq!(r.wire.0.borrow().sent.len(), 0);
+    assert!(
+        test_log::lines()
+            .iter()
+            .any(|l| l.contains("No usable network interface for discovery yet"))
+    );
+}
+
+#[test]
+fn run_serves_the_interfaces_that_exist_now_not_the_startup_snapshot() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    let stop = Arc::new(AtomicBool::new(false));
+    rig.wire.0.borrow_mut().stop_on_receive = Some(Arc::clone(&stop));
+    rig.responder.run(&stop).unwrap();
+    assert_eq!(rig.responder.engine.config.interfaces(), [wifi()]);
+    let wire = rig.wire.0.borrow();
+    assert_eq!(
+        wire.sent.len(),
+        2,
+        "only the Byes, on the current interface"
+    );
+    assert!(
+        wire.sent
+            .iter()
+            .all(|(i, d, _)| (*i, *d) == (0, wifi().group()))
+    );
+}
+
+#[test]
+fn link_local_entries_that_will_be_dropped_do_not_count_towards_the_limit() {
+    let mut set: Vec<_> = (0..8_u8)
+        .map(|n| Interface {
+            addr: Ipv4Addr::new(192, 0, 2, 10 + n).into(),
+            prefix_len: 24,
+            index: 1,
+        })
+        .collect();
+    set.push(Interface {
+        addr: "fe80::1".parse().unwrap(),
+        prefix_len: 64,
+        index: 7,
+    });
+    let config = Config::idle(endpoint(), scopes(), svc()).unwrap();
+    assert_eq!(config.with_interfaces(set).unwrap().interfaces().len(), 8);
+}
+
+/// Receive `from`'s probe and leave its reply queued.
+fn queue_probe(rig: &mut Rig, from: SocketAddr, id: u32) {
+    let doc = PROBE_ONVIF.replace(
+        "11111111-2222-3333-4444-555555555555",
+        &format!("11111111-2222-3333-4444-{id:012}"),
+    );
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((from, doc.into_bytes()));
+    rig.responder.step(POLL).unwrap();
+}
+
+fn flush(rig: &mut Rig) -> Vec<String> {
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    std::mem::take(&mut rig.wire.0.borrow_mut().sent)
+        .into_iter()
+        .map(|(_, _, p)| String::from_utf8(p).unwrap())
+        .collect()
+}
+
+#[test]
+fn retrying_an_unbindable_interface_keeps_queued_replies_and_backs_off() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    rig.wire.0.borrow_mut().unbindable = vec![wifi()];
+    *wanted.lock().unwrap() = Some(vec![iface(10), wifi()]);
+    tick(&mut rig);
+    queue_probe(&mut rig, peer(20), 1);
+    // The retry (the delay is 5 s, then doubles) must not discard the delayed reply.
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    assert_eq!(rig.wire.0.borrow().rebinds.len(), 4);
+    let replies = flush(&mut rig);
+    assert_eq!(replies.len(), 1, "the delayed reply survived the retry");
+    assert!(replies[0].contains("192.0.2.10:8080"));
+    // A retransmit of the same probe is still de-duplicated, as without any retry.
+    queue_probe(&mut rig, peer(20), 1);
+    assert_eq!(flush(&mut rig).len(), 0);
+    // Backoff: a long run of polls rebinds a handful of times, not once per poll.
+    for _ in 0..100 {
+        rig.clock.advance(WATCH_EVERY);
+        rig.responder.poll_watch();
+    }
+    assert!(rig.wire.0.borrow().rebinds.len() < 24);
+    assert_eq!(rig.responder.retry_every, MAX_RETRY);
+}
+
+#[test]
+fn a_dropped_delayed_reply_does_not_suppress_the_clients_retransmit() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    queue_probe(&mut rig, peer(20), 1);
+    // The interface the reply was queued on vanishes before the reply is due, then returns.
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    *wanted.lock().unwrap() = Some(vec![iface(10)]);
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    rig.wire.0.borrow_mut().sent.clear();
+    flush(&mut rig);
+    rig.wire.0.borrow_mut().sent.clear();
+    // The retransmit is answered, not remembered as already answered.
+    assert!(probe_xaddr(&mut rig, peer(20), 1).is_some());
+}
+
+#[test]
+fn queued_replies_follow_their_interface_to_its_new_index() {
+    let (mut rig, wanted) = watched(vec![iface(10), wifi()]);
+    let wifi_peer = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 30), 40000));
+    queue_probe(&mut rig, wifi_peer, 1);
+    // The wired interface vanishes: Wi-Fi moves from index 1 to 0 with its reply pending.
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    rig.wire.0.borrow_mut().sent.clear();
+    let sent = {
+        rig.clock.advance(MAX_DELAY);
+        rig.responder.step(POLL).unwrap();
+        std::mem::take(&mut rig.wire.0.borrow_mut().sent)
+    };
+    let reply = sent
+        .iter()
+        .find(|(_, dest, _)| *dest == wifi_peer)
+        .expect("reply survived");
+    assert_eq!(reply.0, 0);
+}
+
+fn v6(addr: &str, index: u32) -> Interface {
+    Interface {
+        addr: addr.parse().unwrap(),
+        prefix_len: 64,
+        index,
+    }
+}
+
+#[test]
+fn engine_and_socket_numbering_agree_after_a_mask_strands_a_link_local_sibling() {
+    let (ll3, g3, g4) = (
+        v6("fe80::1", 3),
+        v6("2001:db8::1", 3),
+        v6("2001:db8:1::1", 4),
+    );
+    let config = config_with(vec![ll3, g3, g4]);
+    assert_eq!(config.interfaces(), [ll3, g3, g4]);
+    // What `UdpTransport::bind` would hold when `g3` cannot bind: sockets for `ll3` and `g4`.
+    let mut transport = MemTransport::default();
+    transport.0.borrow_mut().unbindable = vec![g3];
+    transport.0.borrow_mut().bound = vec![ll3, g4];
+    let settled = config.serving(&mut transport, vec![true, false, true]);
+    assert_eq!(
+        settled.interfaces(),
+        [g4],
+        "`ll3` lost its routable sibling"
+    );
+    assert_eq!(
+        transport.0.borrow().bound,
+        [g4],
+        "socket 0 is `g4`, as engine 0"
+    );
+    let clock = ManualClock::new();
+    let mut responder = Responder::new(settled, Counter(1), transport.clone(), clock.clone());
+    responder.start();
+    clock.advance(MAX_DELAY);
+    responder.step(POLL).unwrap();
+    let wire = transport.0.borrow();
+    assert_eq!(
+        wire.left_from,
+        [Some(g4), Some(g4)],
+        "both `Hello` dialects"
+    );
+}
+
+#[test]
+fn serving_never_keeps_an_interface_without_a_socket() {
+    test_log::install();
+    let config = config_with(vec![iface(10), iface(11)]);
+    let mut transport = MemTransport::default();
+    transport.0.borrow_mut().fail_rebind = true;
+    let settled = config.serving(&mut transport, vec![true, false]);
+    assert_eq!(settled.interfaces().len(), 0);
 }

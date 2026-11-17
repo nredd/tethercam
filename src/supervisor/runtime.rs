@@ -375,9 +375,11 @@ fn bind_discovery(
     discovery_cfg
         .map(|cfg| {
             discovery::UdpTransport::bind(cfg.interfaces())
-                .map(|transport| {
-                    // Interfaces that failed to bind must not claim a subnet in the responder.
-                    let cfg = cfg.with_usable_interfaces(transport.usable());
+                .map(|mut transport| {
+                    // Interfaces that failed to bind must not claim a subnet in the responder,
+                    // and the responder's numbering must stay the sockets' numbering.
+                    let usable = transport.usable().to_vec();
+                    let cfg = cfg.serving(&mut transport, usable);
                     Responder::new(
                         cfg,
                         discovery::SystemEntropy::default(),

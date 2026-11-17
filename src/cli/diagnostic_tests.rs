@@ -146,12 +146,43 @@ fn unnamed_discovery_skips_loopback_and_ipv4_link_local_unless_asked_for() {
             .collect::<Vec<_>>(),
         ["2001:db8::1"]
     );
+    // Nothing usable yet is not fatal: discovery waits for the watch to find an interface.
     let only_unusable = vec![interface("lo", "127.0.0.1", true)];
     cfg.onvif_address = "0.0.0.0".parse().unwrap();
-    assert_eq!(
-        kind(&discovery(&cfg, only_unusable).unwrap_err()),
-        kind(&Error::Interface)
-    );
+    let idle = discovery(&cfg, only_unusable).unwrap();
+    assert_eq!(idle.interfaces().len(), 0);
+}
+
+#[test]
+fn point_to_point_tunnels_are_skipped_unless_named() {
+    let mut tunnel = interface("utun4", "198.51.100.2", true);
+    tunnel.is_p2p = true;
+    let all = vec![tunnel, interface("test0", "192.0.2.1", true)];
+    let mut cfg = Config::generate().unwrap();
+    let served = |cfg: &Config| discovery(cfg, all.clone()).unwrap().interfaces().len();
+    assert_eq!(served(&cfg), 1);
+    cfg.interface = Some("utun4".into());
+    assert_eq!(served(&cfg), 1);
+}
+
+static HOST: std::sync::Mutex<Option<Vec<(&str, &str)>>> = std::sync::Mutex::new(None);
+
+fn fake_host() -> std::io::Result<Vec<if_addrs::Interface>> {
+    HOST.lock()
+        .unwrap()
+        .as_ref()
+        .map(|list| list.iter().map(|(n, ip)| interface(n, ip, true)).collect())
+        .ok_or_else(|| std::io::Error::other("synthetic enumeration failure"))
+}
+
+#[test]
+fn the_watch_reapplies_the_startup_selection_to_each_enumeration() {
+    let cfg = Config::generate().unwrap();
+    let watch = interface_watch(&cfg, fake_host);
+    *HOST.lock().unwrap() = Some(vec![("lo", "127.0.0.1"), ("test0", "192.0.2.1")]);
+    assert_eq!(watch.poll().unwrap().len(), 1, "loopback is still skipped");
+    *HOST.lock().unwrap() = None;
+    assert!(watch.poll().is_none(), "a failed enumeration keeps the set");
 }
 
 #[test]
@@ -246,8 +277,19 @@ fn discovery_uses_only_selected_local_interfaces_and_stored_identity() {
         1
     );
     cfg.interface = Some("absent".into());
+    let none = discovery(&cfg, interfaces).unwrap();
+    assert_eq!(none.interfaces().len(), 0);
+    // More addresses than the responder serves are cut, not refused, so a restart still serves.
+    cfg.interface = None;
+    cfg.onvif_address = "0.0.0.0".parse().unwrap();
+    let crowded = (1..=9)
+        .map(|n| interface("test0", &format!("192.0.2.{n}"), true))
+        .collect();
+    assert_eq!(discovery(&cfg, crowded).unwrap().interfaces().len(), 8);
+    // An address that can never be advertised is still refused.
+    let unusable = vec![interface("test0", "0.0.0.0", true)];
     assert_eq!(
-        kind(&discovery(&cfg, interfaces).unwrap_err()),
+        kind(&discovery(&cfg, unusable).unwrap_err()),
         kind(&Error::Interface)
     );
 }

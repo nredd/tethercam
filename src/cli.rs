@@ -246,6 +246,15 @@ async fn command_until<F: CameraFactory>(
     factory: F, cfg: &Config, options: &Options, out: &mut dyn Write,
     shutdown: std::pin::Pin<Box<dyn Future<Output = ()> + '_>>,
 ) -> Result<(), Error> {
+    command_with(factory, cfg, options, out, shutdown, if_addrs::get_if_addrs).await
+}
+
+/// [`command_until`] with the host interface enumeration injected, so a failing one is testable.
+async fn command_with<F: CameraFactory>(
+    factory: F, cfg: &Config, options: &Options, out: &mut dyn Write,
+    shutdown: std::pin::Pin<Box<dyn Future<Output = ()> + '_>>,
+    interfaces: fn() -> std::io::Result<Vec<if_addrs::Interface>>,
+) -> Result<(), Error> {
     match options.command {
         Command::Probe => diagnostics::probe(factory, out).await,
         Command::Doctor => {
@@ -268,9 +277,12 @@ async fn command_until<F: CameraFactory>(
             let discovery = if options.no_discovery {
                 None
             } else {
-                Some(diagnostics::local_discovery(cfg, if_addrs::get_if_addrs())?)
+                Some(diagnostics::watched_discovery(cfg, interfaces)?)
             };
-            crate::supervisor::serve(factory, cfg, discovery, shutdown, out).await?;
+            Box::pin(crate::supervisor::serve(
+                factory, cfg, discovery, shutdown, out,
+            ))
+            .await?;
             Ok(())
         }
         Command::Setup
