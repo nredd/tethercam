@@ -117,9 +117,9 @@ tethercam service uninstall
 
 ## Network link loss
 
-The camera is only reachable while the host's network link is up, and the listeners and
-WS-Discovery are bound at start to the configured addresses. During the partial soak the host's
-network interface disappeared once and the stream recovered with no observed process restart. That is
+The camera is only reachable while the host's network link is up. By design the listeners and
+WS-Discovery are bound at start to the configured addresses (not measured here). During the partial soak the host's
+network interface disappeared and the stream recovered with no observed process restart. That is
 one observation, not a guarantee: how listeners and discovery behave across interface changes is
 untested here and tracked in [#116](https://github.com/nredd/tethercam/issues/116). Until that
 lands, treat a pinned address (`rtsp_address`, `onvif_address`, `interface`) as bound at start and

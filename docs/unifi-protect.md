@@ -22,6 +22,8 @@ reported by the owner and not recorded in detail; Protect's UI changes between v
 
 ## Steps
 
+The intended procedure. Only the "Verified" outcomes above were observed.
+
 1. The service is `ready` (`GET /tethercam/status`) and bound to a LAN address
 2. In Protect, open Devices and find the camera under adoptable third-party cameras. Click to
    Adopt
@@ -36,8 +38,8 @@ and ONVIF port (`onvif_port`, default 8080), where your Protect version offers t
 Protect may show the same camera more than once. This is an open 1.0 blocker
 ([#112](https://github.com/nredd/tethercam/issues/112)). A fix to discovery scopes
 ([#115](https://github.com/nredd/tethercam/pull/115)) merged but was not running during the
-verified run, so it is not proven to fix it. Do not delete the config to "fix" a duplicate: a new
-identity adds another camera.
+verified run, so it is not proven to fix it. Unverified expectation: replacing the config generates a new
+identity, which Protect would likely treat as another camera, so do not delete it to "fix" a duplicate.
 
 ## Troubleshooting
 

@@ -26,8 +26,8 @@ expectations, not measured):
 2. Enter host, port and credentials
 3. Check the camera entity's snapshot
 
-Via Protect: set up the UniFi Protect integration against the console. Adopted cameras are
-imported without further steps.
+Via Protect: set up the UniFi Protect integration against the console. The one adopted camera was
+imported without further steps (a single observation).
 
 ## Troubleshooting
 
