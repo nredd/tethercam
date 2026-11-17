@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::ptp::session::SessionError;
 use crate::sony::SonyError;
+use crate::supervisor::PipelineError;
 use crate::transport::TransportError;
 
 #[cfg(test)]
@@ -44,7 +45,7 @@ pub enum FirstFrameCause {
     NotReady,
     /// Live view reported ready but no frame came.
     #[error(
-        "no first frame: live view reported ready but no frame arrived in time; retry, and report it with the log if it repeats"
+        "no first frame: live view reported ready but no frame arrived in time; retry, and report it if it repeats"
     )]
     NoFrame,
     /// The camera stopped answering.
@@ -68,20 +69,32 @@ pub enum FirstFrameCause {
     Permission,
     /// The camera answered a command with an error status.
     #[error(
-        "no first frame: the camera rejected a command, cause unestablished; if it repeats, confirm PC Remote mode and report it with the log"
+        "no first frame: the camera rejected a command, cause unestablished; if it repeats, confirm PC Remote mode and report it"
     )]
     Rejected,
     /// A payload could not be decoded.
     #[error(
-        "no first frame: the camera sent data this version cannot decode, likely an unsupported body or firmware; report it with the log"
+        "no first frame: the camera sent data this version cannot decode, likely an unsupported body or firmware; report it"
     )]
     Protocol,
-    /// A frame arrived but is not usable video.
-    #[error("no first frame: a frame arrived but is not a decodable JPEG; report it with the log")]
+    /// A frame arrived but `run` would reject it: not decodable, or not carriable as MJPEG.
+    #[error(
+        "no first frame: a frame arrived but run would reject it as undecodable or not valid for MJPEG; report it"
+    )]
     Decode,
+    /// A decodable frame arrived, but the H.264 encoder refuses its size or the stream settings.
+    #[error(
+        "no first frame: a frame arrived but the H.264 encoder rejects its size or the `streams` settings; check `streams` in the configuration"
+    )]
+    Encoder,
+    /// The USB data was malformed or out of sequence.
+    #[error(
+        "no first frame: the camera's USB data was malformed or out of sequence, cause unestablished (cable, port or an unsupported body); retry with another cable or port and report it if it repeats"
+    )]
+    Framing,
     /// None of the above.
     #[error(
-        "no first frame: the check failed for a reason this version cannot classify; read the log"
+        "no first frame: the check failed for a reason this version cannot classify; report it"
     )]
     Unclassified,
 }
@@ -108,6 +121,15 @@ impl FirstFrameCause {
         }
     }
 
+    /// Classify what [`crate::supervisor::PipelineError`] says about the first frame.
+    pub(super) fn of_pipeline(error: &PipelineError) -> Self {
+        match error {
+            PipelineError::Jpeg(_) | PipelineError::RtpJpeg(_) => Self::Decode,
+            PipelineError::Encode(_) => Self::Encoder,
+            _ => Self::Unclassified,
+        }
+    }
+
     fn session(error: &SessionError) -> Self {
         match error {
             SessionError::Transport(error) | SessionError::Unrecoverable(error) => {
@@ -119,7 +141,7 @@ impl FirstFrameCause {
             | SessionError::UnexpectedContainer { .. }
             | SessionError::TransactionMismatch { .. }
             | SessionError::UnsupportedLength
-            | SessionError::DataTooLarge { .. } => Self::Protocol,
+            | SessionError::DataTooLarge { .. } => Self::Framing,
             #[cfg(feature = "macos-icc")]
             SessionError::Icc(error) => Self::icc(*error),
             _ => Self::Unclassified,

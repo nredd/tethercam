@@ -31,9 +31,25 @@ fn body() -> SonySimConfig {
     }
 }
 
+fn streams(h264: bool, mjpeg: bool) -> crate::config::Streams {
+    crate::config::Streams {
+        frame_rate: 15,
+        bitrate: 100_000,
+        h264,
+        mjpeg,
+        full_resolution_snapshot: false,
+    }
+}
+
 async fn doctor(camera: crate::transport::sim::SimCamera) -> (Result<(), Error>, String) {
     let mut out = Vec::new();
-    let result = diagnostics::doctor_camera(Factory::new(vec![camera]), fast(), &mut out).await;
+    let result = diagnostics::doctor_camera(
+        Factory::new(vec![camera]),
+        fast(),
+        &streams(true, true),
+        &mut out,
+    )
+    .await;
     (result, String::from_utf8(out).unwrap())
 }
 
@@ -114,6 +130,32 @@ async fn synthetic_bodies_map_to_their_likely_cause() {
 }
 
 #[tokio::test]
+async fn doctor_rejects_the_frames_run_would_reject() {
+    // Decodes, but 33x33 is not carriable as MJPEG and not an even H.264 size.
+    let odd = || {
+        sony_camera(SonySimConfig {
+            live_view_jpeg: jpeg(33, 33),
+            ..body()
+        })
+    };
+    let check = async |h264, mjpeg| {
+        let mut out = Vec::new();
+        diagnostics::doctor_camera(
+            Factory::new(vec![odd()]),
+            fast(),
+            &streams(h264, mjpeg),
+            &mut out,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    };
+    assert_eq!(check(true, true).await, Err(Cause::Decode.to_string()));
+    assert_eq!(check(false, true).await, Err(Cause::Decode.to_string()));
+    assert_eq!(check(true, false).await, Err(Cause::Encoder.to_string()));
+    assert!(check(false, false).await.is_ok());
+}
+
+#[tokio::test]
 async fn injected_transport_faults_name_timeout_and_disconnect() {
     let mut camera = sony_camera(body());
     camera.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
@@ -140,6 +182,8 @@ fn every_cause_is_actionable_and_free_of_identifiers() {
         Cause::Protocol,
         Cause::Decode,
         Cause::Unclassified,
+        Cause::Encoder,
+        Cause::Framing,
     ];
     let mut seen = std::collections::HashSet::new();
     for cause in all {
@@ -193,22 +237,22 @@ fn classification_covers_every_driver_error_family() {
         (session(SessionError::TooManyEmptyReads), Cause::Timeout),
         (
             session(SessionError::Container(ContainerError::TruncatedHeader(0))),
-            Cause::Protocol,
+            Cause::Framing,
         ),
-        (session(SessionError::UnsupportedLength), Cause::Protocol),
+        (session(SessionError::UnsupportedLength), Cause::Framing),
         (
             session(SessionError::TransactionMismatch {
                 expected: 1,
                 actual: 2,
             }),
-            Cause::Protocol,
+            Cause::Framing,
         ),
         (
             session(SessionError::DataTooLarge {
                 announced: 2,
                 limit: 1,
             }),
-            Cause::Protocol,
+            Cause::Framing,
         ),
         (
             session(SessionError::Response {
@@ -229,6 +273,30 @@ fn classification_covers_every_driver_error_family() {
     assert_eq!(
         Cause::of(&SonyError::LiveViewNotReady, true),
         Cause::NoFrame
+    );
+}
+
+#[test]
+fn pipeline_failures_are_classified_by_stage() {
+    use crate::supervisor::PipelineError;
+    assert_eq!(
+        Cause::of_pipeline(&PipelineError::Jpeg(crate::media::JpegError::Malformed(
+            String::new()
+        ))),
+        Cause::Decode
+    );
+    assert_eq!(
+        Cause::of_pipeline(&PipelineError::Encode(
+            crate::media::EncodeError::InvalidDimensions {
+                width: 1,
+                height: 1
+            }
+        )),
+        Cause::Encoder
+    );
+    assert_eq!(
+        Cause::of_pipeline(&PipelineError::Worker),
+        Cause::Unclassified
     );
 }
 

@@ -231,6 +231,42 @@ fn stream_configs(
     ))
 }
 
+/// Everything `prepare` requires of the first frame: RFC 2435 framing when MJPEG is on, a decode,
+/// and an accepted encoder configuration for its size when H.264 is on. Returns the pieces
+/// `prepare` keeps.
+fn validate_first(
+    first: &[u8], settings: &Streams,
+) -> Result<(JpegDecoder, I420Frame, Option<SoftwareH264Encoder>), PipelineError> {
+    if settings.mjpeg {
+        crate::rtp::jpeg::JpegInfo::parse(first)?;
+    }
+    let mut decoder = JpegDecoder::new();
+    let mut frame = I420Frame::default();
+    decoder.decode_into(first, &mut frame)?;
+    let encoder = if settings.h264 {
+        Some(SoftwareH264Encoder::configure(EncoderConfig {
+            width: frame.width(),
+            height: frame.height(),
+            fps: settings.frame_rate,
+            bitrate_bps: settings.bitrate,
+            keyframe_interval: settings.frame_rate.saturating_mul(2),
+            profile: Profile::Baseline,
+        })?)
+    } else {
+        None
+    };
+    Ok((decoder, frame, encoder))
+}
+
+/// Whether `run` would accept `first` as its first frame under `settings`: the same checks as
+/// [`Pipeline::prepare`], so `doctor` cannot report ready for a frame `run` rejects.
+///
+/// # Errors
+/// The [`PipelineError`] `prepare` would return.
+pub(crate) fn check_first_frame(first: &[u8], settings: &Streams) -> Result<(), PipelineError> {
+    validate_first(first, settings).map(drop)
+}
+
 pub(crate) struct Pipeline {
     processor: Processor,
     frames: watch::Receiver<Option<Arc<[u8]>>>,
@@ -258,24 +294,7 @@ impl Pipeline {
         streams: Result<RtpConfig, PipelineError>,
     ) -> Result<(Self, [Arc<RuntimeSource>; 2]), PipelineError> {
         let ([main_config, jpeg_config], timestamp_base) = streams?;
-        if settings.mjpeg {
-            crate::rtp::jpeg::JpegInfo::parse(first)?;
-        }
-        let mut decoder = JpegDecoder::new();
-        let mut frame = I420Frame::default();
-        decoder.decode_into(first, &mut frame)?;
-        let encoder = if settings.h264 {
-            Some(SoftwareH264Encoder::configure(EncoderConfig {
-                width: frame.width(),
-                height: frame.height(),
-                fps: settings.frame_rate,
-                bitrate_bps: settings.bitrate,
-                keyframe_interval: settings.frame_rate.saturating_mul(2),
-                profile: Profile::Baseline,
-            })?)
-        } else {
-            None
-        };
+        let (decoder, frame, encoder) = validate_first(first, settings)?;
         let fmtp = encoder.as_ref().map(|encoder| {
             let b64 = base64::engine::general_purpose::STANDARD;
             format!(

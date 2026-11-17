@@ -267,7 +267,13 @@ async fn command_with<F: CameraFactory>(
                 cfg,
                 crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
             )?;
-            diagnostics::doctor_camera(factory, crate::sony::SonyConfig::default(), out).await?;
+            diagnostics::doctor_camera(
+                factory,
+                crate::sony::SonyConfig::default(),
+                &cfg.streams,
+                out,
+            )
+            .await?;
             writeln!(
                 out,
                 "Clock, permissions, listener ports and camera mode are ready."
