@@ -1,8 +1,8 @@
 # macOS quickstart and camera checklist
 
 From a boxed Sony body to a stream UniFi Protect and Home Assistant can use, on a Mac. Every
-address here is synthetic (`192.0.2.0/24`). The `icc` backend is designed to run beside Apple's camera helpers; in the measured run none was killed,
-unloaded or bypassed.
+address here is synthetic (`192.0.2.0/24`). The `icc` backend is designed to run beside Apple's camera helpers; the earlier short hardware sample
+([`macos-camera.md`](macos-camera.md#validation-status)) ran with the helpers untouched.
 
 ## What was measured, and what was not
 
@@ -49,7 +49,7 @@ camera, with the body powered:
 3. Data-capable USB-C cable, directly to the Mac mini, not through an unpowered hub
 
 Settings that were NOT checked on the a7 III, so whether they matter is unknown: the mode dial
-position, save destination, focus settings, and auto power-off. An earlier observation recorded in
+position, save destination, focus settings, and auto power-off. An earlier observation, not measured in this run, recorded in
 [#13](https://github.com/nredd/tethercam/issues/13): a body left the USB device list within hours with
 the cable untouched and no session open; the cause is unestablished. If
 your camera disappears, look at its power-off and sleep settings first and report what you find.
