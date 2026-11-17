@@ -1,8 +1,8 @@
 # macOS quickstart and camera checklist
 
 From a boxed Sony body to a stream UniFi Protect and Home Assistant can use, on a Mac. Every
-address here is synthetic (`192.0.2.0/24`). Nothing in it needs a Sony or Apple helper killed,
-unloaded or bypassed: the `icc` backend runs beside them.
+address here is synthetic (`192.0.2.0/24`). The `icc` backend is designed to run beside Apple's camera helpers; in the measured run none was killed,
+unloaded or bypassed.
 
 ## What was measured, and what was not
 
@@ -39,17 +39,19 @@ NOT verified, and not claimed:
 
 ## Camera checklist
 
-On the camera, with the lens on and the body powered:
+These settings come from the earlier docs and the code's USB mode check. They were not individually
+confirmed on the measured run beyond the camera working with them as the owner had set it. On the
+camera, with the body powered:
 
-1. Menu -> Setup -> USB Connection -> **PC Remote**. Required: the body is refused in MTP and
-   Mass Storage mode, and picked up within a minute of switching
-2. Menu -> Setup -> USB Power Supply -> **On**
+1. Menu -> Setup -> USB Connection -> **PC Remote**. The software refuses the body in MTP and
+   Mass Storage mode ([`usb.md`](usb.md)) and retries, so switching mode is picked up later
+2. Menu -> Setup -> USB Power Supply -> **On** (from the README; effect unconfirmed here)
 3. Data-capable USB-C cable, directly to the Mac mini, not through an unpowered hub
 
 Settings that were NOT checked on the a7 III, so whether they matter is unknown: the mode dial
-position, save destination, focus settings, and auto power-off. A body was seen to leave USB
-within hours with the cable untouched and nobody connected
-([#86](https://github.com/nredd/tethercam/issues/86) history); the cause is unestablished. If
+position, save destination, focus settings, and auto power-off. An earlier observation recorded in
+[#13](https://github.com/nredd/tethercam/issues/13): a body left the USB device list within hours with
+the cable untouched and no session open; the cause is unestablished. If
 your camera disappears, look at its power-off and sleep settings first and report what you find.
 
 ## Steps
@@ -81,7 +83,7 @@ your camera disappears, look at its power-off and sleep settings first and repor
 ## Service
 
 ```sh
-tethercam service install    # from a logged-in GUI session, not over a bare SSH login
+tethercam service install    # needs a logged-in GUI session (see service.md)
 tethercam service status
 tethercam service uninstall
 ```
@@ -105,8 +107,9 @@ tethercam service uninstall
   graceful `SIGTERM` was followed by an automatic restart with a new `run_id`, status `ready`
 - Logs: `~/Library/Logs/tethercam/stdout.log` and `stderr.log`, not rotated
   ([`service.md`](service.md#run-counters-and-the-log-bound))
-- Screen lock and unlock, and reboot with auto-login, are not validated. Keep the Mac mini on
-  with sleep disabled (sleep behavior was not tested)
+- Screen lock and unlock, and reboot with auto-login, are not validated. Sleep: untested. A sleeping host
+  cannot serve a stream, so check System Settings -> Energy (or Battery) for the option that prevents
+  automatic sleep on power, and verify the stream after an idle period yourself
 
 ## Network link loss
 
@@ -120,9 +123,9 @@ check the stream after any link loss.
 
 ## Firewall
 
-macOS may prompt to allow incoming connections for the `tethercam` binary the first time it listens
-beyond loopback. Allow it only if you are on the network you intend. Open TCP 8554 (RTSP) and 8080
-(ONVIF/snapshot) and UDP 3702 (WS-Discovery multicast) to your NVR and Home Assistant only. The ports
+Not observed on the measured run; expected behavior. macOS may prompt to allow incoming connections for the `tethercam` binary the first time it listens
+beyond loopback. Allow it only if you are on the network you intend. If you filter, allow TCP 8554 (RTSP) and 8080
+(ONVIF/snapshot) and UDP 3702 (WS-Discovery multicast) from your NVR and Home Assistant only. The ports
 are `rtsp_port` and `onvif_port`.
 
 ## Bitrate

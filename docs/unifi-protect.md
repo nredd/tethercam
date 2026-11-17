@@ -9,7 +9,7 @@ be `ready` and listening on the LAN first.
 ## Verified
 
 Owner, one run, `tethercam` main e48ae46 on a Mac mini, a7 III. UI and version names below are as
-seen then; Protect's UI changes between versions, so labels may differ on yours.
+reported by the owner and not recorded in detail; Protect's UI changes between versions, so labels may differ on yours.
 
 - In Protect's Devices view, the camera appeared as a third-party camera with a Click to Adopt
   action. Adopting it asks for camera credentials: enter the generated `tethercam` username and
@@ -28,8 +28,8 @@ seen then; Protect's UI changes between versions, so labels may differ on yours.
 3. Enter the camera credentials from `setup`. Never put them in a URL
 4. Wait for online, then check live view and recording
 
-If it is not listed, discovery may not reach it (other VLAN, multicast filtered). Add it by IP
-and ONVIF port (`onvif_port`, default 8080) where your Protect version offers that.
+If it is not listed, discovery may not reach it (other VLAN, multicast filtered). Adding it by IP
+and ONVIF port (`onvif_port`, default 8080), where your Protect version offers that, is untested here.
 
 ## Known issue: duplicate rows
 

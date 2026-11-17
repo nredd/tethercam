@@ -52,6 +52,9 @@ users; development gates use the exact toolchain pinned in `rust-toolchain.toml`
 cargo install tethercam
 ```
 
+The published 0.0.1 has no `icc` backend. On macOS build from source with `--features macos-icc`
+(Rust 1.99 or newer, see below and the [quickstart](docs/macos-quickstart.md)).
+
 From source:
 
 ```sh

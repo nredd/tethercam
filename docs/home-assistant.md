@@ -34,4 +34,5 @@ imported without further steps.
 - Cannot connect: subnet, firewall on the Mac, `onvif_address`, service not `ready` (it answers
   503 until the first live-view frame)
 - Authentication fails: credentials, and clock skew between hosts
+- Camera not in PC Remote: the service reports `waiting` and ONVIF answers 503 ([`architecture.md`](architecture.md#waiting-for-the-camera)); fix the camera mode first
 - Duplicate cameras: see the known Protect issue in [`unifi-protect.md`](unifi-protect.md)
