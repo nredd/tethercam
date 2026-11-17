@@ -107,12 +107,15 @@ tethercam service uninstall
 - Screen lock and unlock, and reboot with auto-login, are not validated. Keep the Mac mini on
   with sleep disabled (sleep behavior was not tested)
 
-## Always-on network and power
+## Network link loss
 
-The camera is only reachable while the host's network link is up. Keep the host's network interface
-and its power always on, and do not let anything switch them off: the stream drops while the link is
-down. During the partial soak the link was lost once and the stream recovered without a process
-restart, but do not rely on that.
+The camera is only reachable while the host's network link is up, and the listeners and
+WS-Discovery are bound at start to the configured addresses. During the partial soak the host's
+network interface disappeared once and the stream recovered with no observed process restart. That is
+one observation, not a guarantee: how listeners and discovery behave across interface changes is
+untested here and tracked in [#116](https://github.com/nredd/tethercam/issues/116). Until that
+lands, treat a pinned address (`rtsp_address`, `onvif_address`, `interface`) as bound at start and
+check the stream after any link loss.
 
 ## Firewall
 
@@ -128,6 +131,7 @@ The default `streams.bitrate` is 2 Mbps for the H.264 stream. Older notes of "ab
 
 ## Troubleshooting
 
+- `doctor` does not yet name the likely cause when the first frame never arrives (remaining part of [#86](https://github.com/nredd/tethercam/issues/86)); read `camera_open_failed` in the log
 - `waiting` forever: not in PC Remote, camera asleep or off, wrong `camera_id` (it matches nothing
   and the service waits), or another program has the session. Read `camera_open_failed` in the log
 - Protect or Home Assistant cannot see it: check clock skew (WS-Security timestamps), subnet and

@@ -44,6 +44,6 @@ identity adds another camera.
 - Not discovered: subnet, VLAN, multicast, `onvif_address`; the camera is silent until ready
 - Credential rejected: re-read `camera.toml` privately; the installed service uses its own fixed
   config
-- Offline after a stretch: see the always-on network note in the quickstart
+- Offline after a stretch: see the [network link loss](macos-quickstart.md#network-link-loss) note
 - Clock skew breaks ONVIF authentication: keep the Mac's clock synced
 - Camera not in PC Remote: the service is `waiting` and advertises nothing
