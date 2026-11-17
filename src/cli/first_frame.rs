@@ -24,7 +24,7 @@ mod tests;
 pub enum FirstFrameCause {
     /// The body did not advertise the Sony remote-control extension.
     #[error(
-        "no first frame: the camera did not offer Sony remote control; set USB Connection to PC Remote"
+        "no first frame: the camera did not offer Sony remote control, probably not in PC Remote; check USB Connection is PC Remote"
     )]
     NotRemote,
     /// The handshake was refused.
@@ -58,7 +58,7 @@ pub enum FirstFrameCause {
     Transport,
     /// The camera is busy with something else, or kept answering busy or empty.
     #[error(
-        "no first frame: the camera is busy with another operation; retry shortly, and if it persists check whether another program holds it"
+        "no first frame: the camera is busy or not answering the handshake; retry shortly, and if it persists check whether another program holds it"
     )]
     Busy,
     /// The OS restricts camera access for this process.
