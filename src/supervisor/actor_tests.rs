@@ -988,3 +988,43 @@ async fn a_session_lost_after_ready_counts_a_restart_and_the_next_ready_a_reconn
         (1, 1, 2)
     );
 }
+
+/// Live-view snapshots are checked against the size the streams were described with, on the
+/// fresh-slot path and on the refresh path, before the reply is sent (#103).
+#[tokio::test(start_paused = true)]
+async fn live_snapshots_are_refused_when_their_size_differs_from_the_published_profile() {
+    for age in [Duration::ZERO, Duration::from_secs(60)] {
+        for (published, served) in [((32, 32), true), ((48, 32), false), ((32, 48), false)] {
+            let (actor, control) = actor(Factory::new(vec![camera()]));
+            let logs = LogCapture::new();
+            let (factory, ()) = tokio::join!(Box::pin(actor.run()), async {
+                ready(&control).await;
+                // Unpublished: nothing to compare with, so the frame is served.
+                let unpublished = control.clone();
+                tokio::time::sleep(age).await;
+                let reply = tokio::task::spawn_blocking(move || unpublished.snapshot("main"));
+                assert_eq!(
+                    reply.await.unwrap().unwrap(),
+                    crate::supervisor::testing::jpeg(32, 32)
+                );
+                control.publish_format(published.0, published.1);
+                let _guard = tracing::dispatcher::set_default(&logs.dispatch());
+                tokio::time::sleep(age).await;
+                let caller = control.clone();
+                let reply = tokio::task::spawn_blocking(move || caller.snapshot("main"));
+                let reply = reply.await.unwrap();
+                assert_eq!(reply.is_ok(), served, "{age:?} {published:?}");
+                assert_eq!(control.counters().snapshots_refused, u64::from(!served));
+                // A refused snapshot never ends the session or clears the frame slot.
+                assert!(matches!(control.status(), CameraStatus::Ready { .. }));
+                control.shutdown();
+            });
+            assert_eq!(factory.released.lock().unwrap().len(), 1);
+            assert_eq!(
+                logs.text().contains("snapshot_size_mismatch"),
+                !served,
+                "{age:?} {published:?}"
+            );
+        }
+    }
+}

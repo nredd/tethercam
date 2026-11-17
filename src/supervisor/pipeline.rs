@@ -295,6 +295,7 @@ impl Pipeline {
     ) -> Result<(Self, [Arc<RuntimeSource>; 2]), PipelineError> {
         let ([main_config, jpeg_config], timestamp_base) = streams?;
         let (decoder, frame, encoder) = validate_first(first, settings)?;
+        control.publish_format(frame.width(), frame.height());
         let fmtp = encoder.as_ref().map(|encoder| {
             let b64 = base64::engine::general_purpose::STANDARD;
             format!(
