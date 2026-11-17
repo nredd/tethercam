@@ -52,11 +52,15 @@ only (UDP 3702, both groups, plus unicast). Hard caps, whichever comes first:
 tcpdump -i <iface> -n -s 4200 -c 200 -G 600 -W 1 -w <private>/window1.pcap 'udp port 3702'
 ```
 
-That is 200 packets and 10 minutes. The snap length fits the largest accepted datagram
-(`MAX_PACKET`, 4096 bytes of payload) plus Ethernet, VLAN, IPv6 and UDP headers, so a packet is
-stored whole, at most 4200 bytes each (under 1 MiB in total). A stored packet whose captured
-length is below its original length is truncated: mark it `truncated` in the notes and leave it
-out of every equality comparison and count, never read a partial envelope as an identity.
+That is 200 packets and 10 minutes. The snap length fits an ordinary unfragmented WS-Discovery
+frame: the largest accepted datagram (`MAX_PACKET`, 4096 bytes of payload) plus Ethernet, VLAN,
+IPv6 and UDP headers, at most 4200 bytes each (under 1 MiB in total). It does not cover a
+fragmented datagram: the filter matches only the first fragment (later ones carry no UDP port), so
+a fully captured first fragment is not a complete envelope. Leave the filter as it is.
+
+Exclude from every equality comparison and count, and mark the evidence insufficient, any datagram
+that is fragmented, incomplete or not reassembled, and any stored packet whose captured length is
+below its original length (`truncated`). Never read a partial envelope as an identity.
 
 Start it first, then note `t0` (wall clock, UTC, seconds), then run the trigger:
 
