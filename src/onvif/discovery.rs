@@ -60,7 +60,7 @@ mod message;
 mod net;
 mod xml;
 
-use limiter::{Dedup, GlobalLimiter, SourceLimiter};
+use limiter::{Dedup, GlobalLimiter, SourceLimiter, Token};
 pub use message::{
     AppSequence, Dialect, MAX_MESSAGE_ID, ParseError, ProbeRequest, Request, ResolveRequest,
     Target, parse_request,
@@ -774,7 +774,9 @@ pub struct Outgoing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Replied {
     raw_key: String,
+    raw_token: Token,
     message_id: String,
+    message_token: Token,
 }
 
 /// The pure protocol core.
@@ -840,7 +842,8 @@ impl<E: Entropy> Engine<E> {
         if !self.limiter.allow(ip, now) || !self.global.allow(now) {
             return Err(Dropped::RateLimited);
         }
-        self.raw.insert(&raw_key, now);
+        // Absent just above, so recorded; token 0 (never issued) would make a later forget a no-op.
+        let raw_token = self.raw.insert(&raw_key, now).unwrap_or_default();
         let request = parse_request(data).map_err(Dropped::Malformed)?;
         let (message_id, matched) = match &request {
             Request::Probe(p) => (
@@ -859,9 +862,9 @@ impl<E: Entropy> Engine<E> {
                     .eq_ignore_ascii_case(self.config.endpoint.as_str()),
             ),
         };
-        if !self.dedup.insert(message_id, now) {
+        let Some(message_token) = self.dedup.insert(message_id, now) else {
             return Err(Dropped::Duplicate);
-        }
+        };
         if !matched {
             return Err(Dropped::NoMatch);
         }
@@ -884,7 +887,9 @@ impl<E: Entropy> Engine<E> {
             payload: payload.into_bytes(),
             replied: Some(Replied {
                 raw_key,
+                raw_token,
                 message_id: message_id.to_owned(),
+                message_token,
             }),
         })
     }
@@ -922,12 +927,14 @@ impl<E: Entropy> Engine<E> {
     }
 
     /// Forget that `out`'s request was answered because its reply never left (discarded, refused
-    /// or failed to send), so the client's retransmit is answered. Everything else already
+    /// or failed to send), so the client's retransmit is answered. Only the insertions this reply
+    /// made are removed: an entry recorded again since (after eviction or expiry) stays. Everything else already
     /// answered stays suppressed, and the rate limits stay, so retries remain bounded.
     fn forget(&mut self, out: &Outgoing) {
         if let Some(replied) = &out.replied {
-            self.raw.remove(&replied.raw_key);
-            self.dedup.remove(&replied.message_id);
+            self.raw.remove(&replied.raw_key, replied.raw_token);
+            self.dedup
+                .remove(&replied.message_id, replied.message_token);
         }
     }
 

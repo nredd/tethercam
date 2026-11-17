@@ -1803,3 +1803,40 @@ fn dropping_one_queued_reply_keeps_what_other_interfaces_already_answered() {
     rig.responder.step(POLL).unwrap();
     assert_eq!(deliver(&mut rig, wireless, &queued), 1);
 }
+
+#[test]
+fn a_stale_forget_does_not_remove_an_entry_recorded_again_after_eviction() {
+    // Public `Limits` let a caller raise the budgets far past the dedup capacities.
+    let high = Limits {
+        global_burst: 100_000,
+        global_per_second: 100_000,
+        source_burst: 100_000,
+        ..Limits::default()
+    };
+    let mut engine = Engine::new(config().with_limits(high), Counter(1));
+    let now = Instant::now();
+    let first = onvif_probe(1);
+    let p1 = engine.handle(now, peer(20), first.as_bytes()).unwrap();
+    // Enough distinct requests to evict both of P1's entries by capacity (raw 64, ids 256).
+    for id in 2..2 + 300_u32 {
+        engine
+            .handle(now, peer(20), onvif_probe(id).as_bytes())
+            .unwrap();
+    }
+    // The client retransmits; both entries are recorded again (same instant) for P2.
+    let p2 = engine.handle(now, peer(20), first.as_bytes()).unwrap();
+    // P1's send fails late: it must not take P2's entries with it.
+    engine.forget(&p1);
+    assert!(matches!(
+        engine.handle(now, peer(20), first.as_bytes()),
+        Err(Dropped::Duplicate)
+    ));
+    let retry = format!("{PROBE_ONVIF}\n").replace("555555555555", "000000000001");
+    assert!(matches!(
+        engine.handle(now, peer(20), retry.as_bytes()),
+        Err(Dropped::Duplicate)
+    ));
+    // P2's own failure does forget them.
+    engine.forget(&p2);
+    assert!(engine.handle(now, peer(20), first.as_bytes()).is_ok());
+}
