@@ -297,6 +297,21 @@ camera_id = "0F6A2C1E-0000-4000-8000-000000000002"   # exact, as printed by `tet
 | several, not the selected one | refused, as above | waits; never falls back to another device |
 | exactly one other device | that device is used | waits; the other device is never opened |
 
+- One-shot commands (`cameras`, `probe`, `doctor`) discover again when, and only when, a discovery returns
+  no devices at all: up to two more times, a second apart, three observation windows of 2 s in all, so at
+  most about 8 s when the framework answers each window on time. The owner saw one saved `camera_id` list as
+  selected, then `doctor` twice report no selected camera, then succeed, with the camera attached throughout.
+  That an empty snapshot can happen is proven; why it happens is NOT established, and this does not claim to
+  fix it. The first non-empty snapshot is used and selected exactly as above, so a selected camera that is
+  absent among other devices still waits or is refused, never falls back and never opens another device.
+  Nothing else is retried: any error (busy, a deadline, a restriction, a quarantine, a native failure) is
+  returned at once because native work may be pending, and nothing is submitted while a camera is
+  outstanding. If every attempt is empty, `probe` and `doctor` say `ImageCaptureCore listed no cameras in 3
+  discovery attempts; the cause is not established ...` (counts only, no identifier) and `cameras` prints the
+  same line under `Cameras found: 0`; when a later attempt found the camera `cameras` says which attempt it
+  was, and `probe`/`doctor` log `icc_discovery_recovered` with the attempt count. The service (`run`) is
+  unchanged: it discovers once per supervisor attempt and keeps waiting on empty. Tested with synthetic
+  scripted discovery only; whether this helps the owner's case is for the owner to try on hardware
 - `camera_id` is rejected with `camera_backend = "usb"` (as `camera_serial` is with `icc`), and when empty,
   padded with whitespace, over 1024 bytes or containing control, format or separator characters. These are config validation
   errors raised before any camera access, and they never print the value. An existing configuration

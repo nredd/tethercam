@@ -29,13 +29,13 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use super::Error;
+use super::empty::{self, EmptyRecovery};
 use super::icc::open_error;
 use crate::config::{Config, is_unprintable, valid_camera_id};
 use crate::ptp::DeviceInfo;
 use crate::ptp::session::{PtpSession, SessionConfig, SessionError};
-use crate::transport::icc::{
-    DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession, IccTimeout, distinct,
-};
+use crate::supervisor::OpenError;
+use crate::transport::icc::{Effect, IccDeviceId, IccError, IccHandle, IccSession, distinct};
 
 #[cfg(test)]
 #[path = "cameras_tests.rs"]
@@ -186,22 +186,36 @@ fn write_line(
 /// Discovery failures as [`Error::Open`], output failures as [`Error::Io`] and
 /// [`Error::Quarantined`] when native ownership became unresolvable.
 pub(super) async fn list(
-    mut handle: IccHandle, cfg: &Config, describe: bool, out: &mut dyn Write,
-    mut stop: Pin<Box<dyn Future<Output = ()> + '_>>,
+    mut handle: IccHandle, cfg: &Config, describe: bool, recovery: EmptyRecovery,
+    out: &mut dyn Write, mut stop: Pin<Box<dyn Future<Output = ()> + '_>>,
 ) -> Result<(), Error> {
     let wanted = cfg.camera_id.as_ref().map(crate::config::Secret::expose);
-    let found = match handle
-        .discover(DISCOVERY_WINDOW, IccTimeout::default())
-        .await
-    {
-        Ok(found) if found.len() <= MAX_DEVICES => found,
+    let snapshot = match empty::discover(&mut handle, recovery).await {
+        Ok(snapshot) if snapshot.found.len() <= MAX_DEVICES => snapshot,
         Ok(_) => return Err(Error::Open(open_error(IccError::LimitExceeded))),
         Err(error) if error.effect() == Effect::Quarantine => return Err(Error::Quarantined),
         Err(error) => return Err(Error::Open(open_error(error))),
     };
     // One device the framework lists twice is one line, flagged with the count.
-    let devices = distinct(&found);
+    let devices = distinct(&snapshot.found);
     writeln!(out, "Cameras found: {}", devices.len())?;
+    // Counts only: what the repeated discovery saw, said where the operator reads the listing.
+    if snapshot.exhausted_empty() {
+        writeln!(
+            out,
+            "{}.",
+            OpenError::EmptyListing {
+                attempts: snapshot.attempts
+            }
+        )?;
+    } else if snapshot.attempts > 1 {
+        writeln!(
+            out,
+            "Discovery was empty on its first {} attempt(s); this listing is from attempt {}.",
+            snapshot.attempts.saturating_sub(1),
+            snapshot.attempts
+        )?;
+    }
     let mut pause: Option<&'static str> = None;
     let mut matched = false;
     let mut quarantined = false;

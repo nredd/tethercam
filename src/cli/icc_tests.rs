@@ -14,9 +14,9 @@ use crate::cli::Command;
 use crate::sony::op;
 use crate::supervisor::serve_until;
 use crate::supervisor::testing::{LogCapture, camera};
-use crate::transport::icc::Boundary;
 use crate::transport::icc::fake::{Call, Fake, Script, Shared, SimBoundary, SimFaults, Unsettled};
 use crate::transport::icc::run_with;
+use crate::transport::icc::{Boundary, IccTimeout};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -364,6 +364,7 @@ fn probe_through(boundary: SimBoundary, logs: &LogCapture) -> (Result<(), Error>
         options: options(Command::Probe),
         cfg: free_cfg(),
         dispatch: logs.dispatch(),
+        recovery: EmptyRecovery::OFF,
     };
     let mut out = Vec::new();
     let result = run_with(boundary, |handle| worker(handle, &plan, &mut out)).unwrap();
@@ -384,6 +385,7 @@ fn a_probe_without_the_camera_is_a_plain_failure_not_a_quarantine() {
         options: options(Command::Probe),
         cfg: free_cfg(),
         dispatch: LogCapture::new().dispatch(),
+        recovery: EmptyRecovery::OFF,
     };
     let mut out = Vec::new();
     let result = run_with(fake, |handle| worker(handle, &plan, &mut out)).unwrap();
@@ -403,6 +405,7 @@ fn run_serves_until_stopped_and_closes_the_session_in_order() {
                 handle,
                 &cfg,
                 &options(Command::Run),
+                EmptyRecovery::OFF,
                 &mut out,
                 Box::pin(stop),
             )
@@ -446,6 +449,7 @@ fn with_no_camera_the_process_comes_up_waiting_and_stops_in_order() {
                 handle,
                 &cfg,
                 &options(Command::Run),
+                EmptyRecovery::OFF,
                 &mut out,
                 Box::pin(stop),
             )
@@ -475,6 +479,7 @@ fn run_until_quarantined(faults: SimFaults) -> Result<(), Error> {
             handle,
             &cfg,
             &options(Command::Run),
+            EmptyRecovery::OFF,
             &mut out,
             Box::pin(std::future::pending()),
         ))
@@ -558,6 +563,7 @@ fn a_failed_close_quarantines_even_when_the_stop_was_requested() {
                 handle,
                 &cfg,
                 &options(Command::Run),
+                EmptyRecovery::OFF,
                 &mut out,
                 Box::pin(stop),
             )
@@ -574,6 +580,7 @@ fn the_worker_reports_runtime_and_signal_setup_failures() {
         options: options(Command::Probe),
         cfg: free_cfg(),
         dispatch: LogCapture::new().dispatch(),
+        recovery: EmptyRecovery::OFF,
     };
     let mut out = Vec::new();
     // Never reached when the runtime failed first; called once here so it is exercised.
@@ -639,6 +646,7 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
         &logs.dispatch(),
         sink.clone(),
         |entry| run_with(SimBoundary::new(camera()), entry),
+        EmptyRecovery::OFF,
         Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
@@ -662,6 +670,7 @@ fn launch_without_a_settle_bound_runs_unwatched() {
         &LogCapture::new().dispatch(),
         sink.clone(),
         |entry| run_with(SimBoundary::new(camera()), entry),
+        EmptyRecovery::OFF,
         None,
         record_unexpected_termination,
     )
@@ -687,6 +696,7 @@ fn launch_terminates_with_the_restart_status_after_a_quarantine() {
             };
             run_with(SimBoundary::with_faults(camera(), faults), entry)
         },
+        EmptyRecovery::OFF,
         Some(SETTLE_LIMIT),
         record_termination,
     );
@@ -709,6 +719,7 @@ fn launch_reports_an_unavailable_runtime_without_running_anything() {
         &LogCapture::new().dispatch(),
         Sink::default(),
         |_entry| Err(IccError::Runtime),
+        EmptyRecovery::OFF,
         Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
@@ -730,6 +741,7 @@ fn launch_does_not_blame_the_platform_when_the_worker_failed_after_it_ran() {
                 std::panic::resume_unwind(Box::new("synthetic worker failure"))
             })
         },
+        EmptyRecovery::OFF,
         Some(SETTLE_LIMIT),
         record_unexpected_termination,
     );
@@ -793,6 +805,7 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
         &logs.dispatch(),
         sink.clone(),
         hung_with_camera,
+        EmptyRecovery::OFF,
         Some(Duration::from_millis(50)),
         exit_and_settle,
     );
@@ -850,6 +863,7 @@ fn a_one_shot_command_that_panics_when_unwinding_still_reports_an_error_before_t
         &LogCapture::new().dispatch(),
         out.clone(),
         hung_with_camera,
+        EmptyRecovery::OFF,
         Some(Duration::from_millis(50)),
         exit_and_settle,
     );
@@ -879,6 +893,7 @@ fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit()
         &LogCapture::new().dispatch(),
         sink.clone(),
         hung_without_camera,
+        EmptyRecovery::OFF,
         Some(Duration::from_millis(50)),
         exit_and_settle,
     );
@@ -899,10 +914,14 @@ fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit()
 #[test]
 fn a_watcher_that_cannot_start_fails_the_command_before_any_native_work() {
     let sink = Sink::default();
+    let plan = Plan {
+        options: options(Command::Probe),
+        cfg: free_cfg(),
+        dispatch: LogCapture::new().dispatch(),
+        recovery: EmptyRecovery::OFF,
+    };
     let result = launch_spawning(
-        &options(Command::Probe),
-        &free_cfg(),
-        &LogCapture::new().dispatch(),
+        plan,
         sink.clone(),
         hung_with_camera,
         Some(SETTLE_LIMIT),
@@ -954,6 +973,7 @@ fn a_hung_one_shot_command_really_exits_with_the_distinct_status() {
             &LogCapture::new().dispatch(),
             io::stdout(),
             hung_with_camera,
+            EmptyRecovery::OFF,
             Some(Duration::from_millis(200)),
             terminate,
         );

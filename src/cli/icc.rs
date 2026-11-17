@@ -15,6 +15,9 @@
 //! Never the first of several, and never logged. `camera_serial` is a raw-USB identity and is
 //! rejected rather than ignored (`config`); identifiers are printed only by `cameras`.
 //!
+//! One-shot commands also discover again after an *empty* snapshot, a bounded few times (`empty`);
+//! the service does not, and a non-empty snapshot without the selected camera is never retried.
+//!
 //! Reconnect: the supervisor's loop reuses the one runtime. After a confirmed close the next
 //! session reopens on it. A deadline retires the session and the next attempt reports busy until
 //! native cleanup settles; busy for [`BUSY_LIMIT`] without a break means the completion is never
@@ -47,13 +50,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::Dispatch;
 
+use super::empty::{self, EmptyRecovery};
 use super::{Command, Error, Options, cameras, command_until, diagnostics};
 use crate::config::{self, Config};
 use crate::ptp::session::SessionConfig;
 use crate::supervisor::{CameraFactory, OpenError};
 use crate::transport::icc::{
-    self as icc, DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession,
-    IccTimeout, Selector, distinct,
+    self as icc, Effect, IccDeviceId, IccError, IccHandle, IccSession, Selector, distinct,
 };
 
 #[cfg(test)]
@@ -154,6 +157,9 @@ pub(super) struct IccFactory {
     fatal: watch::Sender<bool>,
     /// When the current run of consecutive busy answers began, see [`BUSY_LIMIT`].
     busy_since: Option<tokio::time::Instant>,
+    /// What an empty snapshot costs: the service discovers once per attempt, a one-shot command
+    /// a bounded few times (see `empty`).
+    empty: EmptyRecovery,
 }
 
 impl IccFactory {
@@ -166,9 +172,16 @@ impl IccFactory {
                 selector,
                 fatal,
                 busy_since: None,
+                empty: EmptyRecovery::OFF,
             },
             quarantined,
         )
+    }
+
+    /// Discover again after an empty snapshot, as `empty` allows. Only for one-shot commands.
+    pub(super) fn recovering(mut self, empty: EmptyRecovery) -> Self {
+        self.empty = empty;
+        self
     }
 
     fn quarantine(&self) {
@@ -228,10 +241,25 @@ impl CameraFactory for IccFactory {
         let Some(mut handle) = self.handle.take() else {
             return Err(self.classify(OpenError::Busy));
         };
-        let found = handle
-            .discover(DISCOVERY_WINDOW, IccTimeout::default())
-            .await;
-        let chosen = found.and_then(|found| {
+        let snapshot = empty::discover(&mut handle, self.empty).await;
+        if let Ok(snapshot) = &snapshot {
+            if snapshot.exhausted_empty() {
+                // Counts only. One-shot commands name it; the service never gets here.
+                self.handle = Some(handle);
+                self.busy_since = None;
+                return Err(OpenError::EmptyListing {
+                    attempts: snapshot.attempts,
+                });
+            }
+            if snapshot.attempts > 1 && !snapshot.found.is_empty() {
+                tracing::info!(
+                    event = "icc_discovery_recovered",
+                    attempts = snapshot.attempts
+                );
+            }
+        }
+        let chosen = snapshot.and_then(|snapshot| {
+            let found = snapshot.found;
             self.selector.choose(&found).inspect_err(|error| {
                 if *error == IccError::Ambiguous {
                     // Distinct devices, as `cameras` counts them: the framework may list one twice.
@@ -288,13 +316,14 @@ impl CameraFactory for IccFactory {
 ///
 /// A quarantine wins over any other result: it decides whether the process can go on.
 pub(super) async fn drive_until(
-    handle: IccHandle, cfg: &Config, options: &Options, out: &mut dyn Write,
-    stop: Pin<Box<dyn Future<Output = ()> + '_>>,
+    handle: IccHandle, cfg: &Config, options: &Options, recovery: EmptyRecovery,
+    out: &mut dyn Write, stop: Pin<Box<dyn Future<Output = ()> + '_>>,
 ) -> Result<(), Error> {
     if let Command::Cameras { describe } = options.command {
-        return cameras::list(handle, cfg, describe, out, stop).await;
+        return cameras::list(handle, cfg, describe, recovery, out, stop).await;
     }
     let (factory, mut fatal) = IccFactory::new(handle, selector(cfg)?);
+    let factory = factory.recovering(recovery);
     let quarantined = fatal.clone();
     let shutdown = async move {
         tokio::select! {
@@ -315,18 +344,28 @@ pub(super) struct Plan {
     options: Options,
     cfg: Config,
     dispatch: Dispatch,
+    recovery: EmptyRecovery,
 }
 
 type StopSignal = io::Result<Pin<Box<dyn Future<Output = ()>>>>;
 
 /// The worker side: scoped logging, a runtime of its own, and OS signals registered in it.
-fn worker_with(
+pub(super) fn worker_with(
     handle: IccHandle, plan: &Plan, out: &mut dyn Write,
     runtime: io::Result<tokio::runtime::Runtime>, stop: fn() -> StopSignal,
 ) -> Result<(), Error> {
     tracing::dispatcher::with_default(&plan.dispatch, || {
-        runtime?
-            .block_on(async { drive_until(handle, &plan.cfg, &plan.options, out, stop()?).await })
+        runtime?.block_on(async {
+            drive_until(
+                handle,
+                &plan.cfg,
+                &plan.options,
+                plan.recovery,
+                out,
+                stop()?,
+            )
+            .await
+        })
     })
 }
 
@@ -431,38 +470,29 @@ fn spawn_watcher(task: Box<dyn FnOnce() + Send>) -> io::Result<std::thread::Join
 /// [`UNSETTLED_EXIT`] when the application ended but `run` has not returned within it.
 fn launch_with<W: Write + Send + 'static>(
     options: &Options, cfg: &Config, dispatch: &Dispatch, out: W, run: Run,
-    settle: Option<Duration>, terminate: fn(u8),
+    recovery: EmptyRecovery, settle: Option<Duration>, terminate: fn(u8),
 ) -> Result<(), Error> {
-    launch_spawning(
-        options,
-        cfg,
-        dispatch,
-        out,
-        run,
-        settle,
-        terminate,
-        spawn_watcher,
-    )
+    let plan = Plan {
+        options: options.clone(),
+        cfg: cfg.clone(),
+        dispatch: dispatch.clone(),
+        recovery,
+    };
+    launch_spawning(plan, out, run, settle, terminate, spawn_watcher)
 }
 
 /// [`launch_with`], with the watcher's thread start injectable. A watcher that cannot start fails
 /// the command before the native runtime is touched: silently running unbounded would be the hang
 /// this exists to prevent.
 fn launch_spawning<W: Write + Send + 'static>(
-    options: &Options, cfg: &Config, dispatch: &Dispatch, out: W, run: Run,
-    settle: Option<Duration>, terminate: fn(u8), spawn: Spawn,
+    plan: Plan, out: W, run: Run, settle: Option<Duration>, terminate: fn(u8), spawn: Spawn,
 ) -> Result<(), Error> {
-    let plan = Plan {
-        options: options.clone(),
-        cfg: cfg.clone(),
-        dispatch: dispatch.clone(),
-    };
     let out: SharedOut<W> = Arc::new(Mutex::new(out));
     let (progress, observed) = mpsc::channel();
     let watcher = settle
         .map(|limit| {
             let out = Arc::clone(&out);
-            let dispatch = dispatch.clone();
+            let dispatch = plan.dispatch.clone();
             spawn(Box::new(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
                     watch(&out, &observed, limit, terminate);
@@ -525,6 +555,7 @@ pub(super) fn launch(options: &Options, cfg: &Config, dispatch: &Dispatch) -> Re
         dispatch,
         io::stdout(),
         icc::run::<Entry, Result<(), Error>>,
+        EmptyRecovery::for_command(options.command),
         settle_bound(options.command),
         terminate,
     )
