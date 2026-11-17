@@ -54,8 +54,9 @@ your camera disappears, look at its power-off and sleep settings first and repor
 
 ## Steps
 
-1. Install: `cargo install tethercam --features macos-icc` (Rust 1.99 or newer for the `icc`
-   feature; see the [README](../README.md#install))
+1. Install from source: `cargo install --path . --features macos-icc` in a checkout (Rust 1.99
+   or newer for the `icc` feature; published 0.0.1 has no `icc` backend, it arrives with 0.0.2; see
+   the [README](../README.md#install))
 2. Create the config privately: `tethercam setup --config ./camera.toml`. It prints the generated
    credentials once to your terminal; keep that output private
 3. Select the backend in `camera.toml`: `camera_backend = "icc"`
