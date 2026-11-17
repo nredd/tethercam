@@ -14,13 +14,19 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+/// Identifies one insertion into a [`Dedup`]. Never reused within a `Dedup`, so it names that
+/// insertion even when the same id is later evicted and recorded again, at any timestamp.
+pub(super) type Token = u64;
+
 /// Remembers recently seen `MessageID`s so a datagram that arrives twice (once per joined
 /// socket, or retransmitted) is answered once.
 #[derive(Debug)]
 pub(super) struct Dedup {
-    seen: VecDeque<(String, Instant)>,
+    seen: VecDeque<(String, Instant, Token)>,
     ttl: Duration,
     capacity: usize,
+    /// The next token; starts at 1 so `Token::default()` names no insertion.
+    next: Token,
 }
 
 impl Dedup {
@@ -29,17 +35,18 @@ impl Dedup {
             seen: VecDeque::new(),
             ttl,
             capacity,
+            next: 1,
         }
     }
 
     /// Whether `id` was seen within the TTL, without recording it.
     pub(super) fn contains(&mut self, id: &str, now: Instant) -> bool {
         self.expire(now);
-        self.seen.iter().any(|(seen, _)| seen == id)
+        self.seen.iter().any(|(seen, ..)| seen == id)
     }
 
     fn expire(&mut self, now: Instant) {
-        while let Some((_, at)) = self.seen.front() {
+        while let Some((_, at, _)) = self.seen.front() {
             if now.saturating_duration_since(*at) >= self.ttl {
                 self.seen.pop_front();
             } else {
@@ -48,16 +55,26 @@ impl Dedup {
         }
     }
 
-    /// Record `id`. Returns `false` if it was already seen within the TTL.
-    pub(super) fn insert(&mut self, id: &str, now: Instant) -> bool {
+    /// Forget the insertion `token` made for `id`. An entry that has since replaced it (the
+    /// id was evicted or expired and recorded again) has another token and stays.
+    pub(super) fn remove(&mut self, id: &str, token: Token) {
+        self.seen
+            .retain(|(seen, _, at)| !(seen == id && *at == token));
+    }
+
+    /// Record `id`. Returns the insertion's token, or `None` if it was already seen within the
+    /// TTL.
+    pub(super) fn insert(&mut self, id: &str, now: Instant) -> Option<Token> {
         if self.contains(id, now) {
-            return false;
+            return None;
         }
         if self.seen.len() >= self.capacity.max(1) {
             self.seen.pop_front();
         }
-        self.seen.push_back((id.to_owned(), now));
-        true
+        let token = self.next;
+        self.next = self.next.wrapping_add(1).max(1);
+        self.seen.push_back((id.to_owned(), now, token));
+        Some(token)
     }
 }
 
@@ -188,20 +205,51 @@ mod tests {
     fn dedup_suppresses_within_ttl_and_forgets_after() {
         let t0 = Instant::now();
         let mut d = Dedup::new(Duration::from_secs(10), 8);
-        assert!(d.insert("a", t0));
-        assert!(!d.insert("a", t0 + Duration::from_secs(9)));
-        assert!(d.insert("a", t0 + Duration::from_secs(10)));
+        assert!(d.insert("a", t0).is_some());
+        assert!(d.insert("a", t0 + Duration::from_secs(9)).is_none());
+        assert!(d.insert("a", t0 + Duration::from_secs(10)).is_some());
+    }
+
+    #[test]
+    fn dedup_forgets_only_the_removed_insertion() {
+        let t0 = Instant::now();
+        let mut d = Dedup::new(Duration::from_secs(10), 8);
+        let a = d.insert("a", t0).unwrap();
+        d.insert("b", t0).unwrap();
+        d.remove("missing", a);
+        d.remove("b", a);
+        d.remove("a", Token::default());
+        assert!(d.insert("a", t0).is_none(), "wrong token removes nothing");
+        assert!(d.insert("b", t0).is_none());
+        d.remove("a", a);
+        assert!(d.insert("a", t0).is_some());
+        assert!(d.insert("b", t0).is_none());
+    }
+
+    #[test]
+    fn dedup_remove_ignores_a_stale_token_even_at_the_same_instant() {
+        let t0 = Instant::now();
+        let mut d = Dedup::new(Duration::from_secs(10), 1);
+        let first = d.insert("a", t0).unwrap();
+        // Evicted by capacity, then recorded again at the very same instant.
+        d.insert("b", t0).unwrap();
+        let second = d.insert("a", t0).unwrap();
+        assert_ne!(first, second);
+        d.remove("a", first);
+        assert!(d.insert("a", t0).is_none(), "the newer entry stays");
+        d.remove("a", second);
+        assert!(d.insert("a", t0).is_some());
     }
 
     #[test]
     fn dedup_is_bounded() {
         let t0 = Instant::now();
         let mut d = Dedup::new(Duration::from_secs(60), 2);
-        assert!(d.insert("a", t0));
-        assert!(d.insert("b", t0));
-        assert!(d.insert("c", t0));
+        assert!(d.insert("a", t0).is_some());
+        assert!(d.insert("b", t0).is_some());
+        assert!(d.insert("c", t0).is_some());
         assert_eq!(d.seen.len(), 2);
-        assert!(d.insert("a", t0), "oldest was evicted");
+        assert!(d.insert("a", t0).is_some(), "oldest was evicted");
     }
 
     #[test]
