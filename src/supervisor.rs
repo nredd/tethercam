@@ -20,4 +20,6 @@ pub use pipeline::{PipelineError, RuntimeSource};
 pub(crate) use runtime::device_description;
 #[cfg(test)]
 pub(crate) use runtime::model;
+#[cfg(test)]
+pub(crate) use runtime::serve_until;
 pub use runtime::{RunError, serve};

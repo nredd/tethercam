@@ -53,7 +53,7 @@ use crate::ptp::session::SessionConfig;
 use crate::supervisor::{CameraFactory, OpenError};
 use crate::transport::icc::{
     self as icc, DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession,
-    IccTimeout, Selector,
+    IccTimeout, Selector, distinct,
 };
 
 #[cfg(test)]
@@ -234,7 +234,11 @@ impl CameraFactory for IccFactory {
         let chosen = found.and_then(|found| {
             self.selector.choose(&found).inspect_err(|error| {
                 if *error == IccError::Ambiguous {
-                    tracing::warn!(event = "icc_ambiguous_cameras", candidates = found.len());
+                    // Distinct devices, as `cameras` counts them: the framework may list one twice.
+                    tracing::warn!(
+                        event = "icc_ambiguous_cameras",
+                        candidates = distinct(&found).len()
+                    );
                 }
             })
         });
@@ -391,12 +395,18 @@ fn watch<W: Write>(
     );
     let mut out = lock_out(out);
     // Best effort: the process is about to end and there is nowhere left to report to.
-    if let Some(failure) = failure {
+    if let Some(failure) = &failure {
         let _ = writeln!(out, "Error: {failure}");
     }
+    // Only a command that succeeded has a complete result to point at.
+    let outcome = if failure.is_some() {
+        "The command did not succeed."
+    } else {
+        "The result above is complete."
+    };
     let _ = writeln!(
         out,
-        "Native cleanup did not settle within {limit:?}; exiting with status {UNSETTLED_EXIT}. The result above is complete."
+        "Native cleanup did not settle within {limit:?}; exiting with status {UNSETTLED_EXIT}. {outcome}"
     );
     let _ = out.flush();
     drop(out);
@@ -467,9 +477,12 @@ fn launch_spawning<W: Write + Send + 'static>(
     let finished = progress.clone();
     let entry: Entry = Box::new(move |handle| {
         ran.store(true, Ordering::Release);
+        // Start failed and overwrite on a normal return. Only where panics unwind (debug and test
+        // builds): a panic then skips the overwrite and the watcher reports an error. The release
+        // profile uses `panic = "abort"`, so there a panic ends the process before any of this runs.
         let mut report = Finished {
             progress: finished,
-            failure: None,
+            failure: Some(Error::IccFailed.to_string()),
         };
         let mut out = lock_out(&out);
         let result = worker(handle, &plan, &mut *out);

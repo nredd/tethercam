@@ -447,6 +447,31 @@ async fn a_failure_that_is_not_a_refusal_keeps_the_ordinary_backoff() {
     assert_eq!(pauses.lock().unwrap()[0], Duration::from_millis(100));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_session_that_fails_for_another_reason_keeps_the_ordinary_backoff() {
+    use crate::transport::{Endpoint, sim::Fault};
+    // The camera reaches the session and then fails, with an error that is not a refused
+    // handshake: the backend's refusal delay must not apply.
+    let mut failing = camera();
+    failing.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
+    let factory = Factory::new(vec![failing, camera()]);
+    let pauses = Arc::clone(&factory.pauses);
+    let (actor, control) = Supervisor::new(
+        Refusing(factory),
+        SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let work = async {
+        ready(&control).await;
+        control.shutdown();
+    };
+    tokio::join!(actor.run(), work);
+    assert_eq!(control.counters().session_restarts, 1);
+    assert_eq!(pauses.lock().unwrap()[0], Duration::from_millis(100));
+}
+
 #[tokio::test]
 async fn serializes_live_frames_and_full_resolution_snapshots_then_reads_power() {
     let (actor, control) = actor(Factory::new(vec![camera()]));
@@ -515,10 +540,12 @@ async fn a_still_that_times_out_after_a_clean_release_keeps_the_session() {
         shutter: Shutter::NoImage,
         ..SonySimConfig::default()
     });
+    let logs = LogCapture::new();
     let (mut actor, control) = actor(Factory::new(vec![no_image]));
     actor.still_snapshots.store(true, Ordering::Relaxed);
     actor.sony.capture_timeout = Duration::from_millis(50);
     actor.sony.poll_interval = Duration::from_millis(10);
+    let released = Arc::clone(&actor.factory.released);
     let work = async {
         ready(&control).await;
         let snapshot_control = control.clone();
@@ -528,11 +555,19 @@ async fn a_still_that_times_out_after_a_clean_release_keeps_the_session() {
                 .unwrap(),
             Err(SnapshotError)
         );
+        // A session that ended would have been released before its slot was cleared, so a live
+        // frame in the same session, with nothing released, proves it was kept.
+        let mut frames = control.frames.clone();
+        frames.borrow_and_update();
+        control.demand.send_replace([1, 0]);
+        frames.changed().await.unwrap();
+        assert_eq!(released.lock().unwrap().len(), 0);
         assert!(format!("{:?}", control.status()).contains("Ready"));
         control.shutdown();
     };
-    let (factory, ()) = tokio::join!(Box::pin(actor.run()), work);
+    let (factory, ()) = tokio::join!(actor.run().with_subscriber(logs.dispatch()), work);
     assert_eq!(factory.released.lock().unwrap().len(), 1);
+    assert_eq!(logs.text().matches("snapshot_still_failed").count(), 1);
 }
 
 #[tokio::test]
@@ -571,7 +606,11 @@ async fn a_refused_shutter_release_ends_the_session_instead_of_leaving_it_presse
 
 #[tokio::test(start_paused = true)]
 async fn a_snapshot_that_raced_the_slot_clearing_is_refused_at_the_next_attempt() {
-    let (actor, control) = actor(Factory::new(Vec::new()));
+    // The second attempt has a camera. Without the refusal at the top of the attempt, the racing
+    // request would be served by it from the live-view slot instead.
+    let mut factory = Factory::new(vec![camera()]);
+    factory.steps.push_front(Ok(None));
+    let (actor, control) = actor(factory);
     let pauses = Arc::clone(&actor.factory.pauses);
     let work = async {
         // `join!` polls the actor first, and with no camera it runs straight into its backoff,
@@ -588,9 +627,13 @@ async fn a_snapshot_that_raced_the_slot_clearing_is_refused_at_the_next_attempt(
             }
         };
         assert_eq!(reply.unwrap(), Err(SnapshotError));
+        ready(&control).await;
         control.shutdown();
     };
-    let (_, ()) = tokio::join!(Box::pin(actor.run()), work);
+    let (factory, ()) = tokio::join!(Box::pin(actor.run()), work);
+    // Only the startup frame: no fetch answered the racing request.
+    let cameras = factory.released.lock().unwrap();
+    assert_eq!(live_view_fetches(&cameras[0]), 1);
 }
 
 fn shutter_or_still_commands(camera: &crate::transport::sim::SimCamera) -> usize {
@@ -714,19 +757,63 @@ async fn failed_stale_refresh_refuses_the_snapshot_and_reconnects() {
     assert_eq!(factory.released.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
-async fn snapshots_queued_when_a_session_ends_are_refused() {
+/// Queues a snapshot request while connecting, i.e. after the top-of-attempt refusal has run, so
+/// only the rejection at the end of the session can refuse it.
+struct QueueOnConnect {
+    inner: Factory,
+    snapshots: Arc<std::sync::OnceLock<mpsc::Sender<SnapshotReply>>>,
+    reply: Option<SnapshotReply>,
+}
+
+impl CameraFactory for QueueOnConnect {
+    type Camera = <Factory as CameraFactory>::Camera;
+    type Session = <Factory as CameraFactory>::Session;
+
+    fn connect(&mut self) -> impl Future<Output = Result<Option<Self::Camera>, OpenError>> + Send {
+        // The test stops the actor during its first backoff, so this runs exactly once.
+        let reply = self.reply.take().unwrap();
+        self.snapshots.get().unwrap().try_send(reply).unwrap();
+        self.inner.connect()
+    }
+    fn session(
+        &self, camera: Self::Camera, cfg: SessionConfig, clock: fn() -> Instant,
+    ) -> Self::Session {
+        self.inner.session(camera, cfg, clock)
+    }
+    fn recover(&self, session: Self::Session) -> Self::Camera {
+        self.inner.recover(session)
+    }
+    fn release(&mut self, camera: Self::Camera) {
+        self.inner.release(camera);
+    }
+    fn pause(&self, delay: Duration) -> impl Future<Output = ()> + Send {
+        self.inner.pause(delay)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshots_queued_when_a_session_ends_are_refused_before_the_backoff() {
     use crate::transport::{Endpoint, sim::Fault};
     let mut failing = camera();
     failing.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
-    let (actor, control) = actor(Factory::new(vec![failing]));
     let (tx, rx) = blocking::sync_channel(1);
-    control.snapshots.try_send(tx).unwrap();
+    let slot = Arc::new(std::sync::OnceLock::new());
+    let (actor, control) = Supervisor::new(
+        QueueOnConnect {
+            inner: Factory::new(vec![failing]),
+            snapshots: Arc::clone(&slot),
+            reply: Some(tx),
+        },
+        SonyConfig::default(),
+        SessionConfig::default(),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    slot.set(control.snapshots.clone()).unwrap();
     let work = async {
-        let reply = tokio::task::spawn_blocking(move || rx.recv())
-            .await
-            .unwrap();
-        assert_eq!(reply.unwrap(), Err(SnapshotError));
+        // `join!` polls the actor first: it ran the failed session and sits in its backoff, so
+        // the next attempt's refusal has not happened. Only the session end can have refused it.
+        assert_eq!(rx.try_recv().unwrap(), Err(SnapshotError));
         control.shutdown();
     };
     let (_, ()) = tokio::join!(Box::pin(actor.run()), work);

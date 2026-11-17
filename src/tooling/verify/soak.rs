@@ -350,7 +350,9 @@ fn nap(total: Duration, stop: &AtomicBool) {
 }
 
 /// The credential-bearing client inputs. Removed explicitly on the normal path, and by `Drop` on
-/// any other exit, including a panic. A `SIGKILL` skips both and leaves the directory.
+/// an error or an unwinding panic. `tethercam-tools` is built with `panic = "abort"` in the
+/// release profile, where a panic runs no destructor, so a panic there, like a `SIGKILL`, leaves
+/// the directory.
 struct ClientDir {
     path: PathBuf,
     removed: bool,
@@ -1265,7 +1267,8 @@ mod tests {
             stop(false),
         );
         assert!(dies.is_err());
-        // The first slot of the pair works as well.
+        // The first slot of a pair works as well: `SIGUSR1` is only ever its first slot, while
+        // the run above used the second slot (`SIGUSR2`).
         let other = stop(false);
         watch_signals(
             current_thread_runtime,
@@ -1274,7 +1277,7 @@ mod tests {
             Arc::clone(&other),
         )
         .expect("installed");
-        send("-WINCH");
+        send("-USR1");
         let seen = (0..500).find(|_| {
             std::thread::sleep(Duration::from_millis(20));
             other.load(Ordering::Relaxed)
