@@ -55,12 +55,16 @@ tcpdump -i <iface> -n -s 4200 -c 200 -G 600 -W 1 -w <private>/window1.pcap 'udp 
 That is 200 packets and 10 minutes. The snap length fits an ordinary unfragmented WS-Discovery
 frame: the largest accepted datagram (`MAX_PACKET`, 4096 bytes of payload) plus Ethernet, VLAN,
 IPv6 and UDP headers, at most 4200 bytes each (under 1 MiB in total). It does not cover a
-fragmented datagram: the filter matches only the first fragment (later ones carry no UDP port), so
-a fully captured first fragment is not a complete envelope. Leave the filter as it is.
+fragmented datagram. The filter matches at most the first fragment of a fragmented IPv4 datagram
+(later fragments carry no UDP port) and none of a fragmented IPv6 one (the Fragment header hides
+the port), so such a datagram is partly captured or missing. A fully captured first fragment is not
+a complete envelope, and a missing reply may just be uncaptured. Leave the filter as it is.
 
-Exclude from every equality comparison and count, and mark the evidence insufficient, any datagram
-that is fragmented, incomplete or not reassembled, and any stored packet whose captured length is
-below its original length (`truncated`). Never read a partial envelope as an identity.
+Mark each stored packet that has the IPv4 more-fragments flag or a fragment offset set, or whose
+captured length is below its original length, `fragmented` or `truncated` in the notes. Exclude it
+from every equality comparison and count, never read a partial envelope as an identity, and treat
+the window as insufficient evidence for any conclusion that depends on it. A reply missing
+while fragmented traffic was seen is likewise insufficient, not a finding.
 
 Start it first, then note `t0` (wall clock, UTC, seconds), then run the trigger:
 
