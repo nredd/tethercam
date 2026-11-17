@@ -39,8 +39,8 @@ Record before any trigger, in one private note:
   NTP synced). Row timing is meaningless without it
 - Which hosts could advertise the same camera: a second `tethercam` service, an old LaunchAgent, a
   copied `camera.toml` (same `endpoint_uuid`). Check and write down yes/no
-- The capture privilege is arranged before the window opens. The first attempt stopped on an
-  interactive `sudo` prompt; do not weaken the host to get past one, stop instead
+- The capture privilege is arranged before the window opens. An interactive `sudo` prompt
+  mid-window is a stop; do not weaken the host to get past one
 
 ## Capture
 
@@ -56,8 +56,8 @@ That is 200 packets and 10 minutes. The snap length fits the largest accepted da
 stored whole, at most 4200 bytes each (under 1 MiB in total). A stored packet whose captured
 length is below its original length is truncated: mark it `truncated` in the notes and leave it
 out of every equality comparison and count, never read a partial envelope as an identity.
-Start it first, then note `t0` (wall clock, UTC,
-seconds), then run the trigger:
+
+Start it first, then note `t0` (wall clock, UTC, seconds), then run the trigger:
 
 - Window 1, observation only: do nothing for the window, only watch the Devices view
 - Window 2, one service restart by the owner, however the service was installed (see
