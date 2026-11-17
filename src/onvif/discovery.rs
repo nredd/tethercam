@@ -480,13 +480,15 @@ impl Config {
     /// Returns a [`ConfigError`] for too many or unusable interfaces, or a description too large
     /// to fit one datagram.
     pub fn with_interfaces(mut self, interfaces: Vec<Interface>) -> Result<Self, ConfigError> {
-        if interfaces.len() > MAX_INTERFACES {
-            return Err(ConfigError::TooManyInterfaces);
-        }
         if let Some(bad) = interfaces.iter().find(|i| !i.is_valid()) {
             return Err(ConfigError::InvalidInterface(bad.addr));
         }
-        self.interfaces = advertisable(interfaces);
+        // Entries that will be dropped anyway must not count towards the limit.
+        let interfaces = advertisable(interfaces);
+        if interfaces.len() > MAX_INTERFACES {
+            return Err(ConfigError::TooManyInterfaces);
+        }
+        self.interfaces = interfaces;
         self.check_size()?;
         Ok(self)
     }
@@ -1035,6 +1037,11 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     ///
     /// Returns [`Error::Io`] if receiving fails. `Bye` is still attempted.
     pub fn run(&mut self, stop: &AtomicBool) -> Result<(), Error> {
+        // The responder may have waited hours for the camera: announce the interfaces that exist
+        // now, not the ones from the startup snapshot.
+        self.next_poll = self.clock.now();
+        self.poll_watch();
+        self.pending.clear();
         self.start();
         let mut result = Ok(());
         while !stop.load(Ordering::Relaxed) {

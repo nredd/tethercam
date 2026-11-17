@@ -1396,3 +1396,42 @@ fn an_idle_responder_says_it_is_waiting() {
             .any(|l| l.contains("No usable network interface for discovery yet"))
     );
 }
+
+#[test]
+fn run_serves_the_interfaces_that_exist_now_not_the_startup_snapshot() {
+    let (mut rig, wanted) = watched(vec![iface(10)]);
+    *wanted.lock().unwrap() = Some(vec![wifi()]);
+    let stop = Arc::new(AtomicBool::new(false));
+    rig.wire.0.borrow_mut().stop_on_receive = Some(Arc::clone(&stop));
+    rig.responder.run(&stop).unwrap();
+    assert_eq!(rig.responder.engine.config.interfaces(), [wifi()]);
+    let wire = rig.wire.0.borrow();
+    assert_eq!(
+        wire.sent.len(),
+        2,
+        "only the Byes, on the current interface"
+    );
+    assert!(
+        wire.sent
+            .iter()
+            .all(|(i, d, _)| (*i, *d) == (0, wifi().group()))
+    );
+}
+
+#[test]
+fn link_local_entries_that_will_be_dropped_do_not_count_towards_the_limit() {
+    let mut set: Vec<_> = (0..8_u8)
+        .map(|n| Interface {
+            addr: Ipv4Addr::new(192, 0, 2, 10 + n).into(),
+            prefix_len: 24,
+            index: 1,
+        })
+        .collect();
+    set.push(Interface {
+        addr: "fe80::1".parse().unwrap(),
+        prefix_len: 64,
+        index: 7,
+    });
+    let config = Config::idle(endpoint(), scopes(), svc()).unwrap();
+    assert_eq!(config.with_interfaces(set).unwrap().interfaces().len(), 8);
+}

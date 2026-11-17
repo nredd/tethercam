@@ -152,7 +152,7 @@ listeners bind `rtsp_address` and `onvif_address`.
 Interface changes are followed while running. The set is re-read every 5 seconds with the same
 selection as at startup. An interface that appears gets its own `Hello`, one that vanishes stops
 being advertised, and a host with no usable interface at start waits for one instead of failing.
-An interface that cannot bind or join the multicast group is retried at every refresh. The responder serves at most 8 interfaces; with more matching, set `interface`. No restart or config edit is needed. Failover works with the default wildcard addresses
+An interface that cannot bind or join the multicast group is retried at every refresh. The responder serves at most 8 interfaces; with more matching, set `interface`. If interfaces exist at start but none can bind or join the multicast group, `run` still fails and the service manager restarts it. No restart or config edit is needed otherwise. New connections fail over with the default wildcard addresses
 (`0.0.0.0`): connections are accepted on any interface and the stream and snapshot URLs in ONVIF
 replies use the address the client connected to. A pinned `rtsp_address` or `onvif_address` is
 deliberately literal: the listener is bound to that address, so it is unreachable while the
