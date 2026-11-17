@@ -173,18 +173,30 @@ async fn injected_run_shutdown_startup_failure_and_discovery_diagnostics() {
         .is_err()
     );
     opts.no_discovery = false;
-    cfg.interface = Some("synthetic-absent-interface".into());
+    // A host whose interfaces cannot be listed fails the run before any listener is served.
     assert!(
-        super::command_until(
+        super::command_with(
             Factory::new(Vec::new()),
             &cfg,
             &opts,
             &mut out,
-            Box::pin(std::future::ready(()))
+            Box::pin(std::future::ready(())),
+            || Err(std::io::Error::other("synthetic interface enumeration")),
         )
         .await
         .is_err()
     );
+    // An interface that is absent is waited for, not a startup failure.
+    cfg.interface = Some("synthetic-absent-interface".into());
+    super::command_until(
+        Factory::new(Vec::new()),
+        &cfg,
+        &opts,
+        &mut out,
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .unwrap();
     assert!(
         diagnostics::probe(
             Factory::new(vec![sony_camera(SonySimConfig {

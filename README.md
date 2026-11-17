@@ -141,14 +141,27 @@ cargo run -- run --config ./camera.toml --simulate ./synthetic.jpg --no-discover
 
 WS-Discovery advertises the same fixed profile, type, name and hardware scopes as `GetScopes`;
 clients can filter probes by any of those scopes. Discovery listens on every up interface of the
-`onvif_address` family. With `interface` unset and `onvif_address` unspecified, loopback and IPv4
-link-local addresses are skipped. An interface
-that cannot bind or join the multicast group is skipped with a logged warning; discovery fails
-only when none is usable. Set `interface` to an exact OS name to listen on that one interface
-only, loopback and link-local included, e.g. `interface = "en0"` on macOS or
-`interface = "eth0"` on Linux. A specific `onvif_address` likewise selects its own interface.
-Skipped interfaces are logged by position and OS interface index, and are not retried until the
-next start; pin `interface` to the one that matters if the warning names it.
+`onvif_address` family. With `interface` unset and `onvif_address` unspecified, loopback, IPv4
+link-local and point-to-point (VPN tunnel) addresses are skipped. An interface
+that cannot bind or join the multicast group is skipped with a logged warning. Set `interface` to
+an exact OS name to serve discovery on that one interface only, loopback and link-local included,
+e.g. `interface = "en0"` on macOS or `interface = "eth0"` on Linux. A specific `onvif_address`
+likewise selects its own interface. `interface` scopes discovery only; the RTSP and ONVIF TCP
+listeners bind `rtsp_address` and `onvif_address`.
+
+Interface changes are followed while running. The set is re-read every 5 seconds with the same
+selection as at startup. An interface that appears gets its own `Hello`, one that vanishes stops
+being advertised, and a host with no usable interface at start waits for one instead of failing.
+No restart or config edit is needed. Failover works with the default wildcard addresses
+(`0.0.0.0`): connections are accepted on any interface and the stream and snapshot URLs in ONVIF
+replies use the address the client connected to. A pinned `rtsp_address` or `onvif_address` is
+deliberately literal: the listener is bound to that address, so it is unreachable while the
+address is gone and works again when it returns, and discovery serves only that address.
+
+What this does not do: an established RTSP or HTTP connection cannot move to a new address, so
+clients reconnect. A client that stored the old address (for example a recorder adopted by IP)
+keeps using it until it rediscovers or re-reads `GetStreamUri`. `Hello` helps only clients that
+listen for it.
 
 WS-Discovery infers the arrival interface from the sender's subnet, rather than receiving the
 interface from the socket. With overlapping subnets it chooses the most specific match; equal

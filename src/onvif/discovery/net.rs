@@ -47,6 +47,17 @@ pub trait Transport {
     ///
     /// Returns an error if the datagram could not be sent.
     fn send(&mut self, interface: usize, dest: SocketAddr, payload: &[u8]) -> Result<(), Error>;
+
+    /// Serve exactly `interfaces` from now on, e.g. after one appeared or vanished. Returns, per
+    /// input interface, whether it could be set up. On error nothing changes. A transport with
+    /// no per-interface state has nothing to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `interfaces` is not empty and none of them could be set up.
+    fn rebind(&mut self, interfaces: &[Interface]) -> Result<Vec<bool>, Error> {
+        Ok(vec![true; interfaces.len()])
+    }
 }
 
 /// One UDP socket per interface, bound to the wildcard address on the discovery port and
@@ -57,6 +68,8 @@ pub trait Transport {
 pub struct UdpTransport {
     sockets: Vec<UdpSocket>,
     usable: Vec<bool>,
+    port: u16,
+    join: bool,
     /// Socket polled first on the next receive; advances after every datagram so a flood on
     /// one interface cannot starve the others.
     next: usize,
@@ -100,6 +113,8 @@ impl UdpTransport {
             _ => Ok(Self {
                 sockets,
                 usable,
+                port,
+                join,
                 next: 0,
             }),
         }
@@ -319,6 +334,12 @@ impl Transport for UdpTransport {
         self.recv_with(buf, timeout, UdpSocket::recv_from)
     }
 
+    fn rebind(&mut self, interfaces: &[Interface]) -> Result<Vec<bool>, Error> {
+        // The replacement opens before the old sockets close; the shared port allows both.
+        *self = Self::bind_inner(interfaces, self.port, self.join)?;
+        Ok(self.usable.clone())
+    }
+
     fn send(&mut self, interface: usize, dest: SocketAddr, payload: &[u8]) -> Result<(), Error> {
         let socket = self
             .sockets
@@ -446,6 +467,19 @@ mod tests {
         );
         t.send(0, dest, b"x").unwrap();
         assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn rebinding_replaces_the_sockets_and_a_failure_changes_nothing() {
+        let mut t = UdpTransport::bind_inner(&[loopback()], 0, true).unwrap();
+        assert_eq!(t.rebind(&[loopback(), loopback()]).unwrap(), [true, true]);
+        assert_eq!(t.sockets.len(), 2);
+        assert!(t.rebind(&[missing()]).is_err());
+        assert_eq!((t.sockets.len(), t.usable()), (2, &[true, true][..]));
+        assert_eq!(t.rebind(&[]).unwrap(), Vec::<bool>::new());
+        assert!(t.sockets.is_empty());
+        assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
+        assert_eq!(t.rebind(&[missing(), loopback()]).unwrap(), [false, true]);
     }
 
     #[test]

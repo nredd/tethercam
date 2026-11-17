@@ -44,7 +44,11 @@
 //! - Both dialects are served: WS-Discovery 2005/04 with WS-Addressing 2004/08 (what ONVIF-era
 //!   clients and NVRs speak) and WS-Discovery 1.1 (2009/01). A reply uses the request's dialect;
 //!   `Hello` and `Bye` go out in both
-//! - `Hello` is sent once per interface and dialect, not repeated, with the spec's random delay
+//! - `Hello` is sent once per interface and dialect, not repeated, with the spec's random delay.
+//!   With a [`Watch`] attached to the [`Config`], interfaces are re-enumerated while running: an
+//!   interface that appears gets its own `Hello`, one that vanishes stops being advertised
+//!   (nothing can be sent for it), and a host with no interface yet serves nothing until one
+//!   appears
 //!
 //! References:
 //! - [WS-Discovery 1.1](http://docs.oasis-open.org/ws-dd/discovery/1.1/os/wsdd-discovery-1.1-spec-os.html)
@@ -67,6 +71,7 @@ pub use xml::{QName, SyntaxError};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -99,6 +104,8 @@ const RAW_TTL: Duration = Duration::from_secs(2);
 const RAW_CAPACITY: usize = 64;
 /// Longest single wait in [`Responder::run`], bounding shutdown latency.
 const POLL: Duration = Duration::from_millis(100);
+/// Default time between interface re-enumerations when a [`Watch`] is attached.
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Why a [`Config`] was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -348,12 +355,55 @@ impl Limits {
     }
 }
 
+/// Where the responder learns that the host's interfaces changed.
+///
+/// `poll` returns the interfaces that should be served right now, or `None` when they could not
+/// be enumerated (the current set is kept). It runs on the responder thread every `every`, so it
+/// must be cheap and must not block for long.
+#[derive(Clone)]
+pub struct Watch(Arc<WatchInner>);
+
+struct WatchInner {
+    every: Duration,
+    poll: Box<dyn Fn() -> Option<Vec<Interface>> + Send + Sync>,
+}
+
+impl Watch {
+    /// Re-enumerate with `poll` every `every` (at least one millisecond).
+    #[must_use]
+    pub fn new(
+        every: Duration, poll: impl Fn() -> Option<Vec<Interface>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(WatchInner {
+            every: every.max(Duration::from_millis(1)),
+            poll: Box::new(poll),
+        }))
+    }
+}
+
+impl Watch {
+    /// The interfaces to serve right now, or `None` if they could not be enumerated.
+    #[must_use]
+    pub fn poll(&self) -> Option<Vec<Interface>> {
+        (self.0.poll)()
+    }
+}
+
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Watch")
+            .field("every", &self.0.every)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Everything the responder needs to know about this camera.
 #[derive(Debug, Clone)]
 pub struct Config {
     endpoint: EndpointReference,
     scopes: Vec<String>,
     interfaces: Vec<Interface>,
+    watch: Option<Watch>,
     service: ServiceAddress,
     metadata_version: u32,
     instance_id: u32,
@@ -374,15 +424,22 @@ impl Config {
         endpoint: EndpointReference, scopes: Vec<String>, interfaces: Vec<Interface>,
         service: ServiceAddress,
     ) -> Result<Self, ConfigError> {
-        if interfaces.is_empty() {
+        let config = Self::idle(endpoint, scopes, service)?.with_interfaces(interfaces)?;
+        if config.interfaces.is_empty() {
             return Err(ConfigError::NoInterfaces);
         }
-        if interfaces.len() > MAX_INTERFACES {
-            return Err(ConfigError::TooManyInterfaces);
-        }
-        if let Some(bad) = interfaces.iter().find(|i| !i.is_valid()) {
-            return Err(ConfigError::InvalidInterface(bad.addr));
-        }
+        Ok(config)
+    }
+
+    /// Like [`Config::new`] but serving no interface yet: it answers and announces nothing until
+    /// a [`Watch`] supplies one, so a host that is still waiting for its network can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] for unusable scopes or service path.
+    pub fn idle(
+        endpoint: EndpointReference, scopes: Vec<String>, service: ServiceAddress,
+    ) -> Result<Self, ConfigError> {
         if scopes.len() > MAX_SCOPES {
             return Err(ConfigError::TooManyScopes);
         }
@@ -398,45 +455,50 @@ impl Config {
         if !path_ok {
             return Err(ConfigError::InvalidServicePath(service.path));
         }
-        // Link-local senders still need their subnet for matching, but an unscoped URL is
-        // unusable. Keep such entries only when the same interface has an IPv6 URL address.
-        let advertisable: Vec<_> = interfaces
-            .iter()
-            .filter_map(|i| match i.addr {
-                IpAddr::V6(a) if !a.is_unicast_link_local() => Some(i.index),
-                _ => None,
-            })
-            .collect();
-        let interfaces: Vec<_> = interfaces
-            .into_iter()
-            .filter(|i| {
-                let usable = !matches!(i.addr, IpAddr::V6(a) if a.is_unicast_link_local())
-                    || (i.index != 0 && advertisable.contains(&i.index));
-                if !usable {
-                    log::warn!("Omitting IPv6 discovery on interface index '{}' because it has no non-link-local IPv6 address", i.index);
-                }
-                usable
-            })
-            .collect();
-        if interfaces.is_empty() {
-            return Err(ConfigError::NoInterfaces);
-        }
         let instance_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|d| u32::try_from(d.as_secs()).ok())
             .unwrap_or(1);
-        let config = Self {
+        Ok(Self {
             endpoint,
             scopes,
-            interfaces,
+            interfaces: Vec::new(),
+            watch: None,
             service,
             metadata_version: 1,
             instance_id,
             limits: Limits::default(),
-        };
-        config.check_size()?;
-        Ok(config)
+        })
+    }
+
+    /// Serve exactly `interfaces` (possibly none) instead of the current set.
+    ///
+    /// IPv6 link-local entries are dropped unless their interface also has a routable IPv6
+    /// address to advertise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] for too many or unusable interfaces, or a description too large
+    /// to fit one datagram.
+    pub fn with_interfaces(mut self, interfaces: Vec<Interface>) -> Result<Self, ConfigError> {
+        if interfaces.len() > MAX_INTERFACES {
+            return Err(ConfigError::TooManyInterfaces);
+        }
+        if let Some(bad) = interfaces.iter().find(|i| !i.is_valid()) {
+            return Err(ConfigError::InvalidInterface(bad.addr));
+        }
+        self.interfaces = advertisable(interfaces);
+        self.check_size()?;
+        Ok(self)
+    }
+
+    /// Re-enumerate interfaces while running, so the responder follows interfaces that appear,
+    /// vanish or change address instead of serving the set it started with.
+    #[must_use]
+    pub fn with_watch(mut self, watch: Watch) -> Self {
+        self.watch = Some(watch);
+        self
     }
 
     /// Set the `MetadataVersion`; bump it whenever scopes or addresses change.
@@ -480,8 +542,10 @@ impl Config {
     #[must_use]
     pub fn with_usable_interfaces(mut self, usable: &[bool]) -> Self {
         let mut flags = usable.iter();
-        self.interfaces
-            .retain(|_| flags.next().copied().unwrap_or(false));
+        let mut kept = std::mem::take(&mut self.interfaces);
+        kept.retain(|_| flags.next().copied().unwrap_or(false));
+        // A masked-out routable address can strand its link-local sibling.
+        self.interfaces = advertisable(kept);
         self
     }
 
@@ -560,6 +624,29 @@ impl Config {
         };
         format!("http://{host}{port}{}", self.service.path)
     }
+}
+
+/// Link-local senders still need their subnet for matching, but an unscoped URL is unusable.
+/// Keep such IPv6 entries only when the same interface has a routable IPv6 address.
+fn advertisable(interfaces: Vec<Interface>) -> Vec<Interface> {
+    let routable: Vec<_> = interfaces
+        .iter()
+        .filter_map(|i| match i.addr {
+            IpAddr::V6(a) if !a.is_unicast_link_local() => Some(i.index),
+            _ => None,
+        })
+        .collect();
+    interfaces
+        .into_iter()
+        .filter(|i| {
+            let usable = !matches!(i.addr, IpAddr::V6(a) if a.is_unicast_link_local())
+                || (i.index != 0 && routable.contains(&i.index));
+            if !usable {
+                log::warn!("Omitting IPv6 discovery on interface index '{}' because it has no non-link-local IPv6 address", i.index);
+            }
+            usable
+        })
+        .collect()
 }
 
 fn valid_scope(s: &str) -> bool {
@@ -746,19 +833,33 @@ impl<E: Entropy> Engine<E> {
 
     /// `Hello` announcements, each with its own random delay.
     pub fn hello(&mut self, now: Instant) -> Vec<Outgoing> {
-        self.announce(now, true)
+        self.announce(now, true, |_| true)
+    }
+
+    /// Serve `config`'s interfaces from now on and announce only those not served before.
+    ///
+    /// Probe history, rate limits and sequence numbers carry over, so a client's retry after the
+    /// change is still de-duplicated and the camera keeps one `AppSequence` instance.
+    fn retarget(&mut self, now: Instant, config: Config) -> Vec<Outgoing> {
+        let before = std::mem::replace(&mut self.config.interfaces, config.interfaces);
+        self.announce(now, true, |i| !before.contains(i))
     }
 
     /// `Bye` announcements, due immediately.
     pub fn bye(&mut self, now: Instant) -> Vec<Outgoing> {
-        self.announce(now, false)
+        self.announce(now, false, |_| true)
     }
 
     /// One message per interface and dialect. ONVIF-era clients listen for the 2005/04
     /// dialect, WS-Discovery 1.1 clients for 2009/01, so both are announced.
-    fn announce(&mut self, now: Instant, hello: bool) -> Vec<Outgoing> {
+    fn announce(
+        &mut self, now: Instant, hello: bool, only: impl Fn(&Interface) -> bool,
+    ) -> Vec<Outgoing> {
         let mut out = Vec::new();
         for (interface, i) in self.config.interfaces.clone().into_iter().enumerate() {
+            if !only(&i) {
+                continue;
+            }
             for dialect in Dialect::ALL {
                 let id = format!("urn:uuid:{}", random_uuid(&mut self.entropy));
                 let seq = self.next_sequence();
@@ -836,12 +937,27 @@ pub struct Responder<T, E, C> {
     pending: Vec<Outgoing>,
     buf: Vec<u8>,
     stats: Stats,
+    watch: Option<Watch>,
+    /// When the watch is next polled.
+    next_poll: Instant,
+    /// The interface set last accepted or rejected for good, to skip unchanged polls.
+    last_wanted: Vec<Interface>,
+    /// What the transport was last asked to serve (before masking out failed binds).
+    desired: Vec<Interface>,
+}
+
+/// Whether `a` and `b` hold the same interfaces, in any order.
+fn same_interfaces(a: &[Interface], b: &[Interface]) -> bool {
+    a.len() == b.len() && a.iter().all(|i| b.contains(i))
 }
 
 impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     /// Assemble a responder. Nothing is sent until [`Responder::start`].
     #[must_use]
     pub fn new(config: Config, entropy: E, transport: T, clock: C) -> Self {
+        let watch = config.watch.clone();
+        let desired = config.interfaces.clone();
+        let next_poll = clock.now() + watch.as_ref().map_or(Duration::ZERO, |w| w.0.every);
         Self {
             engine: Engine::new(config, entropy),
             transport,
@@ -849,6 +965,10 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
             pending: Vec::new(),
             buf: vec![0; MAX_PACKET + 1],
             stats: Stats::default(),
+            watch,
+            next_poll,
+            last_wanted: desired.clone(),
+            desired,
         }
     }
 
@@ -858,8 +978,12 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
         self.stats
     }
 
-    /// Queue the `Hello` announcements.
+    /// Queue the `Hello` announcements (none while no interface is served yet; a [`Watch`] adds
+    /// them as interfaces appear).
     pub fn start(&mut self) {
+        if self.engine.config.interfaces.is_empty() {
+            log::warn!("No usable network interface for discovery yet; waiting for one");
+        }
         let now = self.clock.now();
         let hellos = self.engine.hello(now);
         self.pending.extend(hellos);
@@ -916,9 +1040,65 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
                 result = Err(e);
                 break;
             }
+            self.poll_watch();
         }
         self.shutdown();
         result
+    }
+
+    /// Re-enumerate interfaces when the [`Watch`] interval has elapsed.
+    ///
+    /// A failed enumeration keeps the current set. A set the responder cannot serve (too many
+    /// interfaces) is logged once and kept out. A failed socket rebuild keeps the old sockets and
+    /// is retried at the next poll.
+    fn poll_watch(&mut self) {
+        let Some(watch) = self.watch.clone() else {
+            return;
+        };
+        let now = self.clock.now();
+        if now < self.next_poll {
+            return;
+        }
+        self.next_poll = now + watch.0.every;
+        let Some(wanted) = watch.poll() else {
+            return;
+        };
+        if same_interfaces(&wanted, &self.last_wanted) {
+            return;
+        }
+        let config = match self.engine.config.clone().with_interfaces(wanted.clone()) {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("Keeping the current discovery interfaces: {error}");
+                self.last_wanted = wanted;
+                return;
+            }
+        };
+        let desired = config.interfaces.clone();
+        if same_interfaces(&desired, &self.desired) {
+            self.last_wanted = wanted;
+            return;
+        }
+        let usable = match self.transport.rebind(&desired) {
+            Ok(usable) => usable,
+            Err(error) => {
+                log::warn!("Keeping the current discovery sockets, rebinding failed: {error}");
+                return;
+            }
+        };
+        log::warn!(
+            "Discovery now serves {} interface(s) (was {})",
+            desired.len(),
+            self.desired.len()
+        );
+        // Queued replies and announcements carry indices into the old interface list.
+        self.pending.clear();
+        let hellos = self
+            .engine
+            .retarget(now, config.with_usable_interfaces(&usable));
+        self.pending.extend(hellos);
+        self.last_wanted = wanted;
+        self.desired = desired;
     }
 
     fn flush_due(&mut self, now: Instant) {

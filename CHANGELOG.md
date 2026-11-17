@@ -13,6 +13,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
+- Keep WS-Discovery correct across network interface changes (#116): the responder re-enumerates interfaces every 5 s, rebuilds its sockets and subnets when the set changes, sends `Hello` on interfaces that appear, stops advertising addresses that vanish, and no longer fails the run when no interface is usable yet (it waits). Point-to-point (VPN tunnel) interfaces are skipped by default. A pinned `rtsp_address`/`onvif_address` keeps its semantics: unreachable while that address is gone. Established client connections cannot migrate; clients reconnect or rediscover
 - Advertise the fixed profile, name and hardware scopes in WS-Discovery and match filtered probes consistently with `GetScopes`
 
 - Make one-shot `icc` commands (`cameras`, `probe`, `doctor`) always exit: when the command's output is written but native cleanup has not settled after 60 s (a step hit its deadline and the framework never completed it) they print a counts-only notice and exit with the new status 69 through the quarantine exit path, instead of printing their answer and hanging. A settled command still exits cleanly with status 0. The service keeps its 300 s busy limit
