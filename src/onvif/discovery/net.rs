@@ -68,6 +68,8 @@ pub trait Transport {
 pub struct UdpTransport {
     sockets: Vec<UdpSocket>,
     usable: Vec<bool>,
+    /// The interfaces `sockets` and `usable` were built for.
+    interfaces: Vec<Interface>,
     port: u16,
     join: bool,
     /// Socket polled first on the next receive; advances after every datagram so a flood on
@@ -90,11 +92,33 @@ impl UdpTransport {
     /// `join: false` skips only the multicast join and egress setup, so tests exercise the
     /// production bind without touching a multicast group.
     fn bind_inner(interfaces: &[Interface], port: u16, join: bool) -> Result<Self, Error> {
+        Self::bind_reusing(interfaces, port, join, None)
+    }
+
+    /// The socket `old` already holds for `interface`, if it bound one.
+    fn socket_for(&self, interface: &Interface) -> Option<&UdpSocket> {
+        let at = self
+            .interfaces
+            .iter()
+            .zip(&self.usable)
+            .position(|(i, usable)| i == interface && *usable)?;
+        let before = self.usable.iter().take(at).filter(|u| **u).count();
+        self.sockets.get(before)
+    }
+
+    /// Bind every interface, duplicating the descriptor of an interface `old` already serves
+    /// instead of reopening it, so healthy sockets (and what is queued on them) survive a rebind.
+    fn bind_reusing(
+        interfaces: &[Interface], port: u16, join: bool, old: Option<&Self>,
+    ) -> Result<Self, Error> {
         let mut last_error = None;
         let mut sockets = Vec::new();
         let mut usable = Vec::new();
         for (n, i) in interfaces.iter().enumerate() {
-            let opened = open(i, port, join);
+            let opened = match old.and_then(|o| o.socket_for(i)).map(UdpSocket::try_clone) {
+                Some(Ok(socket)) => Ok(socket),
+                _ => open(i, port, join),
+            };
             usable.push(opened.is_ok());
             match opened {
                 Ok(socket) => sockets.push(socket),
@@ -113,6 +137,7 @@ impl UdpTransport {
             _ => Ok(Self {
                 sockets,
                 usable,
+                interfaces: interfaces.to_vec(),
                 port,
                 join,
                 next: 0,
@@ -335,8 +360,9 @@ impl Transport for UdpTransport {
     }
 
     fn rebind(&mut self, interfaces: &[Interface]) -> Result<Vec<bool>, Error> {
-        // The replacement opens before the old sockets close; the shared port allows both.
-        *self = Self::bind_inner(interfaces, self.port, self.join)?;
+        // The replacement is complete before the old sockets close; healthy ones carry over.
+        let fresh = Self::bind_reusing(interfaces, self.port, self.join, Some(&*self))?;
+        *self = fresh;
         Ok(self.usable.clone())
     }
 
@@ -472,7 +498,13 @@ mod tests {
     #[test]
     fn rebinding_replaces_the_sockets_and_a_failure_changes_nothing() {
         let mut t = UdpTransport::bind_inner(&[loopback()], 0, true).unwrap();
+        let healthy = sock(&t, 0).local_addr().unwrap();
         assert_eq!(t.rebind(&[loopback(), loopback()]).unwrap(), [true, true]);
+        assert_eq!(
+            sock(&t, 0).local_addr().unwrap(),
+            healthy,
+            "socket carried over"
+        );
         assert_eq!(t.sockets.len(), 2);
         assert!(t.rebind(&[missing()]).is_err());
         assert_eq!((t.sockets.len(), t.usable()), (2, &[true, true][..]));
@@ -480,6 +512,10 @@ mod tests {
         assert!(t.sockets.is_empty());
         assert_eq!(t.recv(&mut [0; 16], Duration::ZERO).unwrap(), None);
         assert_eq!(t.rebind(&[missing(), loopback()]).unwrap(), [false, true]);
+        // A carried-over socket that is not the first one bound.
+        let carried = sock(&t, 0).local_addr().unwrap();
+        assert_eq!(t.rebind(&[loopback()]).unwrap(), [true]);
+        assert_eq!(sock(&t, 0).local_addr().unwrap(), carried);
     }
 
     #[test]
