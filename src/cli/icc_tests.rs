@@ -807,6 +807,7 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
         notice.contains("Native cleanup did not settle within 50ms; exiting with status 69."),
         "{text}"
     );
+    assert!(notice.contains("The result above is complete."), "{text}");
     assert!(!text.contains("synthetic"), "{text}");
     assert!(
         logs.text()
@@ -816,7 +817,8 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
     );
 }
 
-/// Panics on its first write, like a worker that dies mid-command, and accepts the rest.
+/// Panics on its first write, like a worker that dies mid-command, and accepts the rest. Only
+/// meaningful where panics unwind: the release profile aborts instead.
 #[derive(Clone, Default)]
 struct PanicsOnce {
     armed: Arc<AtomicU8>,
@@ -837,7 +839,8 @@ impl Write for PanicsOnce {
 }
 
 #[test]
-fn a_one_shot_command_that_panics_still_reports_an_error_before_the_unsettled_exit() {
+fn a_one_shot_command_that_panics_when_unwinding_still_reports_an_error_before_the_unsettled_exit()
+{
     let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let out = PanicsOnce::default();
     EXITED.store(0, Ordering::SeqCst);
@@ -860,6 +863,9 @@ fn a_one_shot_command_that_panics_still_reports_an_error_before_the_unsettled_ex
         .unwrap();
     let notice = text.find("Native cleanup did not settle").unwrap();
     assert!(error < notice, "{text}");
+    assert!(text.contains("The command did not succeed."), "{text}");
+    assert!(!text.contains("complete"), "{text}");
+    assert!(!text.contains("trustworthy"), "{text}");
 }
 
 #[test]
@@ -885,6 +891,9 @@ fn a_failed_one_shot_command_still_reports_its_error_before_the_unsettled_exit()
         text.find("Native cleanup did not settle").unwrap() > error,
         "{text}"
     );
+    assert!(text.contains("The command did not succeed."), "{text}");
+    assert!(!text.contains("complete"), "{text}");
+    assert!(!text.contains("trustworthy"), "{text}");
 }
 
 #[test]

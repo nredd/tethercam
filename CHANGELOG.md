@@ -26,7 +26,7 @@ Next release: `0.0.2`.
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
 - Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
 - Preserve typed diagnostic-example error sources and property-test arbitrary USB/IP management/import inputs
-- Report a panicking one-shot `icc` command as a failure: when its worker panics and native cleanup then does not settle, the watcher prints `Error: camera_backend `icc` failed after it started...` before the notice instead of calling a nonexistent result complete. Log the distinct camera count in `icc_ambiguous_cameras`, matching `cameras`
+- Make the one-shot `icc` unsettled-cleanup notice honest: after a failed command it says `The command did not succeed.` and no longer claims a complete result. Where panics unwind (debug and test builds) a worker panic is also reported as an `icc` failure; the release build uses `panic = "abort"` and ends the process at the panic. Log the distinct camera count in `icc_ambiguous_cameras`, matching `cameras`
 - Document that `tethercam-tools soak` removes its client inputs on an error but not on a panic in the `panic = "abort"` release build, and that a second `SIGINT`/`SIGTERM` is ignored while it winds down
 
 ### Added

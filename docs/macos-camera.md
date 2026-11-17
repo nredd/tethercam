@@ -143,10 +143,11 @@ target/release/tethercam run --config ./camera.toml
   once the command's work is done and its output is written and flushed, the process waits 60 s for the
   native side to settle. If it does, the exit is joined and clean, status 0 (or the command's own failure
   status 1). If it does not, the process logs `icc_cleanup_unsettled`, prints a counts-only notice
-  (`Native cleanup did not settle within 60s; exiting with status 69. The result above is complete.`,
-  after the command's own error line if it failed) and exits with status 69 through the same `exit` path,
-  nothing cancelled. 69 is distinct from 75 (restart me) and from 1 (the command failed): the output is
-  complete and trustworthy, but this process's native runtime is spent, so run the command again in a
+  (`Native cleanup did not settle within 60s; exiting with status 69. The result above is complete.`;
+  after a failed command's own error line it says `The command did not succeed.` instead) and exits
+  with status 69 through the same `exit` path, nothing cancelled. 69 is distinct from 75 (restart me)
+  and from 1 (the command failed): after a success the output is complete and trustworthy, but this
+  process's native runtime is spent, so run the command again in a
   fresh process. 60 s is a heuristic, not a guarantee: the longest single step any one-shot command waits
   on, `probe` and `doctor`'s 60 s whole-transaction deadline, and six of the 10 s `cameras` steps. A step
   that hit its deadline leaves one retired command to complete and then the confirming close, so a merely

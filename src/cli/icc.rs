@@ -395,12 +395,18 @@ fn watch<W: Write>(
     );
     let mut out = lock_out(out);
     // Best effort: the process is about to end and there is nowhere left to report to.
-    if let Some(failure) = failure {
+    if let Some(failure) = &failure {
         let _ = writeln!(out, "Error: {failure}");
     }
+    // Only a command that succeeded has a complete result to point at.
+    let outcome = if failure.is_some() {
+        "The command did not succeed."
+    } else {
+        "The result above is complete."
+    };
     let _ = writeln!(
         out,
-        "Native cleanup did not settle within {limit:?}; exiting with status {UNSETTLED_EXIT}. The result above is complete."
+        "Native cleanup did not settle within {limit:?}; exiting with status {UNSETTLED_EXIT}. {outcome}"
     );
     let _ = out.flush();
     drop(out);
@@ -471,8 +477,9 @@ fn launch_spawning<W: Write + Send + 'static>(
     let finished = progress.clone();
     let entry: Entry = Box::new(move |handle| {
         ran.store(true, Ordering::Release);
-        // Start failed and overwrite on a normal return: a panic skips that, and the watcher must
-        // then report an error instead of calling the result complete.
+        // Start failed and overwrite on a normal return. Only where panics unwind (debug and test
+        // builds): a panic then skips the overwrite and the watcher reports an error. The release
+        // profile uses `panic = "abort"`, so there a panic ends the process before any of this runs.
         let mut report = Finished {
             progress: finished,
             failure: Some(Error::IccFailed.to_string()),
