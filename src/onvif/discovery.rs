@@ -893,7 +893,7 @@ impl<E: Entropy> Engine<E> {
 
     /// `Hello` announcements, each with its own random delay.
     pub fn hello(&mut self, now: Instant) -> Vec<Outgoing> {
-        self.announce(now, true, |_| true)
+        self.announce(now, true, &[])
     }
 
     /// What is advertised per interface index: the interface and its `XAddrs`.
@@ -919,22 +919,22 @@ impl<E: Entropy> Engine<E> {
     /// instance.
     fn retarget(&mut self, now: Instant, interfaces: Vec<Interface>) -> Vec<Outgoing> {
         let before = std::mem::replace(&mut self.config.interfaces, interfaces);
-        self.announce(now, true, |i| !before.contains(i))
+        self.announce(now, true, &before)
     }
 
     /// `Bye` announcements, due immediately.
     pub fn bye(&mut self, now: Instant) -> Vec<Outgoing> {
-        self.announce(now, false, |_| true)
+        self.announce(now, false, &[])
     }
 
-    /// One message per interface and dialect. ONVIF-era clients listen for the 2005/04
-    /// dialect, WS-Discovery 1.1 clients for 2009/01, so both are announced.
-    fn announce(
-        &mut self, now: Instant, hello: bool, only: impl Fn(&Interface) -> bool,
-    ) -> Vec<Outgoing> {
+    /// One message per interface and dialect, except for the interfaces in `skip`. ONVIF-era
+    /// clients listen for the 2005/04 dialect, WS-Discovery 1.1 clients for 2009/01, so both are
+    /// announced. Not generic over the filter: coverage accounts for each monomorphization on
+    /// its own, and no single caller would reach every branch.
+    fn announce(&mut self, now: Instant, hello: bool, skip: &[Interface]) -> Vec<Outgoing> {
         let mut out = Vec::new();
         for (interface, i) in self.config.interfaces.clone().into_iter().enumerate() {
-            if !only(&i) {
+            if skip.contains(&i) {
                 continue;
             }
             for dialect in Dialect::ALL {

@@ -158,7 +158,7 @@ replies use the address the client connected to. A pinned `rtsp_address` or `onv
 deliberately literal: the listener is bound to that address, so it is unreachable while the
 address is gone and works again when it returns, and discovery serves only that address.
 
-What this does not do: an established RTSP or HTTP connection cannot move to a new address, so
+What this does not do: an interface that drops and returns with the same address between two 5-second polls is not noticed, so a multicast group membership the OS dropped is not rejoined until the set changes or the service restarts (unicast probes and the TCP listeners are unaffected). An established RTSP or HTTP connection cannot move to a new address, so
 clients reconnect. A client that stored the old address (for example a recorder adopted by IP)
 keeps using it until it rediscovers or re-reads `GetStreamUri`. `Hello` helps only clients that
 listen for it.
