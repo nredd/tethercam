@@ -49,10 +49,11 @@ The image is a scarce hosted pool, so only gates that add information on macOS g
 | `deny` | none | `deny.toml` sets no `targets`, so the Linux job already audits the all-platform dependency graph; the pinned action is a Docker action that does not run on macOS |
 | `cross` | none | Cross-compiles to Linux targets only; a macOS host adds nothing |
 
-macOS coverage is honestly pending, not excluded. On macOS 27 every `src/` file measured 100%
-except `src/transport/usb/nusb_backend.rs` (compiled on macOS, exercised only through Linux
-VHCI/USB/IP), so a macOS coverage leg would be red. The leg is deferred to
-[#126](https://github.com/nredd/tethercam/issues/126), which needs a seam rather than an exclusion.
+macOS coverage is honestly pending, not excluded. A native macOS run of `make coverage` leaves
+`src/transport/usb/nusb_backend.rs` (compiled on macOS, exercised only through Linux VHCI/USB/IP)
+and `src/transport/icc/native.rs` (needs a live camera) uncovered, so a macOS coverage leg would be
+red. The leg is deferred to [#126](https://github.com/nredd/tethercam/issues/126), which needs
+seams rather than exclusions.
 
 ## Transition from `macos-latest`
 
