@@ -220,6 +220,19 @@ use crate::transport::sim::sony::{SonySimConfig, sony_camera};
 use tokio::sync::oneshot;
 use tracing::instrument::WithSubscriber;
 
+fn cfg() -> Config {
+    let mut cfg = Config::generate().unwrap();
+    cfg.rtsp_address = "127.0.0.1".parse().unwrap();
+    cfg.onvif_address = cfg.rtsp_address;
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    cfg.rtsp_port = first.local_addr().unwrap().port();
+    cfg.onvif_port = second.local_addr().unwrap().port();
+    cfg.credentials.username = Secret::new(client::USER.into());
+    cfg.credentials.password = Secret::new(client::PASSWORD.into());
+    cfg
+}
+
 #[test]
 fn the_onvif_identity_is_a_pure_function_of_the_endpoint_uuid() {
     // What Protect can see over ONVIF must not drift between runs (#112): the serial and the
@@ -237,19 +250,6 @@ fn the_onvif_identity_is_a_pure_function_of_the_endpoint_uuid() {
     let other = device_description(&config);
     assert_ne!(first.serial_number, other.serial_number);
     assert_ne!(first.interface.hw_address, other.interface.hw_address);
-}
-
-fn cfg() -> Config {
-    let mut cfg = Config::generate().unwrap();
-    cfg.rtsp_address = "127.0.0.1".parse().unwrap();
-    cfg.onvif_address = cfg.rtsp_address;
-    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    cfg.rtsp_port = first.local_addr().unwrap().port();
-    cfg.onvif_port = second.local_addr().unwrap().port();
-    cfg.credentials.username = Secret::new(client::USER.into());
-    cfg.credentials.password = Secret::new(client::PASSWORD.into());
-    cfg
 }
 
 fn control() -> Control {

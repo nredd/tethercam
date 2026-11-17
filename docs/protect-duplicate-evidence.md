@@ -19,7 +19,7 @@ Limits:
 ## Privacy
 
 - Raw captures, controller screenshots and every real address, MAC, UUID, serial and name stay
-  private: a local directory outside any repository, mode `0600`, deleted when the question is
+  private: a local directory outside any repository (`0700`, files `0600`), deleted when the question is
   answered
 - Publish only counts, yes/no equality results and timings relative to `t0`. Never paste a datagram,
   a UUID or an address, even partly
