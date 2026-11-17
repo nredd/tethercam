@@ -1740,6 +1740,33 @@ fn retries_while_sends_keep_failing_stay_within_the_rate_limit() {
 }
 
 #[test]
+fn a_copy_dropped_for_a_queued_message_id_is_answered_when_that_reply_fails() {
+    let mut rig = rig();
+    rig.wire.0.borrow_mut().fail_sends = true;
+    let copy = format!("{PROBE_ONVIF}\n");
+    // The original queues a reply; a byte-different copy with the same `MessageID` is dropped.
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((peer(20), PROBE_ONVIF.as_bytes().to_vec()));
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((peer(21), copy.as_bytes().to_vec()));
+    rig.responder.step(POLL).unwrap();
+    rig.responder.step(POLL).unwrap();
+    assert_eq!(rig.responder.stats().dropped, 1);
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    assert_eq!(rig.responder.stats().send_errors, 1, "the reply failed");
+    rig.wire.0.borrow_mut().fail_sends = false;
+    // Nothing was answered, so the copy's retransmit is answered, not raw-suppressed.
+    assert_eq!(deliver(&mut rig, peer(21), &copy), 1);
+}
+
+#[test]
 fn a_failed_send_forgets_only_its_own_request() {
     let mut rig = rig();
     let other = onvif_probe(2);

@@ -863,6 +863,9 @@ impl<E: Entropy> Engine<E> {
             ),
         };
         let Some(message_token) = self.dedup.insert(message_id, now) else {
+            // Another copy is answered or queued. This datagram's own record must not outlive
+            // that reply: if it never leaves, this copy's retransmit has to be answered.
+            self.raw.remove(&raw_key, raw_token);
             return Err(Dropped::Duplicate);
         };
         if !matched {
