@@ -5,7 +5,7 @@ single USB-C cable.
 
 > **Status: development.** The CLI, camera actor, codecs, authenticated RTSP and ONVIF run
 > together against simulated cameras. On macOS, one a7 III has been run end to end over the
-> experimental `icc` backend and adopted by UniFi Protect and Home Assistant, but there is no
+> experimental `icc` backend, adopted by UniFi Protect and served to Home Assistant as snapshots (frontend playback not verified), but there is no
 > endurance pass (a 6 h 27 min partial soak only) and duplicate Protect entries
 > ([#112](https://github.com/nredd/tethercam/issues/112)) are an open blocker. See the
 > [macOS quickstart](docs/macos-quickstart.md) for exactly what was and was not verified, and

@@ -91,7 +91,8 @@ tethercam service uninstall
   or move your protected file there while the agent is stopped. Install then loads it instead
   of generating a new one
 - Stable identity: install and reinstall preserve the config, credentials and endpoint UUID.
-  `uninstall` removes the agent but keeps the config, so a reinstall presents the same camera.
+  `uninstall` removes the agent but keeps the config, so a reinstall presents the same camera
+  ([`service.md`](service.md): "matching files, credentials and UUID are preserved")
   Replacing the config with a fresh `setup` generates a new identity, which Protect sees as a new
   camera
 - Stopping is `SIGTERM` and a wait. launchd runs with `ExitTimeOut` 0, so nothing escalates to
@@ -108,10 +109,10 @@ tethercam service uninstall
 
 ## Always-on network and power
 
-The camera is only reachable while the host's network link is up. If the network interface is on a
-dock, hub or smart plug that automation can power off, the stream drops for that time. During the
-partial soak the link was lost and the stream recovered without a process restart, but do not rely on
-that: put the host's NIC and its power on an always-on path, and keep automations from cutting them.
+The camera is only reachable while the host's network link is up. Keep the host's network interface
+and its power always on, and do not let anything switch them off: the stream drops while the link is
+down. During the partial soak the link was lost once and the stream recovered without a process
+restart, but do not rely on that.
 
 ## Firewall
 
