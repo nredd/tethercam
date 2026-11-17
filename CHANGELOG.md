@@ -13,8 +13,6 @@ Next release: `0.0.2`.
 
 ### Fixed
 
-- Report a panicking one-shot `icc` command as a failure: when its worker panics and native cleanup then does not settle, the watcher prints `Error: camera_backend `icc` failed after it started...` before the notice instead of calling a nonexistent result complete. Log the distinct camera count in `icc_ambiguous_cameras`, matching `cameras`
-- Document that `tethercam-tools soak` removes its client inputs on an error but not on a panic in the `panic = "abort"` release build, and that a second `SIGINT`/`SIGTERM` is ignored while it winds down
 - Advertise the fixed profile, name and hardware scopes in WS-Discovery and match filtered probes consistently with `GetScopes`
 
 - Make one-shot `icc` commands (`cameras`, `probe`, `doctor`) always exit: when the command's output is written but native cleanup has not settled after 60 s (a step hit its deadline and the framework never completed it) they print a counts-only notice and exit with the new status 69 through the quarantine exit path, instead of printing their answer and hanging. A settled command still exits cleanly with status 0. The service keeps its 300 s busy limit
@@ -28,6 +26,8 @@ Next release: `0.0.2`.
 - Identify diagnostic property `0xD203` as still-image size, not live-view resolution, in API and verification documentation
 - Reject nonregular profiling inputs without blocking, cap aggregate bytes during reads and bound parser records/lines/columns
 - Preserve typed diagnostic-example error sources and property-test arbitrary USB/IP management/import inputs
+- Report a panicking one-shot `icc` command as a failure: when its worker panics and native cleanup then does not settle, the watcher prints `Error: camera_backend `icc` failed after it started...` before the notice instead of calling a nonexistent result complete. Log the distinct camera count in `icc_ambiguous_cameras`, matching `cameras`
+- Document that `tethercam-tools soak` removes its client inputs on an error but not on a panic in the `panic = "abort"` release build, and that a second `SIGINT`/`SIGTERM` is ignored while it winds down
 
 ### Added
 

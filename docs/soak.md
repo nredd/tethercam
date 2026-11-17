@@ -49,9 +49,9 @@ creates carry credentials; it deletes them when it finishes.
   quick; if it is somehow stuck, `SIGKILL` it and clean up by hand as below
 - a panic, `SIGKILL`, a crash of the host or a power cut: nothing runs. The release build uses
   `panic = "abort"`, which runs no destructors, so a panic is no safer than the others here. The
-  last complete `report.json` is intact, but `NEW_OUTPUT_DIRECTORY/clients` stays with the credentials in it and a running
-  `ffprobe` can outlive the tool for up to one segment. Delete the directory by hand before
-  sharing anything from the output
+  last complete `report.json` is intact, but `NEW_OUTPUT_DIRECTORY/clients` stays with the
+  credentials in it and a running `ffprobe` can outlive the tool for up to one segment. Delete the
+  directory by hand before sharing anything from the output
 
 The soak is itself the streaming client, so the camera's live view runs during segments (that is
 the load an NVR would add). Between segments the client reconnects, which takes a moment. A gap is
