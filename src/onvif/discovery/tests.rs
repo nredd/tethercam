@@ -1646,3 +1646,160 @@ fn serving_never_keeps_an_interface_without_a_socket() {
     let settled = config.serving(&mut transport, vec![true, false]);
     assert_eq!(settled.interfaces().len(), 0);
 }
+
+/// `PROBE_ONVIF` with its `MessageID` replaced by one derived from `id`.
+fn onvif_probe(id: u32) -> String {
+    PROBE_ONVIF.replace(
+        "11111111-2222-3333-4444-555555555555",
+        &format!("11111111-2222-3333-4444-{id:012}"),
+    )
+}
+
+/// Deliver `doc` from `from`, let its reply fall due, and count the sends attempted for it (the
+/// successful ones plus the failed ones).
+fn deliver(rig: &mut Rig, from: SocketAddr, doc: &str) -> u64 {
+    let before = rig.responder.stats();
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((from, doc.as_bytes().to_vec()));
+    rig.responder.step(POLL).unwrap();
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    let after = rig.responder.stats();
+    (after.sent - before.sent) + (after.send_errors - before.send_errors)
+}
+
+#[test]
+fn a_failed_send_does_not_suppress_the_identical_retransmit() {
+    let mut rig = rig();
+    rig.wire.0.borrow_mut().fail_sends = true;
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 1);
+    assert_eq!(rig.responder.stats().send_errors, 1);
+    rig.wire.0.borrow_mut().fail_sends = false;
+    rig.clock.advance(Duration::from_secs(1));
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 1, "answered");
+    assert_eq!(rig.responder.stats().sent, 1);
+    // Once a reply really went out, copies are suppressed again, however many arrive.
+    for _ in 0..10 {
+        assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 0);
+    }
+    assert_eq!(rig.responder.stats().sent, 1);
+}
+
+#[test]
+fn a_failed_send_does_not_suppress_a_retry_with_the_same_message_id() {
+    let mut rig = rig();
+    rig.wire.0.borrow_mut().fail_sends = true;
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 1);
+    rig.wire.0.borrow_mut().fail_sends = false;
+    // Same `MessageID`, different bytes: only the semantic de-duplication could suppress it.
+    let retry = format!("{PROBE_ONVIF}\n");
+    assert_eq!(deliver(&mut rig, peer(20), &retry), 1, "answered");
+    assert_eq!(rig.responder.stats().sent, 1);
+    assert_eq!(deliver(&mut rig, peer(20), &retry), 0);
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 0);
+}
+
+#[test]
+fn retries_while_sends_keep_failing_stay_within_the_rate_limit() {
+    // No refill within the test, so the per-source burst is the whole budget.
+    let frozen = Limits {
+        source_refill: Duration::from_secs(3600),
+        ..Limits::default()
+    };
+    let mut rig = rig_with(config().with_limits(frozen));
+    rig.wire.0.borrow_mut().fail_sends = true;
+    let attempts: u64 = (0..50)
+        .map(|_| deliver(&mut rig, peer(20), PROBE_ONVIF))
+        .sum();
+    assert_eq!(attempts, u64::from(Limits::default().source_burst));
+    assert_eq!(rig.responder.stats().sent, 0);
+}
+
+#[test]
+fn a_failed_send_forgets_only_its_own_request() {
+    let mut rig = rig();
+    let other = onvif_probe(2);
+    assert_eq!(deliver(&mut rig, peer(21), &other), 1);
+    rig.wire.0.borrow_mut().fail_sends = true;
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 1);
+    rig.wire.0.borrow_mut().fail_sends = false;
+    assert_eq!(deliver(&mut rig, peer(21), &other), 0, "still suppressed");
+    assert_eq!(deliver(&mut rig, peer(20), PROBE_ONVIF), 1);
+}
+
+#[test]
+fn a_reply_refused_for_a_full_queue_does_not_suppress_the_retransmit() {
+    let generous = Limits {
+        global_burst: 1000,
+        global_per_second: 1000,
+        source_burst: 1000,
+        ..Limits::default()
+    };
+    let mut rig = rig_with(config().with_limits(generous));
+    let docs: Vec<(SocketAddr, String)> = (0..=MAX_PENDING)
+        .map(|n| {
+            let src = SocketAddr::from(([192, 0, 2, 100 + u8::try_from(n).unwrap()], 4000));
+            (
+                src,
+                with_id(PROBE_ANY, &format!("aaaaaaaa-bbbb-cccc-dddd-{n:012}")),
+            )
+        })
+        .collect();
+    for (src, doc) in &docs {
+        rig.wire
+            .0
+            .borrow_mut()
+            .inbox
+            .push_back((*src, doc.as_bytes().to_vec()));
+        rig.responder.step(Duration::ZERO).unwrap();
+    }
+    assert_eq!(
+        rig.responder.stats().dropped,
+        1,
+        "the last reply was refused"
+    );
+    flush(&mut rig);
+    let (src, doc) = &docs[MAX_PENDING];
+    assert_eq!(
+        deliver(&mut rig, *src, doc),
+        1,
+        "its retransmit is answered"
+    );
+}
+
+#[test]
+fn dropping_one_queued_reply_keeps_what_other_interfaces_already_answered() {
+    let (mut rig, wanted) = watched(vec![iface(10), wifi()]);
+    let wired = peer(20);
+    let wireless = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 30), 40000));
+    let answered = PROBE_ONVIF.to_owned();
+    assert_eq!(deliver(&mut rig, wired, &answered), 1);
+    // A reply queued on the Wi-Fi interface is discarded when that interface vanishes.
+    let queued = onvif_probe(2);
+    rig.wire
+        .0
+        .borrow_mut()
+        .inbox
+        .push_back((wireless, queued.clone().into_bytes()));
+    rig.responder.step(POLL).unwrap();
+    *wanted.lock().unwrap() = Some(vec![iface(10)]);
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    assert!(
+        rig.responder.pending.is_empty(),
+        "the Wi-Fi reply was discarded"
+    );
+    // The wired probe was already answered: a repeat stays suppressed.
+    assert_eq!(deliver(&mut rig, wired, &answered), 0);
+    // The dropped one is answered once its interface returns and the client retries.
+    *wanted.lock().unwrap() = Some(vec![iface(10), wifi()]);
+    rig.clock.advance(WATCH_EVERY);
+    rig.responder.poll_watch();
+    // Let the `Hello`s for the returning interface go out first; only the reply is counted.
+    rig.clock.advance(MAX_DELAY);
+    rig.responder.step(POLL).unwrap();
+    assert_eq!(deliver(&mut rig, wireless, &queued), 1);
+}

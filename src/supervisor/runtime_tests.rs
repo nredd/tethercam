@@ -559,6 +559,36 @@ impl Write for Ready {
     }
 }
 
+#[test]
+fn startup_serves_only_the_interfaces_that_bound() {
+    let loopback = discovery::Interface {
+        addr: "127.0.0.1".parse().unwrap(),
+        prefix_len: 8,
+        index: 0,
+    };
+    // An IPv6 interface that does not exist: a genuine, unprivileged join failure.
+    let missing = discovery::Interface {
+        addr: "::1".parse().unwrap(),
+        prefix_len: 128,
+        index: u32::MAX,
+    };
+    let cfg = discovery::Config::new(
+        discovery::EndpointReference::from_uuid(uuid::Uuid::from_u128(1)),
+        Vec::new(),
+        vec![missing, loopback],
+        discovery::ServiceAddress {
+            port: 8080,
+            path: "/onvif/device_service".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cfg.interfaces(), [missing, loopback]);
+    let responder = bind_discovery(Some(cfg)).unwrap().unwrap();
+    // Without the mask the responder would number and match interfaces the sockets lack.
+    assert_eq!(responder.interfaces(), [loopback]);
+    assert!(bind_discovery(None).unwrap().is_none());
+}
+
 #[tokio::test]
 async fn normal_runtime_and_loopback_only_discovery_shut_down_together() {
     let cfg = cfg();

@@ -14,6 +14,7 @@ Next release: `0.0.2`.
 
 ### Fixed
 
+- Answer a WS-Discovery retry after the first reply never left (#91): a failed send, a reply refused for a full queue, or a queued reply discarded on an interface change no longer leaves the request's `MessageID` and raw datagram marked as answered. Only that request is forgotten, so requests already answered stay suppressed and the rate limits still bound retries. Test the startup bind-mask wiring through `bind_discovery`; `Responder::interfaces` exposes the served set
 - Keep WS-Discovery correct across network interface changes (#116): the responder re-enumerates interfaces every 5 s, rebuilds its sockets and subnets when the set changes, sends `Hello` on interfaces that appear, stops advertising addresses that vanish, and no longer fails the run when no interface is up yet (it waits; interfaces that exist but cannot bind still fail startup). Point-to-point (VPN tunnel) interfaces are skipped by default. A pinned `rtsp_address`/`onvif_address` keeps its semantics: unreachable while that address is gone. Established client connections cannot migrate; clients reconnect or rediscover
 - Advertise the fixed profile, name and hardware scopes in WS-Discovery and match filtered probes consistently with `GetScopes`
 

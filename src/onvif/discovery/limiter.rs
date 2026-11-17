@@ -48,6 +48,11 @@ impl Dedup {
         }
     }
 
+    /// Forget `id`, so it is accepted again. Unknown ids are ignored.
+    pub(super) fn remove(&mut self, id: &str) {
+        self.seen.retain(|(seen, _)| seen != id);
+    }
+
     /// Record `id`. Returns `false` if it was already seen within the TTL.
     pub(super) fn insert(&mut self, id: &str, now: Instant) -> bool {
         if self.contains(id, now) {
@@ -191,6 +196,18 @@ mod tests {
         assert!(d.insert("a", t0));
         assert!(!d.insert("a", t0 + Duration::from_secs(9)));
         assert!(d.insert("a", t0 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn dedup_forgets_only_the_removed_id() {
+        let t0 = Instant::now();
+        let mut d = Dedup::new(Duration::from_secs(10), 8);
+        assert!(d.insert("a", t0));
+        assert!(d.insert("b", t0));
+        d.remove("a");
+        d.remove("missing");
+        assert!(d.insert("a", t0));
+        assert!(!d.insert("b", t0));
     }
 
     #[test]

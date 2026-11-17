@@ -764,6 +764,17 @@ pub struct Outgoing {
     pub interface: usize,
     /// The SOAP envelope.
     pub payload: Vec<u8>,
+    /// What answering this request recorded as seen, for a reply that never left. `None` for
+    /// announcements.
+    replied: Option<Replied>,
+}
+
+/// The de-duplication entries recorded for one answered request: the raw datagram and its
+/// `MessageID`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Replied {
+    raw_key: String,
+    message_id: String,
 }
 
 /// The pure protocol core.
@@ -871,6 +882,10 @@ impl<E: Entropy> Engine<E> {
             dest: source,
             interface,
             payload: payload.into_bytes(),
+            replied: Some(Replied {
+                raw_key,
+                message_id: message_id.to_owned(),
+            }),
         })
     }
 
@@ -906,11 +921,14 @@ impl<E: Entropy> Engine<E> {
             .collect()
     }
 
-    /// Forget which probes were answered, so a client's retransmit of one whose queued reply was
-    /// discarded is answered. The rate limits stay.
-    fn forget_history(&mut self) {
-        self.dedup = Dedup::new(DEDUP_TTL, DEDUP_CAPACITY);
-        self.raw = Dedup::new(RAW_TTL, RAW_CAPACITY);
+    /// Forget that `out`'s request was answered because its reply never left (discarded, refused
+    /// or failed to send), so the client's retransmit is answered. Everything else already
+    /// answered stays suppressed, and the rate limits stay, so retries remain bounded.
+    fn forget(&mut self, out: &Outgoing) {
+        if let Some(replied) = &out.replied {
+            self.raw.remove(&replied.raw_key);
+            self.dedup.remove(&replied.message_id);
+        }
     }
 
     /// Serve `interfaces` from now on and announce those not served before.
@@ -953,6 +971,7 @@ impl<E: Entropy> Engine<E> {
                     dest: i.group(),
                     interface,
                     payload: payload.into_bytes(),
+                    replied: None,
                 });
             }
         }
@@ -1064,6 +1083,12 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
         self.stats
     }
 
+    /// The interfaces served right now, in socket order.
+    #[must_use]
+    pub fn interfaces(&self) -> &[Interface] {
+        self.engine.config.interfaces()
+    }
+
     /// Queue the `Hello` announcements (none while no interface is served yet; a [`Watch`] adds
     /// them as interfaces appear).
     pub fn start(&mut self) {
@@ -1097,7 +1122,11 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
             let data = self.buf.get(..datagram.len).unwrap_or_default();
             match self.engine.handle(now, datagram.source, data) {
                 Ok(out) if self.pending.len() < MAX_PENDING => self.pending.push(out),
-                Ok(_) | Err(_) => self.stats.dropped += 1,
+                Ok(refused) => {
+                    self.stats.dropped += 1;
+                    self.engine.forget(&refused);
+                }
+                Err(_) => self.stats.dropped += 1,
             }
         }
         self.flush_due(now);
@@ -1227,10 +1256,10 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
 
     /// Queued replies and announcements carry indices into the old interface list. Keep the ones
     /// whose interface and `XAddrs` are unchanged under their new index and drop the rest, along
-    /// with the memory of what was answered so the client's retransmit is not suppressed.
+    /// with the memory of having answered just those, so the client's retransmit is not
+    /// suppressed.
     fn remap_pending(&mut self, before: &[(Interface, String)]) {
         let after = self.engine.served();
-        let mut dropped = false;
         for mut out in std::mem::take(&mut self.pending) {
             let moved = before
                 .get(out.interface)
@@ -1239,11 +1268,8 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
                 out.interface = n;
                 self.pending.push(out);
             } else {
-                dropped = true;
+                self.engine.forget(&out);
             }
-        }
-        if dropped {
-            self.engine.forget_history();
         }
     }
 
@@ -1259,9 +1285,15 @@ impl<T: Transport, E: Entropy, C: Clock> Responder<T, E, C> {
     }
 
     fn send(&mut self, out: &Outgoing) {
-        match self.transport.send(out.interface, out.dest, &out.payload) {
-            Ok(()) => self.stats.sent += 1,
-            Err(_) => self.stats.send_errors += 1,
+        if self
+            .transport
+            .send(out.interface, out.dest, &out.payload)
+            .is_ok()
+        {
+            self.stats.sent += 1;
+        } else {
+            self.stats.send_errors += 1;
+            self.engine.forget(out);
         }
     }
 }
