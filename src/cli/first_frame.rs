@@ -56,7 +56,7 @@ pub enum FirstFrameCause {
     /// A USB transfer failed.
     #[error("no first frame: a USB transfer failed; reseat the cable or power-cycle the camera")]
     Transport,
-    /// The camera is busy with something else.
+    /// The camera is busy with something else, or kept answering busy or empty.
     #[error(
         "no first frame: the camera is busy with another operation; retry shortly, and if it persists check whether another program holds it"
     )]
@@ -68,7 +68,7 @@ pub enum FirstFrameCause {
     Permission,
     /// The camera answered a command with an error status.
     #[error(
-        "no first frame: the camera rejected a command; check it is in PC Remote mode and not in use by another program"
+        "no first frame: the camera rejected a command, cause unestablished; if it repeats, confirm PC Remote mode and report it with the log"
     )]
     Rejected,
     /// A payload could not be decoded.
@@ -92,14 +92,17 @@ impl FirstFrameCause {
     pub(super) fn of(error: &SonyError, waiting_for_frame: bool) -> Self {
         match error {
             SonyError::SdioUnsupported => Self::NotRemote,
-            SonyError::UnsupportedProtocol(_)
-            | SonyError::ProtocolRefused { .. }
-            | SonyError::ExtInfoUnavailable { .. } => Self::Refused,
+            // A refusal that is really a stall or timeout is named for what it was.
+            SonyError::ProtocolRefused { fallback_error, .. } => match fallback_error.as_ref() {
+                SonyError::Session(SessionError::Response { .. }) => Self::Refused,
+                other => Self::of(other, waiting_for_frame),
+            },
+            SonyError::ExtInfoUnavailable { .. } => Self::Busy,
             SonyError::LiveViewUnsupported => Self::LiveViewUnavailable,
             SonyError::LiveViewNotReady if waiting_for_frame => Self::NoFrame,
             SonyError::LiveViewNotReady => Self::NotReady,
             SonyError::LiveView(_) => Self::Decode,
-            SonyError::Codec(_) => Self::Protocol,
+            SonyError::UnsupportedProtocol(_) | SonyError::Codec(_) => Self::Protocol,
             SonyError::Session(error) => Self::session(error),
             _ => Self::Unclassified,
         }

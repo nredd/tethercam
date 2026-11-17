@@ -48,15 +48,9 @@ pub(super) async fn probe<F: CameraFactory>(factory: F, out: &mut dyn Write) -> 
 }
 
 /// `probe` plus the step `run` waits on: fetch and decode the first live-view frame. A failure
-/// names its likely cause ([`FirstFrameCause`]) instead of the generic camera error.
+/// names its likely cause ([`FirstFrameCause`]) instead of the generic camera error. The
+/// driver's deadlines are injected so a missing frame is testable fast.
 pub(super) async fn doctor_camera<F: CameraFactory>(
-    factory: F, out: &mut dyn Write,
-) -> Result<(), Error> {
-    doctor_camera_with(factory, SonyConfig::default(), out).await
-}
-
-/// [`doctor_camera`] with the driver's deadlines injected, so a missing frame is testable fast.
-pub(super) async fn doctor_camera_with<F: CameraFactory>(
     factory: F, config: SonyConfig, out: &mut dyn Write,
 ) -> Result<(), Error> {
     let (protocol, capabilities, battery) =

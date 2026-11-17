@@ -32,6 +32,7 @@ mod simulator;
 #[cfg(test)]
 mod tests;
 
+pub use first_frame::FirstFrameCause;
 pub use options::{Command, Options, ParseError};
 
 use std::io::Write;
@@ -79,7 +80,7 @@ pub enum Error {
     Camera,
     /// `doctor` got no first live-view frame; the category names the likely cause.
     #[error(transparent)]
-    FirstFrame(#[from] first_frame::FirstFrameCause),
+    FirstFrame(#[from] FirstFrameCause),
     /// The clock is unsuitable for authenticated ONVIF clients.
     #[error("system clock is implausible; synchronize time before adoption")]
     Clock,
@@ -266,7 +267,7 @@ async fn command_with<F: CameraFactory>(
                 cfg,
                 crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
             )?;
-            diagnostics::doctor_camera(factory, out).await?;
+            diagnostics::doctor_camera(factory, crate::sony::SonyConfig::default(), out).await?;
             writeln!(
                 out,
                 "Clock, permissions, listener ports and camera mode are ready."

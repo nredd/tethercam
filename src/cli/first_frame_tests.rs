@@ -33,8 +33,7 @@ fn body() -> SonySimConfig {
 
 async fn doctor(camera: crate::transport::sim::SimCamera) -> (Result<(), Error>, String) {
     let mut out = Vec::new();
-    let result =
-        diagnostics::doctor_camera_with(Factory::new(vec![camera]), fast(), &mut out).await;
+    let result = diagnostics::doctor_camera(Factory::new(vec![camera]), fast(), &mut out).await;
     (result, String::from_utf8(out).unwrap())
 }
 
@@ -92,7 +91,7 @@ async fn synthetic_bodies_map_to_their_likely_cause() {
         (
             // Valid container, but not a JPEG the decoder accepts.
             SonySimConfig {
-                live_view_jpeg: SonySimConfig::default().live_view_jpeg,
+                live_view_jpeg: vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x01, 0x02, 0xFF, 0xD9],
                 ..body()
             },
             Cause::Decode,
@@ -156,10 +155,17 @@ fn classification_covers_every_driver_error_family() {
     let session = |error: SessionError| SonyError::Session(error);
     let transport = |error: TransportError| session(SessionError::Transport(error));
     let cases = [
-        (SonyError::UnsupportedProtocol(150), Cause::Refused),
+        (SonyError::UnsupportedProtocol(150), Cause::Protocol),
+        (SonyError::ExtInfoUnavailable { attempts: 3 }, Cause::Busy),
         (
-            SonyError::ExtInfoUnavailable { attempts: 3 },
-            Cause::Refused,
+            // A handshake that stalled or timed out is not a refusal.
+            SonyError::ProtocolRefused {
+                requested: crate::sony::Protocol::V300,
+                requested_error: Box::new(SonyError::SdioUnsupported),
+                fallback: crate::sony::Protocol::V200,
+                fallback_error: Box::new(transport(TransportError::Timeout)),
+            },
+            Cause::Timeout,
         ),
         (SonyError::LiveView(LiveViewError::NotJpeg), Cause::Decode),
         (
