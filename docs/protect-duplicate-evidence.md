@@ -32,8 +32,9 @@ Limits:
 
 Record before any trigger, in one private note:
 
-- `tethercam` commit, service state `ready` (`GET /tethercam/status`), and that the camera is the
-  adopted one online in Protect
+- `tethercam` commit, service state `ready` (the `camera` field of the authenticated
+  `GET /tethercam/status`; read it privately, never put credentials in a URL), and that the camera
+  is the adopted one online in Protect
 - Protect row count for this endpoint: adopted rows and unadopted rows, as seen in the Devices view
 - Clock offset between the capture host and the machine you read Protect on, to within 1 s (both
   NTP synced). Row timing is meaningless without it
@@ -75,6 +76,9 @@ reference address, `XAddrs`, `Scopes`, `AppSequence` `InstanceId` and `MessageNu
 
 Expected, so not findings:
 
+- Every `Hello`, `ProbeMatches` and `ResolveMatches` is sent after its own random delay of up to
+  500 ms, so a reply can trail its probe by that long: allow 500 ms of slack when correlating row
+  timing
 - `Hello` once per served interface and dialect at startup, each after a random delay up to
   500 ms, so two per interface on a restart, plus the same pair when an interface appears while
   running
