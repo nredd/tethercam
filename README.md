@@ -4,8 +4,12 @@ Turn a Sony Alpha camera into a network camera for UniFi Protect and Home Assist
 single USB-C cable.
 
 > **Status: development.** The CLI, camera actor, codecs, authenticated RTSP and ONVIF run
-> together against simulated cameras. The native USB factory is wired through `nusb`; physical
-> camera end-to-end operation and real Protect/Home Assistant adoption are not yet validated. See [`docs/architecture.md`](docs/architecture.md).
+> together against simulated cameras. On macOS, one a7 III has been run end to end over the
+> experimental `icc` backend, adopted by UniFi Protect and served to Home Assistant as snapshots (frontend playback not verified), but there is no
+> endurance pass (a 6 h 27 min partial soak only) and duplicate Protect entries
+> ([#112](https://github.com/nredd/tethercam/issues/112)) are an open blocker. See the
+> [macOS quickstart](docs/macos-quickstart.md) for exactly what was and was not verified, and
+> [`docs/architecture.md`](docs/architecture.md).
 
 ## Pipeline
 
@@ -20,12 +24,20 @@ single USB-C cable.
 Install a per-user macOS launchd agent or a Linux system/user systemd service with
 `tethercam service install` (`--user` for Linux's user manager). Installation starts the service.
 See [`docs/service.md`](docs/service.md) for privileges, standard paths, USB permissions, status,
-uninstall and graceful stop policy. Real NVR adoption remains unvalidated.
+uninstall and graceful stop policy. New to a Mac? Start with the [macOS quickstart](docs/macos-quickstart.md), then [UniFi Protect](docs/unifi-protect.md) and [Home Assistant](docs/home-assistant.md).
 
 ## Supported hardware
 
 Developed against the a7 III (ILCE-7M3). The goal is every Sony body that supports
-"PC Remote" over USB. A compatibility table will live here as bodies are verified.
+"PC Remote" over USB.
+
+Verified so far (one owner run, partial; limits in the [quickstart](docs/macos-quickstart.md)):
+
+| Body | Host | Backend | Protect | Home Assistant |
+| --- | --- | --- | --- | --- |
+| a7 III (ILCE-7M3) | Mac mini, USB-C | `icc`, `main` e48ae46 | Adopted; online and recording as reported (not recorded-playback checked); moving playback confirmed. Duplicate rows open ([#112](https://github.com/nredd/tethercam/issues/112)) | ONVIF and Protect-imported: snapshot HTTP 200 (1024x680 JPEG). Frontend playback not verified |
+
+Protect and Home Assistant versions were not recorded. No other body or host is verified.
 
 Live-view resolution is set by the camera, not by this software. On the a7 III it is
 1024x680 at about 15 fps. Full resolution is available as stills, but only on request
@@ -39,6 +51,9 @@ users; development gates use the exact toolchain pinned in `rust-toolchain.toml`
 ```sh
 cargo install tethercam
 ```
+
+The published 0.0.1 has no `icc` backend. On macOS build from source with `--features macos-icc`
+(Rust 1.99 or newer, see below and the [quickstart](docs/macos-quickstart.md)).
 
 From source:
 
@@ -55,6 +70,9 @@ On the camera:
 1. Menu → Setup → USB Connection → **PC Remote**
 2. Menu → Setup → USB Power Supply → **On**
 3. Connect it with a USB-C cable rated for data (USB 3 recommended), directly to the host
+
+Other menu settings (mode dial, save destination, auto power-off, focus) are unverified. On a Mac,
+follow the [quickstart and camera checklist](docs/macos-quickstart.md).
 
 ## Commands
 

@@ -3,7 +3,7 @@
 Decision for `tethercam::media` (issue #8): decode with `zune-jpeg`, encode with
 `rusty_h264-encoder` (features `std` and `asm`, `global-alloc` off).
 
-Target stream: 1024x680, 15 fps, about 3 Mbps, Baseline or Main, pure Rust.
+Target stream: 1024x680, 15 fps, about 3 Mbps (the evaluation target; the runtime default `streams.bitrate` is 2 Mbps), Baseline or Main, pure Rust.
 
 ## Method
 
