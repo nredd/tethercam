@@ -490,3 +490,35 @@ fn icc_is_rejected_before_any_camera_access_where_it_cannot_run() {
         assert_eq!(String::from_utf8(out).unwrap(), "");
     }
 }
+
+#[tokio::test]
+async fn doctor_names_the_cause_where_probe_stays_generic() {
+    use crate::cli::first_frame::FirstFrameCause;
+    use crate::transport::sim::sony::{SonySimConfig, sony_camera};
+    let cfg = free_cfg();
+    let body = || {
+        sony_camera(SonySimConfig {
+            advertise_sdio: false,
+            ..SonySimConfig::default()
+        })
+    };
+    let mut out = Vec::new();
+    let error = super::command_until(
+        Factory::new(vec![body()]),
+        &cfg,
+        &options(Command::Doctor, std::path::Path::new("synthetic.toml")),
+        &mut out,
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::FirstFrame(FirstFrameCause::NotRemote)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("PC Remote"), "{error}");
+    let error = diagnostics::probe(Factory::new(vec![body()]), &mut out)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Camera), "{error:?}");
+}

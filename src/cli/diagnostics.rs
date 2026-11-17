@@ -7,10 +7,14 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 
 use super::Error;
+use super::first_frame::FirstFrameCause;
 use crate::config::Config;
+use crate::media::{I420Frame, JpegDecoder};
 use crate::onvif::discovery::{self, EndpointReference, Interface, ServiceAddress};
 use crate::ptp::session::SessionConfig;
-use crate::sony::{SonyCamera, SonyConfig};
+use crate::sony::{
+    Battery, Capabilities, LiveViewError, Protocol, SonyCamera, SonyConfig, SonyError,
+};
 use crate::supervisor::CameraFactory;
 
 pub(super) fn level(level: &str) -> tracing::Level {
@@ -36,19 +40,65 @@ pub(super) fn check_host(cfg: &Config, now: i64) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) async fn probe<F: CameraFactory>(
-    mut factory: F, out: &mut dyn Write,
+pub(super) async fn probe<F: CameraFactory>(factory: F, out: &mut dyn Write) -> Result<(), Error> {
+    let (protocol, capabilities, battery) = inspect(factory, SonyConfig::default(), false)
+        .await?
+        .map_err(|_| Error::Camera)?;
+    report(out, protocol, &capabilities, battery)
+}
+
+/// `probe` plus the step `run` waits on: fetch and decode the first live-view frame. A failure
+/// names its likely cause ([`FirstFrameCause`]) instead of the generic camera error.
+pub(super) async fn doctor_camera<F: CameraFactory>(
+    factory: F, out: &mut dyn Write,
 ) -> Result<(), Error> {
+    doctor_camera_with(factory, SonyConfig::default(), out).await
+}
+
+/// [`doctor_camera`] with the driver's deadlines injected, so a missing frame is testable fast.
+pub(super) async fn doctor_camera_with<F: CameraFactory>(
+    factory: F, config: SonyConfig, out: &mut dyn Write,
+) -> Result<(), Error> {
+    let (protocol, capabilities, battery) =
+        inspect(factory, config, true)
+            .await?
+            .map_err(|(error, waiting_for_frame)| {
+                Error::FirstFrame(FirstFrameCause::of(&error, waiting_for_frame))
+            })?;
+    report(out, protocol, &capabilities, battery)
+}
+
+type Inspected = (Protocol, Capabilities, Option<Battery>);
+
+/// Open the camera and walk the session as far as `check_frame` asks. The outer error is the
+/// factory's; the inner one carries the driver failure and whether it came while waiting for the
+/// first frame, as opposed to for live view to become ready.
+async fn inspect<F: CameraFactory>(
+    mut factory: F, config: SonyConfig, check_frame: bool,
+) -> Result<Result<Inspected, (SonyError, bool)>, Error> {
     let transport = factory.connect().await?.ok_or(Error::NoCamera)?;
     let mut session = factory.session(transport, SessionConfig::default(), std::time::Instant::now);
-    let report = SonyCamera::run(&mut session, SonyConfig::default(), async |camera| {
+    let mut waiting_for_frame = false;
+    let report = SonyCamera::run(&mut session, config, async |camera| {
         camera.wait_live_view_ready().await?;
+        if check_frame {
+            waiting_for_frame = true;
+            let frame = camera.next_live_view_frame().await?;
+            JpegDecoder::new()
+                .decode_into(&frame, &mut I420Frame::default())
+                .map_err(|_| LiveViewError::NotJpeg)?;
+        }
         Ok((camera.protocol(), camera.capabilities(), camera.battery()))
     })
     .await;
     let transport = factory.recover(session);
     factory.release(transport);
-    let (protocol, capabilities, battery) = report.map_err(|_| Error::Camera)?;
+    Ok(report.map_err(|error| (error, waiting_for_frame)))
+}
+
+fn report(
+    out: &mut dyn Write, protocol: Protocol, capabilities: &Capabilities, battery: Option<Battery>,
+) -> Result<(), Error> {
     writeln!(
         out,
         "Camera: PC Remote; protocol {protocol:?}\nCapabilities: {capabilities:?}\nBattery/power: {battery:?}"

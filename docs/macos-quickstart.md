@@ -144,7 +144,7 @@ The default `streams.bitrate` is 2 Mbps for the H.264 stream. Older notes of "ab
 
 Design expectations, not observed in the measured run:
 
-- `doctor` does not yet name the likely cause when the first frame never arrives (remaining part of [#86](https://github.com/nredd/tethercam/issues/86)); read `camera_open_failed` in the log
+- `doctor` fetches the first live-view frame like `run` and prints `no first frame: <likely cause>` on failure (not in PC Remote, refused handshake, never ready, ready but no frame, timeout, disconnect, busy, restricted access, undecodable data). The causes are inferred from driver errors and checked against synthetic failures only, not on hardware; a cause naming a setting repeats only what this page already lists. Read `camera_open_failed` in the log for open failures
 - `waiting` forever: not in PC Remote, camera asleep or off, wrong `camera_id` (it matches nothing
   and the service waits), or another program has the session. Read `camera_open_failed` in the log
 - Protect or Home Assistant cannot see it: check clock skew (WS-Security timestamps), subnet and

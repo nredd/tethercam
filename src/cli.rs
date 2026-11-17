@@ -8,6 +8,7 @@ mod cameras;
 #[cfg(test)]
 mod diagnostic_tests;
 mod diagnostics;
+mod first_frame;
 #[cfg(feature = "macos-icc")]
 mod icc;
 #[cfg(not(feature = "macos-icc"))]
@@ -76,6 +77,9 @@ pub enum Error {
     /// A selected camera cannot be opened or driven.
     #[error("camera unavailable; check USB permissions and PC Remote mode")]
     Camera,
+    /// `doctor` got no first live-view frame; the category names the likely cause.
+    #[error(transparent)]
+    FirstFrame(#[from] first_frame::FirstFrameCause),
     /// The clock is unsuitable for authenticated ONVIF clients.
     #[error("system clock is implausible; synchronize time before adoption")]
     Clock,
@@ -262,7 +266,7 @@ async fn command_with<F: CameraFactory>(
                 cfg,
                 crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
             )?;
-            diagnostics::probe(factory, out).await?;
+            diagnostics::doctor_camera(factory, out).await?;
             writeln!(
                 out,
                 "Clock, permissions, listener ports and camera mode are ready."

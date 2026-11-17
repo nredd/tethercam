@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Make `doctor` fetch and decode the first live-view frame, as `run` does, and name the likely cause when it does not arrive: not in PC Remote, handshake refused, live view unavailable or never ready, ready but no frame, timeout, disconnect, USB transfer failure, busy, restricted access, rejected command, undecodable data or frame. Messages are fixed categories with no camera responses or identifiers. `probe` is unchanged. Causes are inferred from driver errors; no camera setting is claimed beyond the documented PC Remote mode (part of #86).
 - Reject partial media decodes when FFmpeg reports an error.
 - Prepare and clean up hosted USB/IP prerequisites for the release gate.
 - Bound hung nextest tests: `.config/nextest.toml` terminates a nextest-run test after 120 s (2x its 60 s slow period), 2.4x the slowest real test. Doctests and plain `cargo test` are not covered and keep the CI job timeouts. Test the coverage gate's region-only failure and its hint output errors, and document its report, unsupported toolchain layouts and generic-function coverage (#96, #102).
