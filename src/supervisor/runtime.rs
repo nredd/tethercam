@@ -132,12 +132,23 @@ pub async fn serve<F: CameraFactory>(
     factory: F, cfg: &Config, discovery: Option<discovery::Config>,
     shutdown: impl Future<Output = ()>, out: &mut dyn Write,
 ) -> Result<F, RunError> {
-    serve_until(factory, cfg, discovery, Box::pin(shutdown), out).await
+    serve_until(
+        factory,
+        cfg,
+        discovery,
+        Box::pin(shutdown),
+        out,
+        Some(COUNTERS_INTERVAL),
+    )
+    .await
 }
 
-async fn serve_until<F: CameraFactory>(
+/// [`serve`] with a boxed `shutdown` and the counts line's period. `counters_every: None` logs no
+/// periodic line, only the final one: a seam for tests that must not have the periodic timer
+/// move a paused clock.
+pub(crate) async fn serve_until<F: CameraFactory>(
     factory: F, cfg: &Config, discovery: Option<discovery::Config>, mut shutdown: Shutdown<'_>,
-    out: &mut dyn Write,
+    out: &mut dyn Write, counters_every: Option<Duration>,
 ) -> Result<F, RunError> {
     let interval = Duration::from_secs(1)
         .checked_div(cfg.streams.frame_rate)
@@ -158,11 +169,11 @@ async fn serve_until<F: CameraFactory>(
         result
     };
     // Neither sibling is abandoned when the other finishes. Only the actor owns PTP.
-    let (factory, result, ()) = tokio::join!(
-        actor.run(),
-        network,
-        report_counters(&control, COUNTERS_INTERVAL)
-    );
+    let (factory, result, ()) = tokio::join!(actor.run(), network, async {
+        if let Some(period) = counters_every {
+            report_counters(&control, period).await;
+        }
+    });
     log_counters(&control, "run_counters_final");
     result
         .inspect(|()| tracing::info!(event = "runtime_stopped"))

@@ -573,8 +573,21 @@ async fn capture_discards_a_stale_image_first() {
     })
     .await
     .unwrap();
-    let downloads = codes(&session).iter().filter(|c| **c == 0x1009).count();
-    assert_eq!(downloads, 2, "one discard, one real download");
+    let codes = codes(&session);
+    let downloads: Vec<usize> = codes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == op::GET_OBJECT)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(downloads.len(), 2, "one discard, one real download");
+    // A late image, e.g. one that landed after an earlier capture timed out, is discarded before
+    // the shutter is pressed: it can never be mistaken for the new capture's image.
+    let first_press = codes
+        .iter()
+        .position(|c| *c == op::SDIO_CONTROL_DEVICE)
+        .unwrap();
+    assert!(downloads[0] < first_press && first_press < downloads[1]);
 }
 
 thread_local! {

@@ -53,7 +53,7 @@ use crate::ptp::session::SessionConfig;
 use crate::supervisor::{CameraFactory, OpenError};
 use crate::transport::icc::{
     self as icc, DISCOVERY_WINDOW, Effect, IccDeviceId, IccError, IccHandle, IccSession,
-    IccTimeout, Selector,
+    IccTimeout, Selector, distinct,
 };
 
 #[cfg(test)]
@@ -234,7 +234,11 @@ impl CameraFactory for IccFactory {
         let chosen = found.and_then(|found| {
             self.selector.choose(&found).inspect_err(|error| {
                 if *error == IccError::Ambiguous {
-                    tracing::warn!(event = "icc_ambiguous_cameras", candidates = found.len());
+                    // Distinct devices, as `cameras` counts them: the framework may list one twice.
+                    tracing::warn!(
+                        event = "icc_ambiguous_cameras",
+                        candidates = distinct(&found).len()
+                    );
                 }
             })
         });
@@ -467,9 +471,11 @@ fn launch_spawning<W: Write + Send + 'static>(
     let finished = progress.clone();
     let entry: Entry = Box::new(move |handle| {
         ran.store(true, Ordering::Release);
+        // Start failed and overwrite on a normal return: a panic skips that, and the watcher must
+        // then report an error instead of calling the result complete.
         let mut report = Finished {
             progress: finished,
-            failure: None,
+            failure: Some(Error::IccFailed.to_string()),
         };
         let mut out = lock_out(&out);
         let result = worker(handle, &plan, &mut *out);

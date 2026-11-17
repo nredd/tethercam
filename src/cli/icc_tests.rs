@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::cli::Command;
 use crate::sony::op;
+use crate::supervisor::serve_until;
 use crate::supervisor::testing::{LogCapture, camera};
 use crate::transport::icc::Boundary;
 use crate::transport::icc::fake::{Call, Fake, Script, Shared, SimBoundary, SimFaults, Unsettled};
@@ -87,9 +88,11 @@ fn discovery_outcomes_leave_the_handle_with_the_factory() {
     let logs = LogCapture::new();
     let (fake, _) = scripted(|s| {
         s.discover.push_back(Ok(Vec::new()));
+        // One device reported twice and another once: three entries, two distinct cameras.
         s.discover.push_back(Ok(vec![
             device("synthetic-secret-a"),
             device("synthetic-secret-b"),
+            device("synthetic-secret-a"),
         ]));
         s.discover.push_back(Err(IccError::Permission));
         s.discover.push_back(Err(IccError::DeadlineExceeded));
@@ -488,25 +491,29 @@ fn a_native_command_that_never_completes_ends_the_run_as_quarantined_after_the_b
     let dispatch = logs.dispatch();
     let cfg = free_cfg();
     let mut out = Vec::new();
-    let result = run_with(fake, |handle| {
+    let quarantined = run_with(fake, |handle| {
         tracing::dispatcher::with_default(&dispatch, || {
-            paused_runtime().block_on(drive_until(
-                handle,
-                &cfg,
-                &options(Command::Run),
-                &mut out,
-                Box::pin(std::future::pending()),
-            ))
+            paused_runtime().block_on(async {
+                let (factory, mut fatal) = IccFactory::new(handle, Selector::SoleCandidate);
+                let quarantined = fatal.clone();
+                let shutdown = async move {
+                    let _ = fatal.wait_for(|fatal| *fatal).await;
+                };
+                // No periodic counts line: its five-minute timer would let the paused clock jump
+                // over the backoff, so the attempt count below would not be deterministic.
+                serve_until(factory, &cfg, None, Box::pin(shutdown), &mut out, None)
+                    .await
+                    .unwrap();
+                *quarantined.borrow()
+            })
         })
     })
     .unwrap();
-    assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
-    // Retries are bounded: 100 ms doubling to the 5 s cap reaches the 300 s limit on about the 66th
-    // attempt at most. The lower end is not fixed: while the fake native thread answers, the paused
-    // clock may jump ahead to the next timer, which is the five-minute counts line, so a run can
-    // reach the limit after only a few attempts. The deterministic result is the quarantine above.
+    assert!(quarantined);
+    // 100 ms doubling to the 5 s cap: six waits total 6.3 s, then 5 s each. The 300 s limit is
+    // reached on the 66th attempt, so a bound that is ignored or doubled leaves this range.
     let attempts = script(&shared).calls.len();
-    assert!(attempts <= 70, "{attempts}");
+    assert!((60..=70).contains(&attempts), "{attempts}");
     assert!(logs.text().contains("icc_busy_limit_exceeded"));
 }
 
@@ -807,6 +814,52 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
         "{}",
         logs.text()
     );
+}
+
+/// Panics on its first write, like a worker that dies mid-command, and accepts the rest.
+#[derive(Clone, Default)]
+struct PanicsOnce {
+    armed: Arc<AtomicU8>,
+    sink: Sink,
+}
+
+impl Write for PanicsOnce {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        assert!(
+            self.armed.fetch_add(1, Ordering::SeqCst) != 0,
+            "synthetic worker panic"
+        );
+        self.sink.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_one_shot_command_that_panics_still_reports_an_error_before_the_unsettled_exit() {
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let out = PanicsOnce::default();
+    EXITED.store(0, Ordering::SeqCst);
+    let result = launch_with(
+        &options(Command::Probe),
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        out.clone(),
+        hung_with_camera,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    // The worker died after it started, which is not an unavailable platform.
+    assert!(matches!(result, Err(Error::IccFailed)), "{result:?}");
+    assert_eq!(EXITED.load(Ordering::SeqCst), UNSETTLED_EXIT);
+    let text = written(&out.sink);
+    // Without a recorded failure the notice would claim a complete result that never existed.
+    let error = text
+        .find("Error: camera_backend `icc` failed after it started")
+        .unwrap();
+    let notice = text.find("Native cleanup did not settle").unwrap();
+    assert!(error < notice, "{text}");
 }
 
 #[test]
