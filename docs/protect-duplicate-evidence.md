@@ -63,8 +63,9 @@ a complete envelope, and a missing reply may just be uncaptured. Leave the filte
 Mark each stored packet that has the IPv4 more-fragments flag or a fragment offset set, or whose
 captured length is below its original length, `fragmented` or `truncated` in the notes. Exclude it
 from every equality comparison and count, never read a partial envelope as an identity, and treat
-the window as insufficient evidence for any conclusion that depends on it. A reply missing
-while fragmented traffic was seen is likewise insufficient, not a finding.
+the window as insufficient evidence for any conclusion that depends on it. A missing reply is never
+conclusive from this capture alone, since an uncaptured fragmented reply cannot be ruled out: it is
+insufficient evidence, not a finding.
 
 Start it first, then note `t0` (wall clock, UTC, seconds), then run the trigger:
 
