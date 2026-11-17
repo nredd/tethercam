@@ -35,7 +35,7 @@ Verified so far (one owner run, partial; limits in the [quickstart](docs/macos-q
 
 | Body | Host | Backend | Protect | Home Assistant |
 | --- | --- | --- | --- | --- |
-| a7 III (ILCE-7M3) | Mac mini, USB-C | `icc`, `main` e48ae46 | Adopted, online, recording, moving playback confirmed. Duplicate rows open ([#112](https://github.com/nredd/tethercam/issues/112)) | ONVIF and Protect-imported: snapshot HTTP 200 (1024x680 JPEG). Frontend playback not verified |
+| a7 III (ILCE-7M3) | Mac mini, USB-C | `icc`, `main` e48ae46 | Adopted; online and recording as reported (not recorded-playback checked); moving playback confirmed. Duplicate rows open ([#112](https://github.com/nredd/tethercam/issues/112)) | ONVIF and Protect-imported: snapshot HTTP 200 (1024x680 JPEG). Frontend playback not verified |
 
 Protect and Home Assistant versions were not recorded. No other body or host is verified.
 
