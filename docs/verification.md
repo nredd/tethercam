@@ -144,7 +144,8 @@ The report is **not** written when the gate fails before the native run (missing
 unreadable toolchain, unwritable `coverage/`), or when the text command itself fails; a stale
 report is removed only once a run reaches that step (after the `TOOLCHAIN:` line, so not when the
 Cargo home, working directory or toolchain query fails first); in that case an older report can
-remain, so trust `coverage/uncovered.txt` only after a run that printed `TOOLCHAIN:`. The rustup
+remain, so trust `coverage/uncovered.txt` only after a run that printed `TOOLCHAIN:` and then
+reported the native gate's own failure (`native coverage gate failed`). The rustup
 hint accompanies every native failure.
 
 Toolchain sources are excluded only under `/rustc/` and `<sysroot>/lib/rustlib/src/` (the latter
