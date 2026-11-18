@@ -358,3 +358,12 @@ async fn the_first_frame_check_agrees_with_prepare_for_every_stream_setting() {
         }
     }
 }
+
+#[tokio::test]
+async fn preparing_the_pipeline_publishes_the_described_size_to_snapshots() {
+    let (pipeline, _sources) = prepared(true);
+    assert_eq!(pipeline.control.format.get(), Some(&(32, 32)));
+    // The first description wins; a later, different one never rewrites it.
+    pipeline.control.publish_format(64, 64);
+    assert_eq!(pipeline.control.format.get(), Some(&(32, 32)));
+}

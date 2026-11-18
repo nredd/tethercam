@@ -295,6 +295,12 @@ Transitions:
   `FrameMismatch`: the run fails with the camera closed cleanly, the service manager restarts
   the process and the new size is described from scratch. Nothing is served under the old SDP or
   profiles. A frame without a readable header is left to processing, which reports it
+- Live-view snapshots get the same size check, before the reply: the camera actor compares the
+  newest frame's JPEG header size with the size the streams were described with, and a snapshot
+  of any other size is refused (`503`, `snapshot_size_mismatch` event) instead of served just
+  ahead of the pipeline ending the run. Opt-in full-resolution stills are a different image by
+  design and are not compared. Whether a real A7 III changes live-view size in normal use
+  (focus magnifier, aspect ratio, movie mode) is unmeasured and stays open on hardware (#103)
 
 Logs carry static events: `waiting_camera` and `runtime_listening` at startup, `camera_ready` on
 every session that reaches live view, `camera_disconnected`, `runtime_ready` for the first frame.

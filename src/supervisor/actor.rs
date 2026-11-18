@@ -12,7 +12,7 @@ mod tests;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc as blocking};
+use std::sync::{Arc, OnceLock, mpsc as blocking};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -178,6 +178,8 @@ pub struct Control {
     pub(super) stop: watch::Sender<bool>,
     status: watch::Receiver<CameraStatus>,
     still_snapshots: Arc<AtomicBool>,
+    /// Frame size the streams and ONVIF profiles were described with, once published.
+    pub(super) format: Arc<OnceLock<(u32, u32)>>,
     pub(super) counters: Arc<Counters>,
 }
 
@@ -205,6 +207,12 @@ impl Control {
     #[must_use]
     pub fn counters(&self) -> CounterSnapshot {
         self.counters.snapshot()
+    }
+
+    /// Record the frame size the streams were described with. The first call wins: a run
+    /// describes its streams once, and a different size ends the run.
+    pub(super) fn publish_format(&self, width: u32, height: u32) {
+        let _ = self.format.set((width, height));
     }
 
     pub(super) fn stopping(&self) -> bool {
@@ -275,6 +283,7 @@ pub struct Supervisor<F: CameraFactory> {
     clock: fn() -> Instant,
     frame_interval: Duration,
     still_snapshots: Arc<AtomicBool>,
+    format: Arc<OnceLock<(u32, u32)>>,
     counters: Arc<Counters>,
     demand: watch::Receiver<[u64; 2]>,
     snapshots: mpsc::Receiver<SnapshotReply>,
@@ -300,6 +309,7 @@ impl<F: CameraFactory> Supervisor<F> {
         let (status, status_rx) = watch::channel(CameraStatus::Disconnected);
         let (snapshots, snapshots_rx) = mpsc::channel(4);
         let still_flag = Arc::new(AtomicBool::new(false));
+        let format = Arc::new(OnceLock::new());
         let counters = Arc::new(Counters::new());
         Ok((
             Self {
@@ -309,6 +319,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 clock: Instant::now,
                 frame_interval,
                 still_snapshots: Arc::clone(&still_flag),
+                format: Arc::clone(&format),
                 counters: Arc::clone(&counters),
                 demand: demand_rx,
                 snapshots: snapshots_rx,
@@ -323,6 +334,7 @@ impl<F: CameraFactory> Supervisor<F> {
                 status: status_rx,
                 snapshots,
                 still_snapshots: still_flag,
+                format,
                 counters,
             },
         ))
@@ -483,7 +495,17 @@ impl<F: CameraFactory> Supervisor<F> {
 
     fn latest_frame(&self) -> Result<Vec<u8>, SnapshotError> {
         let slot = self.frames.borrow();
-        slot.as_deref().map(<[u8]>::to_vec).ok_or(SnapshotError)
+        let frame = slot.as_deref();
+        // Same rule as the media pipeline's per-frame check, applied before the reply: the
+        // pipeline ends the run on a changed size, but a snapshot must never be served first
+        // under the profile described for another size. An unreadable header is not a size.
+        let actual = frame.and_then(|frame| crate::media::JpegDecoder::dimensions(frame).ok());
+        if matches!((self.format.get(), actual), (Some(published), Some(actual)) if actual != *published)
+        {
+            tracing::warn!(event = "snapshot_size_mismatch");
+            return Err(SnapshotError);
+        }
+        frame.map(<[u8]>::to_vec).ok_or(SnapshotError)
     }
 
     /// Capture one still. Only failures that provably left the shutter released keep the
