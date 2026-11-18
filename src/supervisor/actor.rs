@@ -47,6 +47,16 @@ pub enum OpenError {
         "more than one camera found; run `tethercam cameras` and select one in the configuration"
     )]
     Ambiguous,
+    /// A one-shot command's discovery was empty on every attempt. Counts only, no identifiers.
+    /// The cause is not established: an empty listing has also been seen with the camera
+    /// attached.
+    #[error(
+        "ImageCaptureCore listed no cameras in {attempts} discovery attempts; the cause is not established (an empty listing has also been seen with the camera attached), so check the cable and PC Remote mode and run again"
+    )]
+    EmptyListing {
+        /// Discoveries made.
+        attempts: u8,
+    },
 }
 
 /// A transport factory. Connecting must not open a PTP session; only the actor does that.

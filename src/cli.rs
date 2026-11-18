@@ -8,6 +8,8 @@ mod cameras;
 #[cfg(test)]
 mod diagnostic_tests;
 mod diagnostics;
+#[cfg(feature = "macos-icc")]
+mod empty;
 mod first_frame;
 #[cfg(feature = "macos-icc")]
 mod icc;

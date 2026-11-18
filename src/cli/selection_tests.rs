@@ -8,6 +8,7 @@ use super::*;
 use crate::cli::Command;
 use crate::config::Secret;
 use crate::ptp::session::PtpSession;
+use crate::supervisor::OpenError;
 use crate::supervisor::testing::{LogCapture, camera};
 use crate::transport::icc::fake::{Call, Fake, Script, Shared, SimBoundary};
 use crate::transport::icc::run_with;
@@ -223,6 +224,7 @@ fn plan(command: Command, camera_id: Option<&str>, logs: &LogCapture) -> Plan {
         },
         cfg,
         dispatch: logs.dispatch(),
+        recovery: EmptyRecovery::OFF,
     }
 }
 
@@ -333,4 +335,66 @@ fn an_absent_selected_camera_is_not_found_so_it_ends_a_busy_run_and_never_opens_
     // The phone was only ever discovered, never opened, so it cannot be refused or paced.
     assert_eq!(script(&shared).opened, Vec::new());
     assert!(!script(&shared).calls.contains(&Call::Open));
+}
+
+fn recovering(mut plan: Plan, command: Command) -> Plan {
+    plan.recovery = EmptyRecovery::for_command(command);
+    plan
+}
+
+fn scripted_discovery(answers: Vec<Result<Vec<IccDeviceId>, IccError>>) -> (Fake, Shared) {
+    let (fake, shared) = Fake::new();
+    script(&shared).discover.extend(answers);
+    (fake, shared)
+}
+
+fn through_worker(
+    answers: Vec<Result<Vec<IccDeviceId>, IccError>>, plan: &Plan,
+) -> (Result<(), Error>, Vec<u8>, Shared) {
+    let (fake, shared) = scripted_discovery(answers);
+    let mut out = Vec::new();
+    let result = run_with(fake, |handle| {
+        worker_with(handle, plan, &mut out, Ok(paused_runtime()), || {
+            Ok(Box::pin(std::future::pending()))
+        })
+    })
+    .unwrap();
+    (result, out, shared)
+}
+
+#[test]
+fn probe_and_doctor_name_an_empty_listing_after_the_bounded_attempts() {
+    for command in [Command::Probe, Command::Doctor] {
+        let plan = recovering(
+            plan(command, Some("synthetic-wanted"), &LogCapture::new()),
+            command,
+        );
+        let (result, out, shared) = through_worker(vec![Ok(Vec::new()); 5], &plan);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::Open(OpenError::EmptyListing { attempts: 3 })),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("cause is not established"));
+        assert_eq!(out, Vec::<u8>::new());
+        assert_eq!(script(&shared).calls, vec![Call::Discover; 3]);
+    }
+}
+
+#[test]
+fn probe_and_doctor_keep_no_selected_camera_when_other_devices_are_attached() {
+    for command in [Command::Probe, Command::Doctor] {
+        let plan = recovering(
+            plan(command, Some("synthetic-wanted"), &LogCapture::new()),
+            command,
+        );
+        // Empty, then only another device: the selected camera is absent, not the framework silent.
+        let (result, _, shared) = through_worker(
+            vec![Ok(Vec::new()), Ok(vec![device("synthetic-other")])],
+            &plan,
+        );
+        assert!(matches!(result, Err(Error::NoCamera)), "{result:?}");
+        assert_eq!(script(&shared).calls, vec![Call::Discover; 2]);
+        assert_eq!(script(&shared).opened, Vec::new());
+    }
 }

@@ -9,9 +9,9 @@ use crate::config::Secret;
 use crate::ptp::session::code;
 use crate::supervisor::OpenError;
 use crate::supervisor::testing::LogCapture;
-use crate::transport::icc::IccReply;
 use crate::transport::icc::fake::{Call, Fake, Script, Shared, Step, ok_reply};
 use crate::transport::icc::run_with;
+use crate::transport::icc::{IccReply, IccTimeout};
 
 const A: &str = "synthetic-secret-a";
 const B: &str = "synthetic-secret-b";
@@ -94,7 +94,7 @@ fn listing_with(
                 } else {
                     Box::pin(std::future::pending())
                 };
-                list(handle, cfg, describe, out, stop).await
+                list(handle, cfg, describe, EmptyRecovery::OFF, out, stop).await
             })
         })
     })
@@ -785,4 +785,120 @@ fn with_nothing_selectable_there_is_no_hint_to_pick_one() {
         "{}",
         listing.out
     );
+}
+
+fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+fn list_through(
+    answers: Vec<Result<Vec<IccDeviceId>, IccError>>, camera_id: Option<&str>,
+    recovery: EmptyRecovery,
+) -> (Result<(), Error>, String, Shared) {
+    let (fake, shared) = Fake::new();
+    script(&shared).discover.extend(answers);
+    let mut cfg = Config::generate().unwrap();
+    cfg.camera_backend = crate::config::CameraBackend::Icc;
+    cfg.camera_id = camera_id.map(|id| Secret::new(id.into()));
+    let mut out = Vec::new();
+    let result = run_with(fake, |handle| {
+        paused_runtime().block_on(list(
+            handle,
+            &cfg,
+            false,
+            recovery,
+            &mut out,
+            Box::pin(std::future::pending()),
+        ))
+    })
+    .unwrap();
+    (result, String::from_utf8(out).unwrap(), shared)
+}
+
+#[test]
+fn cameras_reports_an_always_empty_listing_with_counts_only() {
+    let (result, out, shared) =
+        list_through(vec![Ok(Vec::new()); 4], None, EmptyRecovery::ONE_SHOT);
+    result.unwrap();
+    assert!(out.starts_with("Cameras found: 0\n"), "{out}");
+    assert!(
+        out.contains("listed no cameras in 3 discovery attempts"),
+        "{out}"
+    );
+    assert!(out.contains("cause is not established"), "{out}");
+    assert_eq!(script(&shared).calls, vec![Call::Discover; 3]);
+}
+
+#[test]
+fn cameras_says_when_a_later_attempt_found_the_camera() {
+    let (result, out, shared) = list_through(
+        vec![Ok(Vec::new()), Ok(vec![device(A)])],
+        Some(A),
+        EmptyRecovery::ONE_SHOT,
+    );
+    result.unwrap();
+    assert!(out.starts_with("Cameras found: 1\n"), "{out}");
+    assert!(
+        out.contains(
+            "Discovery was empty on its first 1 attempt(s); this listing is from attempt 2."
+        ),
+        "{out}"
+    );
+    assert!(out.contains("(selected by camera_id)"), "{out}");
+    assert_eq!(script(&shared).calls, vec![Call::Discover; 2]);
+}
+
+#[test]
+fn cameras_without_recovery_prints_no_note_and_an_error_is_not_retried() {
+    let (result, out, shared) = list_through(vec![Ok(Vec::new())], None, EmptyRecovery::OFF);
+    result.unwrap();
+    assert_eq!(out, "Cameras found: 0\n");
+    assert_eq!(script(&shared).calls, [Call::Discover]);
+    let (result, out, shared) = list_through(
+        vec![Err(IccError::Busy), Ok(vec![device(A)])],
+        None,
+        EmptyRecovery::ONE_SHOT,
+    );
+    assert!(matches!(result, Err(Error::Open(OpenError::Busy))));
+    assert_eq!(out, String::new());
+    assert_eq!(script(&shared).calls, [Call::Discover]);
+}
+
+#[test]
+fn a_failed_write_of_the_discovery_note_is_reported_as_io() {
+    for answers in [
+        vec![Ok(Vec::new()); 3],
+        vec![Ok(Vec::new()), Ok(vec![device(A)])],
+    ] {
+        let mut failures = 0;
+        for fail_at in 1..=8 {
+            let (fake, shared) = Fake::new();
+            script(&shared).discover.extend(answers.clone());
+            let mut cfg = Config::generate().unwrap();
+            cfg.camera_backend = crate::config::CameraBackend::Icc;
+            let mut out = FailAt { fail_at, ops: 0 };
+            let result = run_with(fake, |handle| {
+                paused_runtime().block_on(list(
+                    handle,
+                    &cfg,
+                    false,
+                    EmptyRecovery::ONE_SHOT,
+                    &mut out,
+                    Box::pin(std::future::pending()),
+                ))
+            })
+            .unwrap();
+            if matches!(result, Err(Error::Io(_))) {
+                failures += 1;
+            } else {
+                break;
+            }
+        }
+        // The header, the note and the flush each fail on their own.
+        assert!(failures >= 2, "{failures}");
+    }
 }
