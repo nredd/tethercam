@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Create new configuration directories with owner-only permissions on Unix, allowing user service installation under `umask 0002` (#131)
+
 - Recover one-shot `icc` commands (`cameras`, `probe`, `doctor`) from an intermittent empty discovery (#127, refs #106, #77): when a discovery returns no devices at all they discover again up to two more times, a second apart (about 8 s at most when the framework answers each 2 s window on time; a call that does not answer ends the loop with its error), and use the first non-empty snapshot with the unchanged exact selection. An absent selected camera is never retried or replaced by another device, an error is never retried and nothing is submitted while native work may be pending. If every attempt is empty they say so with counts only and that the cause is not established; `cameras` notes a later success. The service keeps its single discovery per supervisor attempt. Why a snapshot is empty is unknown and no hardware result is claimed
 - Refuse a live-view snapshot whose JPEG size differs from the size the streams were described with, before the snapshot reply, instead of serving it just ahead of the pipeline ending the run (part of #103). Whether the camera changes live-view size in normal use, and so whether to keep the restart or republish the stream description, still needs hardware measurement
 - Add the Protect duplicate-rows evidence runbook (`docs/protect-duplicate-evidence.md`) and synthetic tests for stable endpoint identity (refs #112, #33). Docs and tests only; no cause established.

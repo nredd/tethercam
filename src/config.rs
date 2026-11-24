@@ -558,7 +558,13 @@ fn create_directories(
         return sync(parent);
     }
     create_directories(parent, sync)?;
-    match fs::create_dir(path) {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
         Ok(()) => sync(parent),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => sync(parent),
         Err(error) => Err(error),
