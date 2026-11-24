@@ -34,10 +34,12 @@ measured in that run.
 
 On the Linux USB4 test host, the A7 III battery fell from 97% to 80% over about two hours,
 even while status reported `power: usb`. This is one observation, not an endurance test.
-`USB Power Supply = On` reduces drain; it does not guarantee battery-neutral operation.
+`USB Power Supply = On` lets USB supplement the battery and reduce drain; it does not guarantee
+battery-neutral operation.
 Sony's [A7 III guide](https://helpguide.sony.net/ilc/1720/v1/en/contents/TP0001653088.html)
 says the battery does not charge while the camera is on and can supplement external USB power.
-The A7 III is not listed among Sony's [USB-PD-compatible cameras](https://www.sony.com/electronics/support/articles/00301779).
+The A7 III does not support USB-PD; it is not listed among Sony's
+[USB-PD-compatible cameras](https://www.sony.com/electronics/support/articles/00301779).
 
 For unattended 24/7 A7 III use, consider a compatible NP-FZ100 DC coupler (dummy battery)
 with a suitable continuous power supply, and test the complete setup; this has not been
@@ -48,7 +50,7 @@ USB-PD support alone does not establish that the camera receives sufficient powe
 ## Steps
 
 1. Install from source as described in the [README](../README.md#install). The published
-   0.0.1 release does not include the commands and status endpoint used here
+   0.0.1 release does not include `cameras` or `/tethercam/status`
 2. Provision USB access for the foreground user: follow [`usb.md`](usb.md#linux) for the
    `70-tethercam.rules` rule, `plugdev` on headless hosts, login renewal and replug. Do not
    overwrite the system-service-managed rule; see [`service.md`](service.md)
@@ -74,7 +76,8 @@ USB-PD support alone does not establish that the camera receives sufficient powe
 See [`service.md`](service.md) before installing: installation starts the service and can open
 the camera. Stop the foreground process first.
 
-- System: install a durable binary under `/usr` or `/opt`. If you installed the manual
+- System: install a durable binary under `/usr` or `/opt`; substitute its actual absolute path
+  for `/usr/local/bin/tethercam` in the commands below. If you installed the manual
   `plugdev` rule in step 2, first remove that manual rule from
   `/etc/udev/rules.d/70-tethercam.rules` and reload udev. Never remove or overwrite a rule
   already managed by the system service. Then run `sudo /usr/local/bin/tethercam service install`.
