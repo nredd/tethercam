@@ -17,10 +17,12 @@ tool) first, or opening fails with "the camera is in use by another program".
 
 ## Linux
 
-Opening a USB device needs write access to its `/dev/bus/usb` node. Install the udev rule
-[`70-tethercam.rules`](70-tethercam.rules), which grants it to the active local seat session
-through `uaccess` and to the `plugdev` group for Sony devices (vendor `054c`). Ensure the
-group exists before installing the rule:
+Opening a USB device needs write access to its `/dev/bus/usb` node. For foreground runs and
+`systemd --user` services, install the udev rule [`70-tethercam.rules`](70-tethercam.rules),
+which grants it to the active local seat session through `uaccess` and to the `plugdev` group
+for Sony devices (vendor `054c`). System-wide service installs manage
+`/etc/udev/rules.d/70-tethercam.rules` themselves: do not overwrite it; see
+[`service.md`](service.md). Ensure the group exists before installing the manual rule:
 
 ```
 sudo groupadd -f plugdev
