@@ -182,10 +182,12 @@ clients reconnect. A client that stored the old address (for example a recorder 
 keeps using it until it rediscovers or re-reads `GetStreamUri`. `Hello` helps only clients that
 listen for it.
 
-WS-Discovery infers the arrival interface from the sender's subnet, rather than receiving the
-interface from the socket. With overlapping subnets it chooses the most specific match; equal
-prefixes select the first configured interface. The advertised `XAddrs` can therefore point to
-the wrong interface on such networks.
+WS-Discovery infers the arrival interface from the sender's subnet instead of using `IP_PKTINFO`,
+which would require `unsafe`. It chooses the most specific matching prefix; equal prefixes select
+the first served interface. A scoped IPv6 sender matches only its scope's interface. On a
+multi-homed host with overlapping subnets, a reply's advertised `XAddrs` can point to the wrong
+interface. Set `interface` to the intended interface or `onvif_address` to its specific address;
+this restricts discovery, and a specific `onvif_address` also binds the ONVIF TCP listener.
 
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG

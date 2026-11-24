@@ -48,6 +48,10 @@ To gather evidence safely, follow the [duplicate rows evidence runbook](protect-
 Design expectations, not observed in the measured run:
 
 - Not discovered: subnet, VLAN, multicast, `onvif_address`; the camera is silent until ready
+- Wrong discovery address on a multi-homed host with overlapping subnets: discovery infers the
+  arrival interface from the sender's subnet and can advertise the wrong `XAddrs`. Set `interface`
+  to the intended OS interface or `onvif_address` to its specific address. The latter also pins
+  the ONVIF TCP listener; see the [discovery configuration](../README.md#commands)
 - Credential rejected: re-read `camera.toml` privately; the installed service uses its own fixed
   config
 - Offline after a stretch: see the [network link loss](macos-quickstart.md#network-link-loss) note
