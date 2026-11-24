@@ -36,7 +36,9 @@ headless host or over SSH, add it to `plugdev` (replace `$USER` if running as an
 sudo usermod -aG plugdev "$USER"
 ```
 
-Start a new login session or run `newgrp plugdev` for the membership to take effect.
+For foreground runs, start a new login session or run `newgrp plugdev` for the membership to
+take effect; for a `systemd --user` service, restart the user manager or reboot so the service
+inherits the updated group.
 Replug the camera afterwards. Without the rule opening fails with "permission denied opening
 the camera; see docs/usb.md". If a kernel driver holds the interface it is detached when the
 interface is claimed.
