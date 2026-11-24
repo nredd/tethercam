@@ -74,7 +74,12 @@ USB-PD support alone does not establish that the camera receives sufficient powe
 ## Service
 
 See [`service.md`](service.md) before installing: installation starts the service and can open
-the camera. Stop the foreground process first.
+the camera. Stop the foreground process first. The system service uses
+`/var/lib/tethercam/config.toml`; the user service uses `~/.config/tethercam/config.toml`.
+Neither uses `./camera.toml`. Prepare the fixed path or move an existing protected config there
+while stopped to preserve credentials and identity. For system migration, follow the ownership
+requirements in [`service.md`](service.md). Carry over or reapply the intended listener addresses
+before installing: a fresh service config uses wildcard defaults.
 
 - System: install a durable binary under `/usr` or `/opt`; substitute its actual absolute path
   for `/usr/local/bin/tethercam` in the commands below. If you installed the manual
@@ -87,11 +92,5 @@ the camera. Stop the foreground process first.
   `tethercam service status --user`. A user bus is required; logout normally stops it unless an
   administrator enables lingering
 
-The system service uses `/var/lib/tethercam/config.toml`; the user service uses
-`~/.config/tethercam/config.toml`. Neither uses `./camera.toml`. Prepare the fixed path or move
-an existing protected config there while stopped to preserve credentials and identity. For a
-system migration, follow the ownership requirements in [`service.md`](service.md). Carry over
-or reapply the intended listener addresses before installing: a fresh service config uses wildcard
-defaults, and installation starts the service. See [`service.md`](service.md) for credential
-retrieval, uninstall and shutdown details.
+See [`service.md`](service.md) for credential retrieval, uninstall and shutdown details.
 Stopping waits for camera cleanup and may take indefinitely if a process wedges.
