@@ -24,7 +24,7 @@ single USB-C cable.
 Install a per-user macOS launchd agent or a Linux system/user systemd service with
 `tethercam service install` (`--user` for Linux's user manager). Installation starts the service.
 See [`docs/service.md`](docs/service.md) for privileges, standard paths, USB permissions, status,
-uninstall and graceful stop policy. New to a Mac? Start with the [macOS quickstart](docs/macos-quickstart.md), then [UniFi Protect](docs/unifi-protect.md) and [Home Assistant](docs/home-assistant.md).
+uninstall and graceful stop policy. Start with the [macOS quickstart](docs/macos-quickstart.md) or [Linux quickstart](docs/linux-quickstart.md), then [UniFi Protect](docs/unifi-protect.md) and [Home Assistant](docs/home-assistant.md).
 
 ## Supported hardware
 
@@ -37,7 +37,9 @@ Verified so far (one owner run, partial; limits in the [quickstart](docs/macos-q
 | --- | --- | --- | --- | --- |
 | a7 III (ILCE-7M3) | Mac mini, USB-C | `icc`, `main` e48ae46 | Adopted; online and recording as reported (not recorded-playback checked); moving playback confirmed. Duplicate rows open ([#112](https://github.com/nredd/tethercam/issues/112)) | ONVIF and Protect-imported: snapshot HTTP 200 (1024x680 JPEG). Frontend playback not verified |
 
-Protect and Home Assistant versions were not recorded. No other body or host is verified.
+Protect and Home Assistant versions were not recorded. A separate Linux USB run verified foreground
+status, snapshot and H.264 streaming on an a7 III, not Protect or Home Assistant adoption; see the
+[Linux quickstart](docs/linux-quickstart.md) for its limits. No other body is verified.
 
 Live-view resolution is set by the camera, not by this software. On the a7 III it is
 1024x680 at about 15 fps. Full resolution is available as stills, but only on request

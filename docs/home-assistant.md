@@ -1,7 +1,8 @@
 # Home Assistant
 
 Two paths were tried. Addresses are synthetic. Home Assistant's UI and integrations change
-between versions, so labels may differ. Start from the [macOS quickstart](macos-quickstart.md).
+between versions, so labels may differ. Start from the [macOS quickstart](macos-quickstart.md) or
+[Linux quickstart](linux-quickstart.md).
 
 ## Verified
 
@@ -28,6 +29,47 @@ expectations, not measured):
 
 Via Protect: set up the UniFi Protect integration against the console. The adopted camera appeared in the
 integration; the setup steps were not recorded.
+
+## Read-only REST status sensor
+
+Design guidance only: this recipe has not yet been verified on Home Assistant OS. Add it to
+`configuration.yaml`, substitute the tethercam host address, and store the generated credentials
+as `tethercam_username` and `tethercam_password` in Home Assistant's `secrets.yaml`. Protect both
+files. The example address is synthetic. HTTP Digest authenticates but does not encrypt traffic;
+use a trusted network.
+
+```yaml
+rest:
+  - resource: http://192.0.2.10:8080/tethercam/status
+    authentication: digest
+    username: !secret tethercam_username
+    password: !secret tethercam_password
+    scan_interval: 30
+    sensor:
+      - name: Tethercam status
+        value_template: "{{ value_json.camera | default('unknown', true) }}"
+        json_attributes:
+          - battery_percent
+          - power
+          - uptime_secs
+          - frames_fetched
+          - frames_served
+          - frames_dropped
+          - reconnects
+          - session_restarts
+          - connect_misses
+          - snapshots_served
+          - snapshots_refused
+          - run_id
+```
+
+The sensor state is `waiting`, `ready` or `stopped`. Battery fields can be absent, including
+while waiting; `power` can be `battery`, `usb`, `no_battery` or `unknown`. When using an
+attribute in a template, guard missing or null values, for example
+`{{ state_attr('sensor.tethercam_status', 'battery_percent') | default(none, true) }}`;
+also check `has_value('sensor.tethercam_status')` before using a reading. A failed request can
+leave the entity unavailable; do not treat a missing reading as zero. Counters reset on process
+restart; `run_id` identifies the run. Definitions: [`service.md`](service.md#run-counters).
 
 ## Troubleshooting
 
