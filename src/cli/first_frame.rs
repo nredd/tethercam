@@ -182,8 +182,7 @@ impl FirstFrameCause {
         match error {
             IccError::Permission => Self::Permission,
             IccError::Busy | IccError::AdmissionExpired => Self::Busy,
-            IccError::DeadlineExceeded => Self::Timeout,
-            IccError::Removed | IccError::Disconnected => Self::Disconnected,
+            IccError::Removed => Self::Disconnected,
             IccError::CleanupFailure => Self::CleanupFailed,
             IccError::Quarantined => Self::Quarantined,
             other => Self::Native(other),

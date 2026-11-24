@@ -381,9 +381,12 @@ fn probe_reports_cleanup_failure_before_quarantine() {
         },
     );
     let (result, out) = probe_through(boundary, &LogCapture::new());
-    assert!(matches!(result, Err(Error::Quarantined)));
-    assert!(out.contains("camera session cleanup failed"), "{out}");
-    assert!(!out.contains("no first frame"));
+    let error = result.unwrap_err();
+    assert!(matches!(error, Error::QuarantinedProbe(_)));
+    assert!(error.to_string().contains("camera session cleanup failed"));
+    assert!(error.to_string().contains("quarantined"));
+    assert!(!error.to_string().contains("no first frame"));
+    assert_eq!(out, "");
 }
 
 #[test]
@@ -715,13 +718,13 @@ fn launch_terminates_with_the_restart_status_after_a_quarantine() {
         Some(SETTLE_LIMIT),
         record_termination,
     );
-    assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
+    assert!(
+        matches!(result, Err(Error::QuarantinedProbe(_))),
+        "{result:?}"
+    );
     assert_eq!(TERMINATED.load(Ordering::SeqCst), QUARANTINE_EXIT);
     let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    assert!(
-        text.contains("Error: native camera runtime quarantined"),
-        "{text}"
-    );
+    assert!(text.contains("native camera runtime quarantined"), "{text}");
     // The worker thread logged into the dispatcher it was handed, not the main thread's.
     assert!(logs.text().contains("icc_runtime_quarantined"));
 }

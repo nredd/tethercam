@@ -333,11 +333,10 @@ pub(super) async fn drive_until(
     };
     let result = command_until(factory, cfg, options, out, Box::pin(shutdown)).await;
     if *quarantined.borrow() {
-        if let Err(Error::Probe(cause)) = &result {
-            // Quarantine remains terminal even if operator output fails.
-            let _ = writeln!(out, "Error: {}", Error::Probe(*cause));
+        match result {
+            Err(Error::Probe(cause)) => Err(Error::QuarantinedProbe(cause)),
+            _ => Err(Error::Quarantined),
         }
-        Err(Error::Quarantined)
     } else {
         result
     }
@@ -520,7 +519,7 @@ fn launch_spawning<W: Write + Send + 'static>(
         };
         let mut out = lock_out(&out);
         let result = worker(handle, &plan, &mut *out);
-        if let Err(error @ Error::Quarantined) = &result {
+        if let Err(error @ (Error::Quarantined | Error::QuarantinedProbe(_))) = &result {
             // Best effort: the process is about to end and there is nowhere left to report to.
             let _ = writeln!(out, "Error: {error}");
             let _ = out.flush();

@@ -397,9 +397,15 @@ fn icc_categories_map_to_their_likely_cause() {
         (IccError::Permission, Cause::Permission),
         (IccError::Busy, Cause::Busy),
         (IccError::AdmissionExpired, Cause::Busy),
-        (IccError::DeadlineExceeded, Cause::Timeout),
+        (
+            IccError::DeadlineExceeded,
+            Cause::Native(IccError::DeadlineExceeded),
+        ),
         (IccError::Removed, Cause::Disconnected),
-        (IccError::Disconnected, Cause::Disconnected),
+        (
+            IccError::Disconnected,
+            Cause::Native(IccError::Disconnected),
+        ),
         (IccError::CleanupFailure, Cause::CleanupFailed),
         (IccError::Quarantined, Cause::Quarantined),
         (
