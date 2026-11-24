@@ -40,7 +40,7 @@ pub(super) fn check_host(cfg: &Config, now: i64) -> Result<(), Error> {
 pub(super) async fn probe<F: CameraFactory>(factory: F, out: &mut dyn Write) -> Result<(), Error> {
     let (protocol, capabilities, battery, _) = inspect(factory, SonyConfig::default(), false)
         .await?
-        .map_err(|_| Error::Camera)?;
+        .map_err(|failure| Error::Probe(FirstFrameCause::of(&failure.error, false)))?;
     report(out, protocol, &capabilities, battery)
 }
 

@@ -240,7 +240,10 @@ fn version_help_argument_and_output_failures() {
     let mut full: &mut [u8] = &mut [];
     assert!(execute(Options::parse([]), &mut full).is_err());
     assert!(execute(Options::parse(["--help".into()]), &mut full).is_err());
-    assert_eq!(finish(Err(Error::Camera), &mut full), ExitCode::FAILURE);
+    assert_eq!(
+        finish(Err(Error::Probe(FirstFrameCause::Timeout)), &mut full),
+        ExitCode::FAILURE
+    );
     assert!(execute(Err(ParseError::MissingPath), &mut out).is_err());
 }
 
@@ -440,7 +443,7 @@ async fn command_dispatch_and_sanitized_probe_failures() {
             .await
             .unwrap_err()
         ),
-        kind(&Error::Camera)
+        kind(&Error::Probe(FirstFrameCause::Timeout))
     );
     let mut full: &mut [u8] = &mut [];
     assert_eq!(
@@ -492,7 +495,7 @@ fn icc_is_rejected_before_any_camera_access_where_it_cannot_run() {
 }
 
 #[tokio::test]
-async fn doctor_names_the_cause_where_probe_stays_generic() {
+async fn doctor_and_probe_name_the_sanitized_cause() {
     use crate::cli::first_frame::FirstFrameCause;
     use crate::transport::sim::sony::{SonySimConfig, sony_camera};
     let cfg = free_cfg();
@@ -520,5 +523,10 @@ async fn doctor_names_the_cause_where_probe_stays_generic() {
     let error = diagnostics::probe(Factory::new(vec![body()]), &mut out)
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::Camera), "{error:?}");
+    assert!(
+        matches!(error, Error::Probe(FirstFrameCause::NotRemote)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("PC Remote"));
+    assert!(!error.to_string().contains("no first frame"));
 }

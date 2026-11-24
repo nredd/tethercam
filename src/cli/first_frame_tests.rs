@@ -198,6 +198,38 @@ async fn injected_transport_faults_name_timeout_and_disconnect() {
     assert_eq!(message(camera).await, Cause::Timeout.to_string());
 }
 
+#[tokio::test]
+async fn probe_reports_post_open_failures_without_frame_claims() {
+    let factory = Factory::new(vec![sony_camera(body())]);
+    let released = factory.released.clone();
+    diagnostics::probe(factory, &mut Vec::new()).await.unwrap();
+    let commands = released.lock().unwrap()[0].bulk_out_transfers().len();
+    let mut disconnected = sony_camera(body());
+    disconnected.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
+    let mut timeout = sony_camera(body());
+    timeout.inject(Endpoint::BulkIn, 3, Fault::Timeout);
+    let mut close = sony_camera(body());
+    close.inject(Endpoint::BulkOut, commands - 1, Fault::Disconnect);
+    for (camera, cause) in [
+        (disconnected, Cause::Disconnected),
+        (timeout, Cause::Timeout),
+        (close, Cause::Disconnected),
+        (
+            sony_camera(SonySimConfig {
+                defect: crate::transport::sim::sony::Defect::BadExtInfo,
+                ..body()
+            }),
+            Cause::Protocol,
+        ),
+    ] {
+        let error = diagnostics::probe(Factory::new(vec![camera]), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Probe(actual) if actual == cause));
+        assert!(!error.to_string().contains("no first frame"));
+    }
+}
+
 #[test]
 fn every_cause_is_actionable_and_free_of_identifiers() {
     let all = [
