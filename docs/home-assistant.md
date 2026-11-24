@@ -66,8 +66,9 @@ rest:
 The sensor state is `waiting`, `ready` or `stopped`. Battery fields can be absent, including
 while waiting; `power` can be `battery`, `usb`, `no_battery` or `unknown`. When using an
 attribute in a template, guard missing or null values, for example
-`{{ state_attr('sensor.tethercam_status', 'battery_percent') | default(none, true) }}`;
-also check `has_value('sensor.tethercam_status')` before using a reading. A failed request can
+`{% set battery = state_attr('sensor.tethercam_status', 'battery_percent') %}`;
+check `has_value('sensor.tethercam_status')` and `battery is not none` before using it, so a
+valid zero remains zero. A failed request can
 leave the entity unavailable; do not treat a missing reading as zero. Counters reset on process
 restart; `run_id` identifies the run. Definitions: [`service.md`](service.md#run-counters).
 

@@ -17,7 +17,7 @@ One Sony A7 III (ILCE-7M3), native Linux xHCI and the pure-Rust `nusb` backend:
 NOT yet verified on Linux:
 
 - UniFi Protect adoption and recorded timeline playback; Home Assistant OS live stream card
-- A 24-hour unattended `systemd` endurance soak or bus-power endurance
+- A 24-hour unattended `systemd` endurance soak or sustained bus-power endurance
 - Real-time H.264 throughput on an ARM SBC / Raspberry Pi; other bodies and hosts
 
 The steps below are guidance, not a claim that every configuration or service operation was
@@ -29,6 +29,21 @@ measured in that run.
 2. Connect a data-capable USB cable directly to the host. Only one program can hold the camera
 3. Other settings, including sleep and auto power-off, have not been established; investigate them
    if the camera disappears
+
+## Power
+
+On the Linux USB4 test host, the A7 III battery fell from 97% to 80% over about two hours,
+even while status reported `power: usb`. This is one observation, not an endurance test.
+`USB Power Supply = On` reduces drain; it does not guarantee battery-neutral operation.
+Sony's [A7 III guide](https://helpguide.sony.net/ilc/1720/v1/en/contents/TP0001653088.html)
+says the battery does not charge while the camera is on and can supplement external USB power.
+The A7 III is not listed among Sony's [USB-PD-compatible cameras](https://www.sony.com/electronics/support/articles/00301779).
+
+For unattended 24/7 A7 III use, consider a compatible NP-FZ100 DC coupler (dummy battery)
+with a suitable continuous power supply, and test the complete setup; this has not been
+verified here. Newer PD-capable bodies include the A7 IV, A7C II, ZV-E10 II, FX30 and A6700.
+Check the camera-facing connection, cable and power source against Sony's requirements: host
+USB-PD support alone does not establish that the camera receives sufficient power while tethered.
 
 ## Steps
 
@@ -57,15 +72,20 @@ measured in that run.
 See [`service.md`](service.md) before installing: installation starts the service and can open
 the camera. Stop the foreground process first.
 
-- System: install a durable binary under `/usr` or `/opt`, then run
-  `sudo /usr/local/bin/tethercam service install`. The installer manages its account and udev
-  rule. Replug after the rule is installed. Status: `sudo /usr/local/bin/tethercam service status`
+- System: install a durable binary under `/usr` or `/opt`. If you installed the manual
+  `plugdev` rule in step 2, first remove that manual rule from
+  `/etc/udev/rules.d/70-tethercam.rules` and reload udev. Never remove or overwrite a rule
+  already managed by the system service. Then run `sudo /usr/local/bin/tethercam service install`.
+  The installer manages its account and rule. Replug after installation. Status:
+  `sudo /usr/local/bin/tethercam service status`
 - User: after provisioning USB access, run `tethercam service install --user` and
   `tethercam service status --user`. A user bus is required; logout normally stops it unless an
   administrator enables lingering
 
 The system service uses `/var/lib/tethercam/config.toml`; the user service uses
 `~/.config/tethercam/config.toml`. Neither uses `./camera.toml`. Prepare the fixed path or move
-an existing protected config there while stopped to preserve credentials and identity; see
+an existing protected config there while stopped to preserve credentials and identity. For a
+system migration, stage the file as root-owned mode `0600` in the protected service directory;
+merely moving a user-owned file preserves its ownership and the installer rejects it. See
 [`service.md`](service.md) for ownership, credential retrieval, uninstall and shutdown details.
 Stopping waits for camera cleanup and may take indefinitely if a process wedges.
