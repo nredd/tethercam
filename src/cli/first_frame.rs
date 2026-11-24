@@ -92,6 +92,10 @@ pub enum FirstFrameCause {
         "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
     )]
     CloseFailed,
+    /// A sanitized native camera operation failure.
+    #[cfg(feature = "macos-icc")]
+    #[error("no first frame: native camera operation failed: {0}")]
+    Native(crate::transport::icc::IccError),
     /// The native runtime cannot be reused.
     #[error("no first frame: native camera runtime quarantined; restart the process")]
     Quarantined,
@@ -182,8 +186,7 @@ impl FirstFrameCause {
             IccError::Removed | IccError::Disconnected => Self::Disconnected,
             IccError::CleanupFailure => Self::CleanupFailed,
             IccError::Quarantined => Self::Quarantined,
-            IccError::MalformedCompletion => Self::Framing,
-            _ => Self::Unclassified,
+            other => Self::Native(other),
         }
     }
 }

@@ -393,8 +393,15 @@ fn icc_categories_map_to_their_likely_cause() {
         (IccError::Disconnected, Cause::Disconnected),
         (IccError::CleanupFailure, Cause::CleanupFailed),
         (IccError::Quarantined, Cause::Quarantined),
-        (IccError::MalformedCompletion, Cause::Framing),
-        (IccError::Runtime, Cause::Unclassified),
+        (
+            IccError::MalformedCompletion,
+            Cause::Native(IccError::MalformedCompletion),
+        ),
+        (
+            IccError::NativeFailure,
+            Cause::Native(IccError::NativeFailure),
+        ),
+        (IccError::Runtime, Cause::Native(IccError::Runtime)),
     ] {
         let error = SonyError::Session(SessionError::Icc(error));
         assert_eq!(Cause::of(&error, true), expected, "{error:?}");
