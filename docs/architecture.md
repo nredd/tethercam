@@ -29,6 +29,21 @@ One normal application process, Rust only. Optional verification APIs/tools do n
   on first run, never shipped as defaults
 - **For regular people.** `cargo install tethercam`, one setup command, adopt in Protect
 
+## 1.0 compatibility boundary
+
+Starting with 1.0.0, incompatible changes to the documented CLI commands and options, TOML
+configuration schema and defaults, ONVIF mounts, profile tokens and persisted endpoint identity,
+`/tethercam/status` JSON fields, and the default-feature public Rust exports require a major
+version. Compatible additions remain possible under SemVer; clients should tolerate additional
+JSON fields. Generated credentials and endpoint UUIDs remain persisted, not fixed defaults.
+
+The intentional Rust API consists of the public items reachable from `cli`, `config`, `media`,
+`onvif`, `ptp`, `rtp`, `rtsp`, `service`, `sony`, `supervisor`, and `transport` with default
+features. Private implementation modules are not part of that contract. The off-by-default
+`macos-icc`, `test-support`, and `repo-tools` features and their APIs, tools and behavior are
+experimental and may change incompatibly without a major release. Enabling them does not remove
+the compatibility guarantee for the default-feature API.
+
 ## Layers
 
 Bottom to top. Each is a module under `src/` and depends only on layers above it in this list.

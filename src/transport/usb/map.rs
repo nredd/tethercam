@@ -15,7 +15,7 @@ use super::port::PortError;
 
 /// Map a reported connection speed.
 #[must_use]
-pub fn speed(speed: Option<Speed>) -> BusSpeed {
+pub(super) fn speed(speed: Option<Speed>) -> BusSpeed {
     match speed {
         Some(Speed::Low) => BusSpeed::Low,
         Some(Speed::Full) => BusSpeed::Full,
@@ -28,7 +28,7 @@ pub fn speed(speed: Option<Speed>) -> BusSpeed {
 
 /// Map an `nusb` open, enumeration or claim error.
 #[must_use]
-pub fn usb_error(kind: ErrorKind, message: String) -> UsbError {
+pub(super) fn usb_error(kind: ErrorKind, message: String) -> UsbError {
     match kind {
         ErrorKind::Disconnected => UsbError::Disconnected,
         ErrorKind::Busy => UsbError::Busy,
@@ -39,7 +39,7 @@ pub fn usb_error(kind: ErrorKind, message: String) -> UsbError {
 
 /// Map an `nusb` error on an already-open device.
 #[must_use]
-pub fn port_error_from_kind(kind: ErrorKind, message: String) -> PortError {
+pub(super) fn port_error_from_kind(kind: ErrorKind, message: String) -> PortError {
     match kind {
         ErrorKind::Disconnected => PortError::Disconnected,
         _ => PortError::Other(message),
@@ -48,7 +48,7 @@ pub fn port_error_from_kind(kind: ErrorKind, message: String) -> PortError {
 
 /// Map a failed transfer.
 #[must_use]
-pub fn transfer_error(error: TransferError) -> PortError {
+pub(super) fn transfer_error(error: TransferError) -> PortError {
     match error {
         TransferError::Stall => PortError::Stall,
         TransferError::Disconnected => PortError::Disconnected,
@@ -62,7 +62,7 @@ pub fn transfer_error(error: TransferError) -> PortError {
 /// The count is what the device transferred, even when `destination` is smaller, so a caller
 /// can detect an oversized transfer.
 #[must_use]
-pub fn copy_received(destination: &mut [u8], received: &[u8]) -> usize {
+pub(super) fn copy_received(destination: &mut [u8], received: &[u8]) -> usize {
     for (slot, byte) in destination.iter_mut().zip(received) {
         *slot = *byte;
     }
