@@ -384,6 +384,15 @@ fn pipeline_failures_are_classified_by_stage() {
 #[test]
 fn icc_categories_map_to_their_likely_cause() {
     use crate::transport::icc::IccError;
+    let cause = Cause::Native(IccError::MalformedCompletion);
+    assert!(
+        Error::FirstFrame(cause)
+            .to_string()
+            .contains("malformed native completion")
+    );
+    let probe = Error::Probe(cause).to_string();
+    assert!(probe.contains("malformed native completion"));
+    assert!(!probe.contains("no first frame"));
     for (error, expected) in [
         (IccError::Permission, Cause::Permission),
         (IccError::Busy, Cause::Busy),

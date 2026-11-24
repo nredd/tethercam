@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-- Report sanitized session failure causes from `probe` instead of a generic camera error (#137)
+- Report sanitized session failure causes from `probe` instead of a generic camera error; `doctor` also identifies busy responses and native session failures more precisely (#137)
 
 - Create new configuration directories with owner-only permissions on Unix, allowing user service installation under `umask 0002` (#131)
 - Wire the ignored Sony live-view hardware soak to USB, skipping when hardware is not selected or no usable camera is attached (#132)
