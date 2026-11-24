@@ -11,6 +11,7 @@ use std::os::unix::{
 };
 
 fn files(temp: &tempfile::TempDir) -> files::Files {
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     files::Files::new(temp.path().into(), fs::metadata(temp.path()).unwrap().uid())
 }
 

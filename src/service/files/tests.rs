@@ -10,6 +10,7 @@ fn failure() -> io::Error {
 }
 fn fixture() -> (tempfile::TempDir, Files) {
     let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let uid = fs::metadata(temp.path()).unwrap().uid();
     let files = Files::new(temp.path().into(), uid);
     (temp, files)

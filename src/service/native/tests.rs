@@ -77,6 +77,7 @@ impl Script {
 
 fn fixture(platform: Platform, user: bool) -> (tempfile::TempDir, Plan, Files) {
     let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let uid = fs::metadata(temp.path()).unwrap().uid();
     let plan = Plan::new(
         platform,
@@ -1147,6 +1148,7 @@ impl Manager {
 #[test]
 fn public_manager_and_status_output() {
     let temp = tempfile::tempdir().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         Manager::test_status(temp.path().into(), false)
             .manage(Action::Status)

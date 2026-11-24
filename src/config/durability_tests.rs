@@ -207,6 +207,23 @@ fn permission_metadata_failure_is_propagated() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn new_directories_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("new");
+    let child = parent.join("nested");
+    create_directories(&child, &mut sync_directory).unwrap();
+    for path in [&parent, &child] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+}
+
 #[test]
 fn directory_created_by_competitor_is_synced() {
     let temp = tempfile::tempdir().unwrap();
