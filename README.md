@@ -87,7 +87,7 @@ tethercam run --config ./camera.toml
 identity, or loads the existing file without replacing it. It explicitly prints credentials to
 the operator, so keep its output private. Without `--config`, the platform configuration directory
 is used. `probe` lists candidate USB modes and reports the selected body's remote-control capabilities
-and battery/USB power. `camera_serial` in the configuration selects an exact device; otherwise
+and battery/USB power. Session failures are reported as sanitized causes without camera responses or identifiers. `camera_serial` in the configuration selects an exact device; otherwise
 the first usable camera is chosen. `camera_backend = "icc"` (default `"usb"`, no fallback) selects the
 experimental macOS `ImageCaptureCore` backend instead, see below. `tethercam cameras --config ./camera.toml`
 lists what the backend can see so one can be chosen (`camera_id` for `icc`, `camera_serial` for USB). USB serials and OS bus paths are not printed. `doctor` checks file

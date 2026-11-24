@@ -77,9 +77,9 @@ pub enum Error {
     /// A sanitized USB enumeration/opening failure.
     #[error(transparent)]
     Open(#[from] crate::supervisor::OpenError),
-    /// A selected camera cannot be opened or driven.
-    #[error("camera unavailable; check USB permissions and PC Remote mode")]
-    Camera,
+    /// A sanitized failure while inspecting the camera session.
+    #[error("camera probe failed: {}", .0.to_string().trim_start_matches("no first frame: "))]
+    Probe(FirstFrameCause),
     /// `doctor` got no first live-view frame; the category names the likely cause.
     #[error(transparent)]
     FirstFrame(#[from] FirstFrameCause),
@@ -105,6 +105,9 @@ pub enum Error {
     /// The one native runtime is quarantined for the life of the process.
     #[error("native camera runtime quarantined; it cannot be reused, restart the process")]
     Quarantined,
+    /// Probe failed and quarantined the native camera runtime.
+    #[error("{}; native camera runtime quarantined; restart the process", Error::Probe(*.0))]
+    QuarantinedProbe(FirstFrameCause),
     /// The simulator input is not a supported JPEG.
     #[error("simulator JPEG rejected")]
     Simulator,

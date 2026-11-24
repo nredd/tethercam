@@ -198,6 +198,38 @@ async fn injected_transport_faults_name_timeout_and_disconnect() {
     assert_eq!(message(camera).await, Cause::Timeout.to_string());
 }
 
+#[tokio::test]
+async fn probe_reports_post_open_failures_without_frame_claims() {
+    let factory = Factory::new(vec![sony_camera(body())]);
+    let released = factory.released.clone();
+    diagnostics::probe(factory, &mut Vec::new()).await.unwrap();
+    let commands = released.lock().unwrap()[0].bulk_out_transfers().len();
+    let mut disconnected = sony_camera(body());
+    disconnected.inject(Endpoint::BulkOut, 0, Fault::Disconnect);
+    let mut timeout = sony_camera(body());
+    timeout.inject(Endpoint::BulkIn, 3, Fault::Timeout);
+    let mut close = sony_camera(body());
+    close.inject(Endpoint::BulkOut, commands - 1, Fault::Disconnect);
+    for (camera, cause) in [
+        (disconnected, Cause::Disconnected),
+        (timeout, Cause::Timeout),
+        (close, Cause::Disconnected),
+        (
+            sony_camera(SonySimConfig {
+                defect: crate::transport::sim::sony::Defect::BadExtInfo,
+                ..body()
+            }),
+            Cause::Protocol,
+        ),
+    ] {
+        let error = diagnostics::probe(Factory::new(vec![camera]), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Probe(actual) if actual == cause));
+        assert!(!error.to_string().contains("no first frame"));
+    }
+}
+
 #[test]
 fn every_cause_is_actionable_and_free_of_identifiers() {
     let all = [
@@ -208,6 +240,8 @@ fn every_cause_is_actionable_and_free_of_identifiers() {
         Cause::NoFrame,
         Cause::Timeout,
         Cause::Disconnected,
+        Cause::CleanupFailed,
+        Cause::Quarantined,
         Cause::Transport,
         Cause::Busy,
         Cause::Permission,
@@ -300,6 +334,13 @@ fn classification_covers_every_driver_error_family() {
             }),
             Cause::Rejected,
         ),
+        (
+            session(SessionError::Response {
+                code: crate::ptp::session::code::DEVICE_BUSY,
+                params: Vec::new(),
+            }),
+            Cause::Busy,
+        ),
         (session(SessionError::NotOpen), Cause::Unclassified),
         (
             SonyError::UnknownProperty(crate::ptp::DevicePropCode(0xD21C)),
@@ -343,14 +384,48 @@ fn pipeline_failures_are_classified_by_stage() {
 #[test]
 fn icc_categories_map_to_their_likely_cause() {
     use crate::transport::icc::IccError;
+    let cause = Cause::Native(IccError::MalformedCompletion);
+    assert!(
+        Error::FirstFrame(cause)
+            .to_string()
+            .contains("malformed native completion")
+    );
+    let probe = Error::Probe(cause).to_string();
+    assert!(probe.contains("malformed native completion"));
+    assert!(!probe.contains("no first frame"));
+    for cause in [Cause::Busy, Cause::NativeDeadline] {
+        for message in [
+            Error::FirstFrame(cause).to_string(),
+            Error::Probe(cause).to_string(),
+        ] {
+            assert!(message.contains("retry"), "{message}");
+        }
+    }
+    let deadline = Error::Probe(Cause::NativeDeadline).to_string();
+    for guidance in ["still finishing", "wait for cleanup", "cable", "power"] {
+        assert!(deadline.contains(guidance), "{deadline}");
+    }
     for (error, expected) in [
         (IccError::Permission, Cause::Permission),
         (IccError::Busy, Cause::Busy),
         (IccError::AdmissionExpired, Cause::Busy),
-        (IccError::DeadlineExceeded, Cause::Timeout),
+        (IccError::DeadlineExceeded, Cause::NativeDeadline),
         (IccError::Removed, Cause::Disconnected),
-        (IccError::Disconnected, Cause::Disconnected),
-        (IccError::Runtime, Cause::Unclassified),
+        (
+            IccError::Disconnected,
+            Cause::Native(IccError::Disconnected),
+        ),
+        (IccError::CleanupFailure, Cause::CleanupFailed),
+        (IccError::Quarantined, Cause::Quarantined),
+        (
+            IccError::MalformedCompletion,
+            Cause::Native(IccError::MalformedCompletion),
+        ),
+        (
+            IccError::NativeFailure,
+            Cause::Native(IccError::NativeFailure),
+        ),
+        (IccError::Runtime, Cause::Native(IccError::Runtime)),
     ] {
         let error = SonyError::Session(SessionError::Icc(error));
         assert_eq!(Cause::of(&error, true), expected, "{error:?}");

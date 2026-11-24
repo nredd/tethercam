@@ -1,4 +1,4 @@
-//! Likely cause of a `doctor` run that never gets a first live-view frame.
+//! Sanitized camera session and first-frame failure categories for `probe` and `doctor`.
 //!
 //! Each cause is a fixed category chosen from the typed driver error and the stage it happened
 //! in. Nothing the camera or the OS said is interpolated: no response codes, device strings,
@@ -20,7 +20,7 @@ use crate::transport::TransportError;
 #[path = "first_frame_tests.rs"]
 mod tests;
 
-/// Why the first frame never arrived, as far as the failure can tell.
+/// A sanitized session or first-frame failure category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FirstFrameCause {
     /// The body did not advertise the Sony remote-control extension.
@@ -92,6 +92,22 @@ pub enum FirstFrameCause {
         "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
     )]
     CloseFailed,
+    /// Native work exceeded its deadline and remains in progress.
+    #[cfg(feature = "macos-icc")]
+    #[error(
+        "no first frame: native camera work exceeded its deadline and is still finishing; wait for cleanup, check the cable and camera power, then retry"
+    )]
+    NativeDeadline,
+    /// A sanitized native camera operation failure.
+    #[cfg(feature = "macos-icc")]
+    #[error("no first frame: native camera operation failed: {0}")]
+    Native(crate::transport::icc::IccError),
+    /// The native runtime cannot be reused.
+    #[error("no first frame: native camera runtime quarantined; restart the process")]
+    Quarantined,
+    /// Native session cleanup failed.
+    #[error("no first frame: camera session cleanup failed; restart the process and retry")]
+    CleanupFailed,
     /// The USB data was malformed or out of sequence.
     #[error(
         "no first frame: the camera's USB data was malformed or out of sequence, cause unestablished (cable, port or an unsupported body); retry with another cable or port and report it if it repeats"
@@ -141,6 +157,11 @@ impl FirstFrameCause {
                 Self::transport(error)
             }
             SessionError::DeadlineExceeded(_) | SessionError::TooManyEmptyReads => Self::Timeout,
+            SessionError::Response { code, .. }
+                if *code == crate::ptp::session::code::DEVICE_BUSY =>
+            {
+                Self::Busy
+            }
             SessionError::Response { .. } => Self::Rejected,
             SessionError::Container(_)
             | SessionError::UnexpectedContainer { .. }
@@ -167,9 +188,11 @@ impl FirstFrameCause {
         match error {
             IccError::Permission => Self::Permission,
             IccError::Busy | IccError::AdmissionExpired => Self::Busy,
-            IccError::DeadlineExceeded => Self::Timeout,
-            IccError::Removed | IccError::Disconnected => Self::Disconnected,
-            _ => Self::Unclassified,
+            IccError::DeadlineExceeded => Self::NativeDeadline,
+            IccError::Removed => Self::Disconnected,
+            IccError::CleanupFailure => Self::CleanupFailed,
+            IccError::Quarantined => Self::Quarantined,
+            other => Self::Native(other),
         }
     }
 }
