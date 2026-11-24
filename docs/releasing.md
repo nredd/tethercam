@@ -5,8 +5,10 @@ including its experimental ICC exceptions.
 
 The tag-only `Release` workflow publishes to crates.io with
 [trusted publishing](https://crates.io/docs/trusted-publishing), then publishes a GitHub
-immutable release containing the verified source `.crate` archive. No registry token secret
-or personal access token belongs in GitHub. There are no prebuilt platform binaries yet.
+immutable release containing the verified source `.crate` archive, an `x86_64-unknown-linux-gnu`
+binary tarball and `SHA256SUMS`. No registry token secret or personal access token belongs in GitHub.
+Download all three assets into one directory and run `sha256sum -c SHA256SUMS` before extracting
+the binary. The binary is dynamically linked and requires a compatible Linux GNU runtime.
 
 The native `tethercam-tools` release-tag and disposable-CI USB/IP commands use the
 `repo-tools` feature, which enables `test-support`. These off-by-default verification tools are
@@ -92,13 +94,15 @@ its existing restrictions; see [branch-ruleset.md](branch-ruleset.md).
    exact protected-main commit. Tags cannot be moved or deleted; mistakes need a new version.
 3. `gate` checks ancestry in protected `main`, validates tag/version with the native Rust helper,
    provisions the synthetic USB/IP fixture on the disposable Linux runner, runs `make all cross`,
-   detaches the fixture even after failure, and verifies Cargo packaging and publication dry-run.
+   verifies Cargo packaging and publication dry-run, builds the release binary, extracts and smoke-tests
+   the versioned tarball, and generates and verifies checksums for both archives. It detaches the
+   fixture even after failure and uploads the verified assets from the gated SHA.
    Privileged CI fixture setup never runs in publication jobs or on a maintainer's host.
    Both jobs install the compiler pinned in `rust-toolchain.toml`, the same one CI uses.
 4. `publish` waits for environment admission, checks out the same SHA, downloads the gate's
    same-run archive, repeats package verification, compares its bytes, authenticates via OIDC,
    and executes `cargo publish --locked`. It never overwrites or silently skips a registry version.
-5. `github-release` waits for environment admission, downloads that same-run archive, creates a
+5. `github-release` waits for environment admission, downloads those same-run assets, creates a
    **draft with all assets**, then publishes it. There is no post-publication asset upload.
    Native `gh` fails if a draft/release already exists; nothing is clobbered. Global release
    concurrency queues runs rather than cancelling a partially published run.
