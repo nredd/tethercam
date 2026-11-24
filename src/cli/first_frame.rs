@@ -92,6 +92,9 @@ pub enum FirstFrameCause {
         "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
     )]
     CloseFailed,
+    /// Native session cleanup failed.
+    #[error("no first frame: camera session cleanup failed; restart the process and retry")]
+    CleanupFailed,
     /// The USB data was malformed or out of sequence.
     #[error(
         "no first frame: the camera's USB data was malformed or out of sequence, cause unestablished (cable, port or an unsupported body); retry with another cable or port and report it if it repeats"
@@ -169,6 +172,7 @@ impl FirstFrameCause {
             IccError::Busy | IccError::AdmissionExpired => Self::Busy,
             IccError::DeadlineExceeded => Self::Timeout,
             IccError::Removed | IccError::Disconnected => Self::Disconnected,
+            IccError::CleanupFailure => Self::CleanupFailed,
             _ => Self::Unclassified,
         }
     }

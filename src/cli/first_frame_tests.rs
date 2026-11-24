@@ -240,6 +240,7 @@ fn every_cause_is_actionable_and_free_of_identifiers() {
         Cause::NoFrame,
         Cause::Timeout,
         Cause::Disconnected,
+        Cause::CleanupFailed,
         Cause::Transport,
         Cause::Busy,
         Cause::Permission,
@@ -382,6 +383,7 @@ fn icc_categories_map_to_their_likely_cause() {
         (IccError::DeadlineExceeded, Cause::Timeout),
         (IccError::Removed, Cause::Disconnected),
         (IccError::Disconnected, Cause::Disconnected),
+        (IccError::CleanupFailure, Cause::CleanupFailed),
         (IccError::Runtime, Cause::Unclassified),
     ] {
         let error = SonyError::Session(SessionError::Icc(error));
