@@ -7,6 +7,7 @@ build:  ## Build the project
 	cargo build --all-features
 
 test:  ## Run tests (nextest + doctests)
+	cargo test --test public_api
 	cargo nextest run --all-features
 	cargo test --doc --all-features
 

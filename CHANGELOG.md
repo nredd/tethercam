@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows
 
 - Report sanitized session failure causes from `probe` instead of a generic camera error; `doctor` also identifies busy responses and native session failures more precisely, with retry and cleanup guidance for ICC deadlines (#137)
 - Document the WS-Discovery arrival-interface limitation and configuration for overlapping subnets (Refs #33)
+- Document the 1.0 compatibility boundary and make the internal USB mapping module private (#139)
 
 - Create new configuration directories with owner-only permissions on Unix, allowing user service installation under `umask 0002` (#131)
 - Wire the ignored Sony live-view hardware soak to USB, skipping when hardware is not selected or no usable camera is attached (#132)
