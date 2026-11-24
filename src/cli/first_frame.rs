@@ -92,6 +92,12 @@ pub enum FirstFrameCause {
         "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
     )]
     CloseFailed,
+    /// Native work exceeded its deadline and remains in progress.
+    #[cfg(feature = "macos-icc")]
+    #[error(
+        "no first frame: native camera work exceeded its deadline and is still finishing; wait for cleanup, check the cable and camera power, then retry"
+    )]
+    NativeDeadline,
     /// A sanitized native camera operation failure.
     #[cfg(feature = "macos-icc")]
     #[error("no first frame: native camera operation failed: {0}")]
@@ -181,7 +187,8 @@ impl FirstFrameCause {
         use crate::transport::icc::IccError;
         match error {
             IccError::Permission => Self::Permission,
-            IccError::Busy => Self::Busy,
+            IccError::Busy | IccError::AdmissionExpired => Self::Busy,
+            IccError::DeadlineExceeded => Self::NativeDeadline,
             IccError::Removed => Self::Disconnected,
             IccError::CleanupFailure => Self::CleanupFailed,
             IccError::Quarantined => Self::Quarantined,

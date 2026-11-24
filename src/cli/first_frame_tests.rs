@@ -393,17 +393,23 @@ fn icc_categories_map_to_their_likely_cause() {
     let probe = Error::Probe(cause).to_string();
     assert!(probe.contains("malformed native completion"));
     assert!(!probe.contains("no first frame"));
+    for cause in [Cause::Busy, Cause::NativeDeadline] {
+        for message in [
+            Error::FirstFrame(cause).to_string(),
+            Error::Probe(cause).to_string(),
+        ] {
+            assert!(message.contains("retry"), "{message}");
+        }
+    }
+    let deadline = Error::Probe(Cause::NativeDeadline).to_string();
+    for guidance in ["still finishing", "wait for cleanup", "cable", "power"] {
+        assert!(deadline.contains(guidance), "{deadline}");
+    }
     for (error, expected) in [
         (IccError::Permission, Cause::Permission),
         (IccError::Busy, Cause::Busy),
-        (
-            IccError::AdmissionExpired,
-            Cause::Native(IccError::AdmissionExpired),
-        ),
-        (
-            IccError::DeadlineExceeded,
-            Cause::Native(IccError::DeadlineExceeded),
-        ),
+        (IccError::AdmissionExpired, Cause::Busy),
+        (IccError::DeadlineExceeded, Cause::NativeDeadline),
         (IccError::Removed, Cause::Disconnected),
         (
             IccError::Disconnected,
