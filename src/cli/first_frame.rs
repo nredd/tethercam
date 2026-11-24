@@ -92,6 +92,9 @@ pub enum FirstFrameCause {
         "frame received and valid, but closing the camera session failed; cause unestablished, retry and reseat the cable or power-cycle the camera if it repeats"
     )]
     CloseFailed,
+    /// The native runtime cannot be reused.
+    #[error("no first frame: native camera runtime quarantined; restart the process")]
+    Quarantined,
     /// Native session cleanup failed.
     #[error("no first frame: camera session cleanup failed; restart the process and retry")]
     CleanupFailed,
@@ -144,6 +147,11 @@ impl FirstFrameCause {
                 Self::transport(error)
             }
             SessionError::DeadlineExceeded(_) | SessionError::TooManyEmptyReads => Self::Timeout,
+            SessionError::Response { code, .. }
+                if *code == crate::ptp::session::code::DEVICE_BUSY =>
+            {
+                Self::Busy
+            }
             SessionError::Response { .. } => Self::Rejected,
             SessionError::Container(_)
             | SessionError::UnexpectedContainer { .. }
@@ -173,6 +181,8 @@ impl FirstFrameCause {
             IccError::DeadlineExceeded => Self::Timeout,
             IccError::Removed | IccError::Disconnected => Self::Disconnected,
             IccError::CleanupFailure => Self::CleanupFailed,
+            IccError::Quarantined => Self::Quarantined,
+            IccError::MalformedCompletion => Self::Framing,
             _ => Self::Unclassified,
         }
     }
