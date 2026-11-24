@@ -333,6 +333,10 @@ pub(super) async fn drive_until(
     };
     let result = command_until(factory, cfg, options, out, Box::pin(shutdown)).await;
     if *quarantined.borrow() {
+        if let Err(Error::Probe(cause)) = &result {
+            // Quarantine remains terminal even if operator output fails.
+            let _ = writeln!(out, "Error: {}", Error::Probe(*cause));
+        }
         Err(Error::Quarantined)
     } else {
         result

@@ -372,6 +372,21 @@ fn probe_through(boundary: SimBoundary, logs: &LogCapture) -> (Result<(), Error>
 }
 
 #[test]
+fn probe_reports_cleanup_failure_before_quarantine() {
+    let boundary = SimBoundary::with_faults(
+        camera(),
+        SimFaults {
+            close: Some(IccError::CleanupFailure),
+            ..SimFaults::default()
+        },
+    );
+    let (result, out) = probe_through(boundary, &LogCapture::new());
+    assert!(matches!(result, Err(Error::Quarantined)));
+    assert!(out.contains("camera session cleanup failed"), "{out}");
+    assert!(!out.contains("no first frame"));
+}
+
+#[test]
 fn probe_runs_the_production_stack_over_the_boundary() {
     let (result, out) = probe_through(SimBoundary::new(camera()), &LogCapture::new());
     result.unwrap();
