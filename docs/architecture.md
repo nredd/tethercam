@@ -42,7 +42,11 @@ The intentional Rust API consists of the public items reachable from `cli`, `con
 features. Private implementation modules are not part of that contract. The off-by-default
 `macos-icc`, `test-support`, and `repo-tools` features and their APIs, tools and behavior are
 experimental and may change incompatibly without a major release. Enabling them does not remove
-the compatibility guarantee for the default-feature API.
+the compatibility guarantee for the default-feature API. The ICC-facing configuration syntax
+`camera_backend = "icc"` and `camera_id`, the `CameraBackend::Icc` variant, and the
+`tethercam cameras --describe` option are exceptions even though they appear in default builds:
+their syntax, types and behavior are experimental and may change incompatibly before ICC is
+promoted to a stable feature. All other default-feature guarantees remain in force.
 
 ## Layers
 

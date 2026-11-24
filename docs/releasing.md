@@ -1,5 +1,8 @@
 # Releasing
 
+Release versioning follows the [1.0 compatibility boundary](architecture.md#10-compatibility-boundary),
+including its experimental ICC exceptions.
+
 The tag-only `Release` workflow publishes to crates.io with
 [trusted publishing](https://crates.io/docs/trusted-publishing), then publishes a GitHub
 immutable release containing the verified source `.crate` archive. No registry token secret

@@ -13,6 +13,12 @@
 //! - [`nusb_backend`]: the real [`Bus`] and [`Port`]; one-line delegations to `nusb` over the
 //!   private pure mappings
 //!
+//! The backend mapping module is private to this crate:
+//!
+//! ```compile_fail
+//! use tethercam::transport::usb::map;
+//! ```
+//!
 //! Setup: see `docs/usb.md` for the Linux udev rule and macOS notes.
 //!
 //! References:
