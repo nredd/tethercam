@@ -186,8 +186,11 @@ WS-Discovery infers the arrival interface from the sender's subnet instead of us
 which would require `unsafe`. It chooses the most specific matching prefix; equal prefixes select
 the first served interface. A scoped IPv6 sender matches only its scope's interface. On a
 multi-homed host with overlapping subnets, a reply's advertised `XAddrs` can point to the wrong
-interface. Set `interface` to the intended interface or `onvif_address` to its specific address;
-this restricts discovery, and a specific `onvif_address` also binds the ONVIF TCP listener.
+interface. Set `interface` to the intended interface to restrict discovery. For IPv6 link-local
+clients, keep `onvif_address = "::"` and ensure that interface also has a non-link-local IPv6
+address to advertise. Pinning any specific IPv6 `onvif_address` prevents discovery from link-local
+IPv6 clients: the link-local entry is excluded, or has no advertisable address if pinned itself.
+A specific `onvif_address` also binds the ONVIF TCP listener.
 
 `--simulate JPEG` never enumerates USB. The example generates a synthetic 1024x680 JPEG, refuses
 to overwrite an existing file, and starts no listener. In this CLI simulator the same input JPEG
