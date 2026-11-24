@@ -1,4 +1,4 @@
-//! Likely cause of a `doctor` run that never gets a first live-view frame.
+//! Sanitized camera session and first-frame failure categories for `probe` and `doctor`.
 //!
 //! Each cause is a fixed category chosen from the typed driver error and the stage it happened
 //! in. Nothing the camera or the OS said is interpolated: no response codes, device strings,
@@ -20,7 +20,7 @@ use crate::transport::TransportError;
 #[path = "first_frame_tests.rs"]
 mod tests;
 
-/// Why the first frame never arrived, as far as the failure can tell.
+/// A sanitized session or first-frame failure category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FirstFrameCause {
     /// The body did not advertise the Sony remote-control extension.
@@ -181,7 +181,7 @@ impl FirstFrameCause {
         use crate::transport::icc::IccError;
         match error {
             IccError::Permission => Self::Permission,
-            IccError::Busy | IccError::AdmissionExpired => Self::Busy,
+            IccError::Busy => Self::Busy,
             IccError::Removed => Self::Disconnected,
             IccError::CleanupFailure => Self::CleanupFailed,
             IccError::Quarantined => Self::Quarantined,

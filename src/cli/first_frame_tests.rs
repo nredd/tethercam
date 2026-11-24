@@ -396,7 +396,10 @@ fn icc_categories_map_to_their_likely_cause() {
     for (error, expected) in [
         (IccError::Permission, Cause::Permission),
         (IccError::Busy, Cause::Busy),
-        (IccError::AdmissionExpired, Cause::Busy),
+        (
+            IccError::AdmissionExpired,
+            Cause::Native(IccError::AdmissionExpired),
+        ),
         (
             IccError::DeadlineExceeded,
             Cause::Native(IccError::DeadlineExceeded),

@@ -725,6 +725,7 @@ fn launch_terminates_with_the_restart_status_after_a_quarantine() {
     assert_eq!(TERMINATED.load(Ordering::SeqCst), QUARANTINE_EXIT);
     let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(text.contains("native camera runtime quarantined"), "{text}");
+    assert!(text.contains("camera session cleanup failed"), "{text}");
     // The worker thread logged into the dispatcher it was handed, not the main thread's.
     assert!(logs.text().contains("icc_runtime_quarantined"));
 }
