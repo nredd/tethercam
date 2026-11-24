@@ -162,7 +162,7 @@ fn validate(policy: &Value, workflows: &Workflows) -> Result<(), String> {
     )
 }
 
-const RELEASE_ASSETS: &str = r#"set -eu
+const RELEASE_ASSETS: &str = r#"set -euo pipefail
 version="${TAG#v}"
 assets="$RUNNER_TEMP/release-assets"
 smoke="$(mktemp -d)"
@@ -310,25 +310,35 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
         })
         .ok_or("missing asset upload")?;
     require(assets < upload, "assets must be verified before upload")?;
-    require(
-        gate.iter().any(|step| {
+    let cleanup = gate
+        .iter()
+        .position(|step| {
             step["run"] == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
                 && step["if"] == "always()"
-        }),
-        "synthetic fixture cleanup must always run",
+        })
+        .ok_or("missing unconditional cleanup")?;
+    require(
+        cleanup > assets,
+        "cleanup must follow fixture provisioning and verification",
     )?;
     for job in jobs.values() {
         let steps = job["steps"].as_array().ok_or("missing steps")?;
-        require(
-            steps.iter().any(|step| {
+        let checkouts: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
                 step["uses"]
                     .as_str()
                     .is_some_and(|uses| uses.starts_with("actions/checkout@"))
-                    && step["with"]["ref"] == "${{ github.sha }}"
-                    && step["with"]["persist-credentials"] == false
-                    && step.get("if").is_none()
-            }),
-            "checkout must use the gated SHA without credentials",
+            })
+            .collect();
+        require(
+            checkouts.len() == 1
+                && checkouts[0].0 == 0
+                && checkouts[0].1["with"]["ref"] == "${{ github.sha }}"
+                && checkouts[0].1["with"]["persist-credentials"] == false
+                && checkouts[0].1.get("if").is_none(),
+            "exactly one checkout must use the gated SHA without credentials before all other steps",
         )?;
     }
     for job in ["publish", "github-release"] {
@@ -452,6 +462,23 @@ fn weakened_release_boundaries_and_reordered_staging_fail() -> Result<(), Box<dy
         }
         assert!(validate_release(&workflow).is_err(), "accepted {mutation}");
     }
+    let mut workflow = original.clone();
+    let steps = workflow["jobs"]["gate"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?;
+    steps.push(steps[0].clone());
+    assert!(validate_release(&workflow).is_err());
+    let mut workflow = original.clone();
+    let steps = workflow["jobs"]["gate"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?;
+    let cleanup = steps
+        .iter()
+        .position(|step| step["if"] == "always()")
+        .ok_or("cleanup")?;
+    let step = steps.remove(cleanup);
+    steps.insert(1, step);
+    assert!(validate_release(&workflow).is_err());
     let mut workflow = original;
     let steps = workflow["jobs"]["github-release"]["steps"]
         .as_array_mut()

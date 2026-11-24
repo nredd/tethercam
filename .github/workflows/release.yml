@@ -50,7 +50,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          set -eu
+          set -euo pipefail
           version="${TAG#v}"
           assets="$RUNNER_TEMP/release-assets"
           smoke="$(mktemp -d)"
