@@ -47,7 +47,8 @@ USB-PD support alone does not establish that the camera receives sufficient powe
 
 ## Steps
 
-1. Install `tethercam` as described in the [README](../README.md#install)
+1. Install from source as described in the [README](../README.md#install). The published
+   0.0.1 release does not include the commands and status endpoint used here
 2. Provision USB access for the foreground user: follow [`usb.md`](usb.md#linux) for the
    `70-tethercam.rules` rule, `plugdev` on headless hosts, login renewal and replug. Do not
    overwrite the system-service-managed rule; see [`service.md`](service.md)
@@ -59,8 +60,9 @@ USB-PD support alone does not establish that the camera receives sufficient powe
    then run `tethercam run --config ./camera.toml`. Use HTTP Digest credentials to read
    `/tethercam/status` on port 8080 and `/onvif/snapshot/main`; use a player's authentication
    prompt for `/live/main` on RTSP port 8554. Do not put credentials in URLs. `waiting` means
-   the first frame is not ready; read `camera_open_failed` in the log. Stop with SIGTERM or
-   Ctrl-C and wait for cleanup before running `probe` again
+   the first frame is not ready; check the log for `camera_open_failed` or `camera_disconnected`.
+   An absent camera need not log an open error. Stop with SIGTERM or Ctrl-C and wait for cleanup
+   before running `probe` or `doctor` again
 6. To serve other hosts, set the listener addresses to the intended network address or the
    generated wildcard defaults and restart. Restrict network access with a firewall. Discovery
    does not cross VLANs; add by address where needed
@@ -85,7 +87,8 @@ the camera. Stop the foreground process first.
 The system service uses `/var/lib/tethercam/config.toml`; the user service uses
 `~/.config/tethercam/config.toml`. Neither uses `./camera.toml`. Prepare the fixed path or move
 an existing protected config there while stopped to preserve credentials and identity. For a
-system migration, stage the file as root-owned mode `0600` in the protected service directory;
-merely moving a user-owned file preserves its ownership and the installer rejects it. See
-[`service.md`](service.md) for ownership, credential retrieval, uninstall and shutdown details.
+system migration, follow the ownership requirements in [`service.md`](service.md). Carry over
+or reapply the intended listener addresses before installing: a fresh service config uses wildcard
+defaults, and installation starts the service. See [`service.md`](service.md) for credential
+retrieval, uninstall and shutdown details.
 Stopping waits for camera cleanup and may take indefinitely if a process wedges.

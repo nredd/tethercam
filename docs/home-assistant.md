@@ -32,7 +32,8 @@ integration; the setup steps were not recorded.
 
 ## Read-only REST status sensor
 
-Design guidance only: this recipe has not yet been verified on Home Assistant OS. Add it to
+Design guidance only: this recipe has not yet been verified on Home Assistant OS. It requires a
+source build with `/tethercam/status`; the published 0.0.1 does not include it. Add it to
 `configuration.yaml`, substitute the tethercam host address, and store the generated credentials
 as `tethercam_username` and `tethercam_password` in Home Assistant's `secrets.yaml`. Protect both
 files. The example address is synthetic. HTTP Digest authenticates but does not encrypt traffic;
