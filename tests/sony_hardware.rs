@@ -7,9 +7,6 @@
 //!
 //! Run it with `TETHERCAM_HARDWARE=1 cargo test --test sony_hardware -- --ignored --nocapture`.
 //!
-//! NOTE(redd): `hardware_transport` has no USB transport to open yet. Replace its body with the
-//! `transport::usb` open call once that module lands.
-//!
 //! References:
 //! - <https://github.com/nredd/tethercam/blob/main/docs/architecture.md#testing>
 //! - <https://github.com/nredd/tethercam/blob/main/src/ptp/session.rs>
@@ -20,8 +17,8 @@ use std::time::{Duration, Instant};
 use tethercam::ptp::session::{Session, SessionConfig};
 use tethercam::sony::{SonyCamera, SonyConfig, SonyError};
 use tethercam::transport::Transport;
-use tethercam::transport::sim::SimCamera;
 use tethercam::transport::sim::sony::{SonySimConfig, sony_camera};
+use tethercam::transport::usb::{NusbBus, NusbTransport, UsbError, open_first};
 
 /// What a soak run saw.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -57,11 +54,15 @@ fn report(line: &str) {
 
 /// The camera selected for the hardware test: `Ok(None)` to skip, `Err` when one was asked for
 /// but cannot be opened.
-fn hardware_transport() -> Result<Option<SimCamera>, String> {
+async fn hardware_transport() -> Result<Option<NusbTransport>, UsbError> {
     if std::env::var_os("TETHERCAM_HARDWARE").is_none() {
         return Ok(None);
     }
-    Err("TETHERCAM_HARDWARE is set but this build has no USB transport yet".to_owned())
+    match open_first(&NusbBus).await {
+        Ok(transport) => Ok(Some(transport)),
+        Err(UsbError::NoCamera | UsbError::WrongMode(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[tokio::test]
@@ -86,21 +87,25 @@ async fn soak_against_the_simulated_body() {
     }
 }
 
-#[test]
-fn hardware_is_skipped_unless_selected() {
+#[tokio::test]
+async fn hardware_is_skipped_unless_selected() {
     if std::env::var_os("TETHERCAM_HARDWARE").is_none() {
-        assert_eq!(hardware_transport().map(|t| t.is_some()), Ok(false));
+        assert_eq!(hardware_transport().await.map(|t| t.is_some()), Ok(false));
     }
 }
 
 #[tokio::test]
 #[ignore = "needs a Sony body in PC Remote mode on USB"]
 async fn thirty_seconds_of_live_view_from_a_real_body() {
-    let Some(transport) = hardware_transport().unwrap() else {
-        report("skipped: TETHERCAM_HARDWARE is not set");
+    let Some(transport) = hardware_transport().await.unwrap() else {
+        report("skipped: hardware not selected or no usable camera attached");
         return;
     };
-    let mut session = Session::new(transport, SessionConfig::default());
+    let config = SessionConfig {
+        max_packet_size: transport.bulk_max_packet_size(),
+        ..SessionConfig::default()
+    };
+    let mut session = Session::new(transport, config);
     let started = Instant::now();
     let soak = soak(&mut session, SonyConfig::default(), Duration::from_secs(30))
         .await

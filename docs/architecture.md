@@ -440,7 +440,7 @@ Not yet established, tracked as issues:
   this invalid-input branch must not depend on arbitrary-byte property-test generation
 - Property tests for every parser; golden-byte tests for every encoder against captures
 - `criterion` benchmarks for per-frame paths, compiled and smoke-run in CI
-- Hardware-in-the-loop tests are `#[ignore]`d and run by hand with a camera attached
+- Hardware-in-the-loop tests are `#[ignore]`d and run by hand with a camera attached. The Sony live-view soak additionally requires `TETHERCAM_HARDWARE` to be set; it skips when unset or when no usable USB camera is attached
 
 ## References
 
