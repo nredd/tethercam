@@ -342,20 +342,25 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
         )?;
     }
     for job in ["publish", "github-release"] {
-        require(
-            jobs[job]["steps"]
-                .as_array()
-                .ok_or("missing steps")?
-                .iter()
-                .any(|step| {
-                    step["uses"]
-                        .as_str()
-                        .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
-                        && step["with"] == json!({"name": "crate-${{ github.sha }}", "path": "${{ runner.temp }}/gated-package"})
-                        && step.get("if").is_none()
-                }),
-            "jobs must download the gated assets",
-        )?;
+        let steps = jobs[job]["steps"].as_array().ok_or("missing steps")?;
+        let download = steps.iter().position(|step| {
+            step["uses"].as_str().is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+                && step["with"] == json!({"name": "crate-${{ github.sha }}", "path": "${{ runner.temp }}/gated-package"})
+                && step.get("if").is_none()
+        }).ok_or("missing gated asset download")?;
+        let consumer = steps
+            .iter()
+            .position(|step| {
+                step["run"].as_str().is_some_and(|run| {
+                    run.starts_with(if job == "publish" {
+                        "cmp "
+                    } else {
+                        "gh release create "
+                    })
+                })
+            })
+            .ok_or("missing asset consumer")?;
+        require(download < consumer, "download must precede asset use")?;
     }
     Ok(())
 }
@@ -441,6 +446,21 @@ fn weakened_release_boundaries_and_reordered_staging_fail() -> Result<(), Box<dy
             })
             .ok_or("download")?;
         download["with"]["run-id"] = json!("123");
+        assert!(validate_release(&workflow).is_err());
+        let mut workflow = original.clone();
+        let steps = workflow["jobs"][job]["steps"]
+            .as_array_mut()
+            .ok_or("steps")?;
+        let index = steps
+            .iter()
+            .position(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+            })
+            .ok_or("download")?;
+        let download = steps.remove(index);
+        steps.push(download);
         assert!(validate_release(&workflow).is_err());
     }
     for mutation in ["cleanup", "permission"] {
