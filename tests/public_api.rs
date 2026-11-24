@@ -1,4 +1,7 @@
 //! Compile-time checks for the intentional default-feature library entry points.
+//!
+//! References:
+//! - `docs/architecture.md`, 1.0 compatibility boundary
 
 use tethercam::{cli, config, media, onvif, ptp, rtp, rtsp, service, sony, supervisor, transport};
 
