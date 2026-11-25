@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 - Publish a smoke-tested x86_64 Linux binary tarball and verified checksums alongside the source archive (#144)
+- Add a Linux quickstart and an unverified Home Assistant REST status sensor recipe (#145)
+- Add a Linux quickstart with A7 III USB power limitations and an unverified Home Assistant REST status sensor recipe (#145, refs #14)
 
 - Report sanitized session failure causes from `probe` instead of a generic camera error; `doctor` also identifies busy responses and native session failures more precisely, with retry and cleanup guidance for ICC deadlines (#137)
 - Document the WS-Discovery arrival-interface limitation and configuration for overlapping subnets (Refs #33)

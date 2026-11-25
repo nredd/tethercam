@@ -45,7 +45,9 @@ binary path changes. A changed template/path is a conflict, not permission to ov
 These fixed paths intentionally do not follow `XDG_CONFIG_HOME`. If foreground setup used a
 custom path, it is a separate config, not silently copied into a daemon. To reuse an identity,
 prepare the service's documented config path with `setup --config PATH` first, or move the
-protected file there while stopped. Installing loads it or generates credentials and identity
+protected file there while stopped. For a Linux system migration, stage the config as root-owned
+mode `0600` in the protected service directory; moving a user-owned file preserves its ownership,
+which the installer rejects. Installing loads it or generates credentials and identity
 through the same `Config::load_or_create` implementation as foreground setup. Installation and
 status never print credentials. For adoption, use `setup --config PATH` privately as the file's
 owner, e.g. `sudo -u tethercam /usr/local/bin/tethercam setup --config /var/lib/tethercam/config.toml`
