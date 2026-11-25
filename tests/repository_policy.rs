@@ -162,6 +162,21 @@ fn validate(policy: &Value, workflows: &Workflows) -> Result<(), String> {
     )
 }
 
+const RELEASE_ASSETS: &str = r#"set -euo pipefail
+version="${TAG#v}"
+assets="$RUNNER_TEMP/release-assets"
+smoke="$(mktemp -d)"
+mkdir -p "$assets"
+cp target/package/*.crate "$assets/"
+tar -czf "$assets/tethercam-$version-x86_64-unknown-linux-gnu.tar.gz" -C target/release tethercam
+tar -xzf "$assets/tethercam-$version-x86_64-unknown-linux-gnu.tar.gz" -C "$smoke"
+"$smoke/tethercam" --help
+"$smoke/tethercam" --version | grep -Fx "tethercam $version"
+cd "$assets"
+sha256sum ./*.crate ./*.tar.gz > SHA256SUMS
+sha256sum -c SHA256SUMS
+"#;
+
 /// Fail closed when release authentication, source checks or publication order drift.
 fn validate_release(workflow: &Value) -> Result<(), String> {
     for (pointer, expected) in [
@@ -175,6 +190,7 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
             ),
         ),
         ("/jobs/gate/env/TETHERCAM_USBIP", json!(1)),
+        ("/jobs/gate/runs-on", json!("ubuntu-latest")),
         ("/jobs/publish/needs", json!("gate")),
         ("/jobs/publish/environment", json!("crates-io")),
         (
@@ -193,6 +209,10 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
             "release security boundary changed",
         )?;
     }
+    require(
+        workflow["jobs"]["gate"].get("permissions").is_none(),
+        "gate must inherit read-only permissions",
+    )?;
     let events = workflow
         .get("on")
         .and_then(Value::as_object)
@@ -228,6 +248,8 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
                 "make all cross",
                 "cargo package --locked",
                 "cargo publish --dry-run --locked",
+                "cargo build --release --locked --bin tethercam",
+                RELEASE_ASSETS,
             ],
         ),
         (
@@ -241,7 +263,7 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
         (
             "github-release",
             vec![
-                "gh release create \"$TAG\" \"$RUNNER_TEMP\"/gated-package/*.crate --draft --verify-tag --target \"$COMMIT\" --title \"$TAG\" --notes-file CHANGELOG.md",
+                "gh release create \"$TAG\" \"$RUNNER_TEMP\"/gated-package/*.crate \"$RUNNER_TEMP\"/gated-package/*.tar.gz \"$RUNNER_TEMP\"/gated-package/SHA256SUMS --draft --verify-tag --target \"$COMMIT\" --title \"$TAG\" --notes-file CHANGELOG.md",
                 "gh release edit \"$TAG\" --draft=false",
             ],
         ),
@@ -263,6 +285,82 @@ fn validate_release(workflow: &Value) -> Result<(), String> {
             )?;
             previous = Some(index);
         }
+    }
+    let gate = jobs["gate"]["steps"]
+        .as_array()
+        .ok_or("missing gate steps")?;
+    let assets = gate
+        .iter()
+        .position(|step| step["run"] == RELEASE_ASSETS)
+        .ok_or("missing assets")?;
+    require(
+        gate[assets]["env"]["TAG"] == "${{ github.ref_name }}",
+        "asset version must use the tag",
+    )?;
+    let upload = gate
+        .iter()
+        .position(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
+                && step["with"]["name"] == "crate-${{ github.sha }}"
+                && step["with"]["path"] == "${{ runner.temp }}/release-assets/"
+                && step["with"]["if-no-files-found"] == "error"
+                && step.get("if").is_none()
+        })
+        .ok_or("missing asset upload")?;
+    require(assets < upload, "assets must be verified before upload")?;
+    let cleanup = gate
+        .iter()
+        .position(|step| {
+            step["run"] == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
+                && step["if"] == "always()"
+        })
+        .ok_or("missing unconditional cleanup")?;
+    require(
+        cleanup > assets,
+        "cleanup must follow fixture provisioning and verification",
+    )?;
+    for job in jobs.values() {
+        let steps = job["steps"].as_array().ok_or("missing steps")?;
+        let checkouts: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+            })
+            .collect();
+        require(
+            checkouts.len() == 1
+                && checkouts[0].0 == 0
+                && checkouts[0].1["with"]["ref"] == "${{ github.sha }}"
+                && checkouts[0].1["with"]["persist-credentials"] == false
+                && checkouts[0].1.get("if").is_none(),
+            "exactly one checkout must use the gated SHA without credentials before all other steps",
+        )?;
+    }
+    for job in ["publish", "github-release"] {
+        let steps = jobs[job]["steps"].as_array().ok_or("missing steps")?;
+        let download = steps.iter().position(|step| {
+            step["uses"].as_str().is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+                && step["with"] == json!({"name": "crate-${{ github.sha }}", "path": "${{ runner.temp }}/gated-package"})
+                && step.get("if").is_none()
+        }).ok_or("missing gated asset download")?;
+        let consumer = steps
+            .iter()
+            .position(|step| {
+                step["run"].as_str().is_some_and(|run| {
+                    run.starts_with(if job == "publish" {
+                        "cmp "
+                    } else {
+                        "gh release create "
+                    })
+                })
+            })
+            .ok_or("missing asset consumer")?;
+        require(download < consumer, "download must precede asset use")?;
     }
     Ok(())
 }
@@ -306,6 +404,101 @@ fn weakened_release_boundaries_and_reordered_staging_fail() -> Result<(), Box<dy
             .ok_or("missing release field")? = Value::Null;
         assert!(validate_release(&workflow).is_err(), "accepted {pointer}");
     }
+    for needle in [
+        "cargo build --release",
+        "tar -czf",
+        "tar -xzf",
+        "--help",
+        "--version",
+        "sha256sum ./*.crate",
+        "sha256sum -c",
+    ] {
+        let mut workflow = original.clone();
+        let steps = workflow["jobs"]["gate"]["steps"]
+            .as_array_mut()
+            .ok_or("steps")?;
+        let step = steps
+            .iter_mut()
+            .find(|step| step["run"].as_str().is_some_and(|run| run.contains(needle)))
+            .ok_or("command")?;
+        step["run"] = json!(
+            step["run"]
+                .as_str()
+                .ok_or("run")?
+                .replace(needle, "removed")
+        );
+        assert!(
+            validate_release(&workflow).is_err(),
+            "accepted missing {needle}"
+        );
+    }
+    for job in ["publish", "github-release"] {
+        let mut workflow = original.clone();
+        let steps = workflow["jobs"][job]["steps"]
+            .as_array_mut()
+            .ok_or("steps")?;
+        let download = steps
+            .iter_mut()
+            .find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+            })
+            .ok_or("download")?;
+        download["with"]["run-id"] = json!("123");
+        assert!(validate_release(&workflow).is_err());
+        let mut workflow = original.clone();
+        let steps = workflow["jobs"][job]["steps"]
+            .as_array_mut()
+            .ok_or("steps")?;
+        let index = steps
+            .iter()
+            .position(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+            })
+            .ok_or("download")?;
+        let download = steps.remove(index);
+        steps.push(download);
+        assert!(validate_release(&workflow).is_err());
+    }
+    for mutation in ["cleanup", "permission"] {
+        let mut workflow = original.clone();
+        if mutation == "cleanup" {
+            let steps = workflow["jobs"]["gate"]["steps"]
+                .as_array_mut()
+                .ok_or("steps")?;
+            let cleanup = steps
+                .iter_mut()
+                .find(|step| {
+                    step["run"]
+                        == "cargo run --features repo-tools --bin tethercam-tools -- usbip detach"
+                })
+                .ok_or("cleanup")?;
+            cleanup["if"] = json!("success()");
+        } else {
+            workflow["jobs"]["gate"]["permissions"] = json!({"id-token": "write"});
+        }
+        assert!(validate_release(&workflow).is_err(), "accepted {mutation}");
+    }
+    let mut workflow = original.clone();
+    let steps = workflow["jobs"]["gate"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?;
+    steps.push(steps[0].clone());
+    assert!(validate_release(&workflow).is_err());
+    let mut workflow = original.clone();
+    let steps = workflow["jobs"]["gate"]["steps"]
+        .as_array_mut()
+        .ok_or("steps")?;
+    let cleanup = steps
+        .iter()
+        .position(|step| step["if"] == "always()")
+        .ok_or("cleanup")?;
+    let step = steps.remove(cleanup);
+    steps.insert(1, step);
+    assert!(validate_release(&workflow).is_err());
     let mut workflow = original;
     let steps = workflow["jobs"]["github-release"]["steps"]
         .as_array_mut()
