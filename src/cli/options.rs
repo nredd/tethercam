@@ -49,6 +49,8 @@ pub struct Options {
     pub simulate: Option<PathBuf>,
     /// Suppress multicast announcements, without disabling authenticated endpoints.
     pub no_discovery: bool,
+    /// Emit the privacy-preserving doctor support report.
+    pub report: bool,
 }
 
 /// Syntax error with no attacker-controlled text.
@@ -66,8 +68,8 @@ impl Options {
     /// Parse arguments excluding the executable. Every argument sequence has a typed result.
     ///
     /// # Errors
-    /// Rejects unknown/duplicate arguments and missing paths. Only four distinct options
-    /// exist, so parsing stops after at most eight arguments even for an infinite iterator.
+    /// Rejects unknown/duplicate arguments and missing paths. Only five distinct options
+    /// exist, so parsing stops after at most nine arguments even for an infinite iterator.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
         let mut args = args.into_iter();
         let first = args.next();
@@ -87,6 +89,7 @@ impl Options {
             config: None,
             simulate: None,
             no_discovery: false,
+            report: false,
         };
         while let Some(arg) = args.next() {
             match arg.to_str() {
@@ -97,6 +100,9 @@ impl Options {
                     options.simulate = Some(path(&mut args)?);
                 }
                 Some("--no-discovery") if !options.no_discovery => options.no_discovery = true,
+                Some("--report") if command == Command::Doctor && !options.report => {
+                    options.report = true;
+                }
                 Some("--describe") if options.command == (Command::Cameras { describe: false }) => {
                     options.command = Command::Cameras { describe: true };
                 }
@@ -129,6 +135,7 @@ fn service(args: &mut dyn Iterator<Item = OsString>) -> Result<Options, ParseErr
                 config: None,
                 simulate: None,
                 no_discovery: false,
+                report: false,
             });
         }
         _ => return Err(ParseError::Invalid),
@@ -143,6 +150,7 @@ fn service(args: &mut dyn Iterator<Item = OsString>) -> Result<Options, ParseErr
         config: None,
         simulate: None,
         no_discovery: false,
+        report: false,
     })
 }
 
