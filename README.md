@@ -94,7 +94,7 @@ the first usable camera is chosen. `camera_backend = "icc"` (default `"usb"`, no
 experimental macOS `ImageCaptureCore` backend instead, see below. `tethercam cameras --config ./camera.toml`
 lists what the backend can see so one can be chosen (`camera_id` for `icc`, `camera_serial` for USB). USB serials and OS bus paths are not printed. `doctor` checks file
 permissions and values, listener addresses/ports, a plausible UTC clock and camera readiness, including the first live-view frame `run` waits on, checked as `run` checks it. When
-that frame never arrives it names the likely cause, without camera responses or identifiers. It does not prove that
+that frame never arrives it names the likely cause, without camera responses or identifiers. `doctor --report` instead emits an allowlisted support summary: version, OS/architecture, configured backend, protocol and capability flags, frame dimensions, coarse battery/power and fixed failure category. It omits configuration paths, credentials, identifiers, addresses, raw camera strings and frame bytes; it is intended for public bug reports. If ICC cleanup remains unsettled or is quarantined after a failed check, the report includes both its failure category and `backend_cleanup` or `backend`; a report output flush failure is an `io` error. It does not prove that
 NTP is synchronized. These foreground commands never install a daemon or
 background themselves; only the explicit `service` command performs native service operations.
 

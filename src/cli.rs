@@ -17,11 +17,15 @@ mod icc;
 mod icc {
     //! Without the `macos-icc` feature the native backend cannot be selected.
 
-    use super::{Error, Options};
+    use super::{Error, Options, Write};
+
+    pub(super) fn run_stdout() -> std::process::ExitCode {
+        super::run(&mut std::io::stdout())
+    }
     use crate::config::Config;
 
     pub(super) fn launch(
-        _options: &Options, _cfg: &Config, _dispatch: &tracing::Dispatch,
+        _options: &Options, _cfg: &Config, _dispatch: &tracing::Dispatch, _out: &mut dyn Write,
     ) -> Result<(), Error> {
         Err(Error::IccUnavailable)
     }
@@ -50,6 +54,8 @@ pub const BANNER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VE
 /// Short command/option help. Daemon operations require an explicit `service` subcommand.
 pub const HELP: &str = "tethercam setup|probe|run|doctor [--config PATH] [--simulate JPEG] [--no-discovery]\n\
 setup creates owner-only credentials and identity; probe inspects a camera; run serves in the foreground; doctor checks readiness.\n\
+tethercam doctor [--config PATH] [--report]\n\
+--report prints a sanitized support summary.\n\
 tethercam cameras [--config PATH] [--describe]\n\
 cameras lists what the configured backend can see; --describe (icc only) briefly opens each device read-only for its make and model, which can raise a trust prompt on a phone; with camera_id set only that device is described.\n\
 tethercam service install|uninstall|status [--user]\n\
@@ -59,6 +65,9 @@ Linux defaults to a privileged system unit; --user selects its user manager. mac
 /// retained as sources but never interpolated into CLI errors or logs.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A fixed, sanitized report failure category.
+    #[error("{0}")]
+    Report(&'static str),
     /// Invalid arguments.
     #[error(transparent)]
     Arguments(#[from] ParseError),
@@ -105,6 +114,10 @@ pub enum Error {
     /// The one native runtime is quarantined for the life of the process.
     #[error("native camera runtime quarantined; it cannot be reused, restart the process")]
     Quarantined,
+    /// A support report failed and native cleanup quarantined the runtime.
+    #[cfg(feature = "macos-icc")]
+    #[error("native camera runtime quarantined; it cannot be reused, restart the process")]
+    QuarantinedReport(Option<&'static str>),
     /// Probe failed and quarantined the native camera runtime.
     #[error("{}; native camera runtime quarantined; restart the process", Error::Probe(*.0))]
     QuarantinedProbe(FirstFrameCause),
@@ -118,11 +131,30 @@ pub enum Error {
 
 /// Parse process arguments, dispatch and report errors through `out`, never an implicit print.
 pub fn run(out: &mut dyn Write) -> ExitCode {
+    run_using(out, &icc::launch)
+}
+
+/// Run with an owned stdout sink so the ICC worker and cleanup watcher can write to it
+/// even when native cleanup prevents the main thread from returning.
+pub fn run_stdout() -> ExitCode {
+    icc::run_stdout()
+}
+
+type IccLaunch<'a> =
+    dyn Fn(&Options, &Config, &tracing::Dispatch, &mut dyn Write) -> Result<(), Error> + 'a;
+
+fn run_using(out: &mut dyn Write, launch: &IccLaunch<'_>) -> ExitCode {
     // The executable owns global logging. If an embedding host already installed a logger,
     // retain it; `execute` itself changes only the scoped tracing subscriber.
     let _ = tracing_log::LogTracer::init();
     finish(
-        execute(Options::parse(std::env::args_os().skip(1)), out),
+        execute_using(
+            Options::parse(std::env::args_os().skip(1)),
+            out,
+            config::default_path(),
+            &mut crate::service::Manager::new,
+            launch,
+        ),
         out,
     )
 }
@@ -130,6 +162,7 @@ pub fn run(out: &mut dyn Write) -> ExitCode {
 fn finish(result: Result<(), Error>, out: &mut dyn Write) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(Error::Report(_)) => ExitCode::FAILURE,
         Err(error) => {
             let _ = writeln!(out, "Error: {error}");
             ExitCode::FAILURE
@@ -141,7 +174,9 @@ fn finish(result: Result<(), Error>, out: &mut dyn Write) -> ExitCode {
 /// the operator through `out`; no tracing event contains credentials, URLs or device identity.
 ///
 /// # Errors
-/// Returns typed argument, file, camera or runtime diagnostics.
+/// Returns typed argument, file, camera or runtime diagnostics. Support reports write and
+/// flush their own sanitized failure category before returning `Error::Report`. On ICC,
+/// borrowed output from the worker is buffered until native cleanup returns.
 pub fn execute(options: Result<Options, ParseError>, out: &mut dyn Write) -> Result<(), Error> {
     execute_with_path(options, out, config::default_path())
 }
@@ -163,7 +198,95 @@ fn execute_with_service(
     default_path: Result<std::path::PathBuf, config::Error>,
     service: &mut dyn FnMut(bool) -> Result<crate::service::Manager, crate::service::Error>,
 ) -> Result<(), Error> {
+    execute_using(options, out, default_path, service, &icc::launch)
+}
+
+fn execute_using(
+    options: Result<Options, ParseError>, out: &mut dyn Write,
+    default_path: Result<std::path::PathBuf, config::Error>,
+    service: &mut dyn FnMut(bool) -> Result<crate::service::Manager, crate::service::Error>,
+    launch: &IccLaunch<'_>,
+) -> Result<(), Error> {
     let options = options?;
+    if options.report {
+        if options.command != Command::Doctor {
+            return Err(ParseError::Invalid.into());
+        }
+        let result = writeln!(
+            out,
+            "tethercam: {}\nos: {}\narch: {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+        .map_err(Error::Io)
+        .and_then(|()| execute_selected(&options, out, default_path, service, launch));
+        return finish_report(out, &result);
+    }
+    execute_selected(&options, out, default_path, service, launch)
+}
+
+fn finish_report(out: &mut dyn Write, result: &Result<(), Error>) -> Result<(), Error> {
+    let category = result.as_ref().err().map(report_error);
+    finalize_report(out, category)
+        .or(Err(Error::Report("io")))
+        .and(category.map_or(Ok(()), |category| Err(Error::Report(category))))
+}
+
+/// Write fixed categories and attempt the flush even when a write fails.
+fn finalize_report<'a>(
+    out: &mut dyn Write, categories: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    let written = categories
+        .into_iter()
+        .try_for_each(|category| writeln!(out, "Error: {category}"));
+    written.and(out.flush())
+}
+
+fn report_error(error: &Error) -> &'static str {
+    match error {
+        Error::Config(_) => "configuration",
+        Error::Clock => "clock",
+        Error::Ports => "ports",
+        Error::NoCamera => "no_camera",
+        Error::Open(_) => "camera_open",
+        Error::FirstFrame(cause) => match cause {
+            FirstFrameCause::NotRemote => "not_remote",
+            FirstFrameCause::Refused => "handshake_refused",
+            FirstFrameCause::LiveViewUnavailable => "live_view_unavailable",
+            FirstFrameCause::NotReady => "live_view_not_ready",
+            FirstFrameCause::NoFrame => "no_frame",
+            FirstFrameCause::Timeout => "camera_timeout",
+            FirstFrameCause::Disconnected => "camera_disconnected",
+            FirstFrameCause::Transport => "transport",
+            FirstFrameCause::Busy => "camera_busy",
+            FirstFrameCause::Permission => "camera_permission",
+            FirstFrameCause::Rejected => "camera_rejected",
+            FirstFrameCause::Protocol => "protocol",
+            FirstFrameCause::Decode => "frame_decode",
+            FirstFrameCause::Encoder => "encoder",
+            FirstFrameCause::CloseFailed => "camera_close",
+            FirstFrameCause::Framing => "framing",
+            FirstFrameCause::Unclassified => "camera_unclassified",
+            #[cfg(feature = "macos-icc")]
+            FirstFrameCause::NativeDeadline => "camera_timeout",
+            #[cfg(feature = "macos-icc")]
+            FirstFrameCause::Native(_) => "backend",
+            FirstFrameCause::Quarantined => "backend",
+            FirstFrameCause::CleanupFailed => "camera_close",
+        },
+        Error::IccUnavailable | Error::IccFailed | Error::Quarantined => "backend",
+        Error::Io(_) => "io",
+        _ => "other",
+    }
+}
+
+fn execute_selected(
+    options: &Options, out: &mut dyn Write,
+    default_path: Result<std::path::PathBuf, config::Error>,
+    service: &mut dyn FnMut(bool) -> Result<crate::service::Manager, crate::service::Error>,
+    launch: &IccLaunch<'_>,
+) -> Result<(), Error> {
     match options.command {
         Command::Version => {
             out.write_all(BANNER.as_bytes())?;
@@ -197,9 +320,20 @@ fn execute_with_service(
         return Ok(());
     }
     let cfg = Config::load(&path)?;
+    if options.report {
+        let backend = match cfg.camera_backend {
+            config::CameraBackend::Usb => "usb",
+            config::CameraBackend::Icc => "icc",
+        };
+        writeln!(out, "backend: {backend}")?;
+    }
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::fmt()
-            .with_max_level(diagnostics::level(&cfg.log_level))
+            .with_max_level(if options.report {
+                tracing::level_filters::LevelFilter::OFF
+            } else {
+                diagnostics::level(&cfg.log_level).into()
+            })
             .with_target(false)
             .with_ansi(false)
             .with_writer(std::io::stderr)
@@ -208,10 +342,10 @@ fn execute_with_service(
     tracing::dispatcher::with_default(&dispatch, || {
         if options.simulate.is_none() && cfg.camera_backend == config::CameraBackend::Icc {
             // Selected, never a fallback: it fails before any camera access where unsupported.
-            return icc::launch(&options, &cfg, &dispatch);
+            return launch(options, &cfg, &dispatch, out);
         }
         dispatch_runtime(
-            &options,
+            options,
             &cfg,
             out,
             tokio::runtime::Builder::new_current_thread()
@@ -272,6 +406,9 @@ async fn command_with<F: CameraFactory>(
                 cfg,
                 crate::onvif::time::Clock::now_unix(&crate::onvif::time::SystemClock),
             )?;
+            if options.report {
+                return diagnostics::doctor_report(factory, &cfg.streams, out).await;
+            }
             diagnostics::doctor_camera(
                 factory,
                 crate::sony::SonyConfig::default(),

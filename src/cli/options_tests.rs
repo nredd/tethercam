@@ -64,6 +64,23 @@ fn rejects_ambiguous_and_duplicate_syntax() {
 }
 
 #[test]
+fn report_is_doctor_only_and_not_repeatable() {
+    assert!(parse(&["doctor", "--report"]).unwrap().report);
+    for args in [
+        vec!["doctor", "--report", "--report"],
+        vec!["probe", "--report"],
+        vec!["run", "--report"],
+        vec!["setup", "--report"],
+        vec!["cameras", "--report"],
+        vec!["service", "status", "--report"],
+        vec!["--help", "--report"],
+        vec!["--version", "--report"],
+    ] {
+        assert_eq!(parse(&args), Err(ParseError::Invalid), "{args:?}");
+    }
+}
+
+#[test]
 fn cameras_takes_only_a_config_and_an_explicit_describe() {
     let plain = parse(&["cameras", "--config", "/synthetic/config.toml"]).unwrap();
     assert_eq!(plain.command, Command::Cameras { describe: false });

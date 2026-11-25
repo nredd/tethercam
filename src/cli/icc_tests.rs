@@ -45,6 +45,7 @@ fn options(command: Command) -> Options {
         config: None,
         simulate: None,
         no_discovery: true,
+        report: false,
     }
 }
 
@@ -677,6 +678,62 @@ fn launch_runs_the_worker_on_the_native_side_with_logging_and_stdout_carried_ove
     assert_eq!(UNEXPECTED.load(Ordering::SeqCst), 0);
 }
 
+#[derive(Clone, Default)]
+struct FirstFlushFails {
+    sink: Sink,
+    calls: Arc<AtomicU8>,
+}
+
+impl Write for FirstFlushFails {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.sink.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(io::Error::other("synthetic-private"));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn report_completion_deduplicates_output_failures() {
+    let mut result = Err(Error::Io(io::Error::other("synthetic write")));
+    let completion = report_completion(&mut result, &mut FlushFailure);
+    assert_eq!(completion.category, None);
+    assert!(completion.flush_failed);
+    assert!(matches!(result, Err(Error::Io(_))));
+}
+
+struct FlushFailure;
+
+impl Write for FlushFailure {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::other("synthetic-private"))
+    }
+}
+
+#[test]
+fn report_fails_when_flushing_output_fails() {
+    let mut opts = options(Command::Doctor);
+    opts.report = true;
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        FlushFailure,
+        |entry| run_with(SimBoundary::new(camera()), entry),
+        EmptyRecovery::OFF,
+        Some(SETTLE_LIMIT),
+        record_unexpected_termination,
+    );
+    assert!(matches!(result, Err(Error::Io(_))));
+}
+
 #[test]
 fn launch_without_a_settle_bound_runs_unwatched() {
     // The service's policy: no watcher, so nothing can end it but its own shutdown.
@@ -728,6 +785,169 @@ fn launch_terminates_with_the_restart_status_after_a_quarantine() {
     assert!(text.contains("camera session cleanup failed"), "{text}");
     // The worker thread logged into the dispatcher it was handed, not the main thread's.
     assert!(logs.text().contains("icc_runtime_quarantined"));
+    let sink = Sink::default();
+    let mut opts = options(Command::Doctor);
+    opts.report = true;
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        sink.clone(),
+        |entry| {
+            run_with(
+                SimBoundary::with_faults(
+                    camera(),
+                    SimFaults {
+                        close: Some(IccError::CleanupFailure),
+                        ..SimFaults::default()
+                    },
+                ),
+                entry,
+            )
+        },
+        EmptyRecovery::OFF,
+        Some(SETTLE_LIMIT),
+        record_termination,
+    );
+    assert!(
+        matches!(result, Err(Error::QuarantinedReport(Some("camera_close")))),
+        "{result:?}"
+    );
+    let report = written(&sink);
+    assert!(report.contains("Error: camera_close\nError: backend\n"));
+    assert!(report.contains("protocol: V"));
+    assert!(report.contains("frame: "));
+    let sink = Sink::default();
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        sink.clone(),
+        |entry| {
+            let body = crate::transport::sim::sony::sony_camera(
+                crate::transport::sim::sony::SonySimConfig {
+                    advertise_sdio: false,
+                    ..Default::default()
+                },
+            );
+            run_with(
+                SimBoundary::with_faults(
+                    body,
+                    SimFaults {
+                        close: Some(IccError::CleanupFailure),
+                        ..Default::default()
+                    },
+                ),
+                entry,
+            )
+        },
+        EmptyRecovery::OFF,
+        Some(SETTLE_LIMIT),
+        record_termination,
+    );
+    assert!(matches!(
+        result,
+        Err(Error::QuarantinedReport(Some("not_remote")))
+    ));
+    assert!(written(&sink).contains("Error: not_remote\nError: backend\n"));
+}
+
+struct RejectReport;
+impl Write for RejectReport {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("synthetic"))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn borrowed_report_forwards_worker_output_and_checks_the_caller_sink() {
+    fn run_report(sink: &mut dyn Write) -> Result<(), Error> {
+        let mut opts = options(Command::Doctor);
+        opts.report = true;
+        forward_report(sink, |writer| {
+            launch_with(
+                &opts,
+                &free_cfg(),
+                &LogCapture::new().dispatch(),
+                writer,
+                |entry| run_with(SimBoundary::new(camera()), entry),
+                EmptyRecovery::OFF,
+                Some(SETTLE_LIMIT),
+                record_unexpected_termination,
+            )
+        })
+    }
+
+    let mut out = b"backend: icc\n".to_vec();
+    run_report(&mut out).unwrap();
+    assert!(out.starts_with(b"backend: icc\nprotocol: V"));
+    assert!(matches!(run_report(&mut RejectReport), Err(Error::Io(_))));
+}
+
+#[test]
+fn quarantine_report_write_failure_is_reported() {
+    RejectReport.flush().unwrap();
+    let mut opts = options(Command::Doctor);
+    opts.report = true;
+    let body =
+        crate::transport::sim::sony::sony_camera(crate::transport::sim::sony::SonySimConfig {
+            advertise_sdio: false,
+            ..Default::default()
+        });
+    let result = run_with(
+        SimBoundary::with_faults(
+            body,
+            SimFaults {
+                close: Some(IccError::CleanupFailure),
+                ..Default::default()
+            },
+        ),
+        |handle| {
+            runtime().block_on(drive_until(
+                handle,
+                &free_cfg(),
+                &opts,
+                EmptyRecovery::OFF,
+                &mut RejectReport,
+                Box::pin(std::future::pending()),
+            ))
+        },
+    );
+    assert!(matches!(
+        result,
+        Ok(Err(Error::QuarantinedReport(Some("not_remote"))))
+    ));
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        RejectReport,
+        |entry| {
+            let body = crate::transport::sim::sony::sony_camera(
+                crate::transport::sim::sony::SonySimConfig {
+                    advertise_sdio: false,
+                    ..Default::default()
+                },
+            );
+            run_with(
+                SimBoundary::with_faults(
+                    body,
+                    SimFaults {
+                        close: Some(IccError::CleanupFailure),
+                        ..Default::default()
+                    },
+                ),
+                entry,
+            )
+        },
+        EmptyRecovery::OFF,
+        Some(SETTLE_LIMIT),
+        |code| assert_eq!(code, QUARANTINE_EXIT),
+    );
+    assert!(matches!(result, Err(Error::Io(_))));
 }
 
 #[test]
@@ -847,6 +1067,63 @@ fn a_one_shot_command_that_leaves_cleanup_pending_reports_then_exits_with_the_di
         "{}",
         logs.text()
     );
+    let sink = Sink::default();
+    let mut opts = options(Command::Doctor);
+    opts.report = true;
+    launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        sink.clone(),
+        hung_with_camera,
+        EmptyRecovery::OFF,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    )
+    .unwrap();
+    assert!(written(&sink).contains("Error: backend_cleanup\n"));
+    assert!(!written(&sink).contains("Native cleanup"));
+    let sink = Sink::default();
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        sink.clone(),
+        hung_without_camera,
+        EmptyRecovery::OFF,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    assert!(matches!(result, Err(Error::NoCamera)));
+    assert_eq!(written(&sink), "Error: no_camera\nError: backend_cleanup\n");
+    let flaky = FirstFlushFails::default();
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        flaky.clone(),
+        hung_without_camera,
+        EmptyRecovery::OFF,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    assert!(matches!(result, Err(Error::Io(_))));
+    assert_eq!(flaky.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        written(&flaky.sink),
+        "Error: no_camera\nError: io\nError: backend_cleanup\n"
+    );
+    let result = launch_with(
+        &opts,
+        &free_cfg(),
+        &logs.dispatch(),
+        RejectReport,
+        hung_without_camera,
+        EmptyRecovery::OFF,
+        Some(Duration::from_millis(50)),
+        exit_and_settle,
+    );
+    assert!(matches!(result, Err(Error::Io(_))));
 }
 
 /// Panics on its first write, like a worker that dies mid-command, and accepts the rest. Only
@@ -1028,6 +1305,16 @@ fn the_real_entry_point_refuses_before_any_camera_access_off_the_main_thread() {
         &options(Command::Run),
         &free_cfg(),
         &LogCapture::new().dispatch(),
+        &mut Vec::new(),
+    );
+    assert!(matches!(result, Err(Error::IccUnavailable)));
+    let mut opts = options(Command::Doctor);
+    opts.report = true;
+    let result = launch(
+        &opts,
+        &free_cfg(),
+        &LogCapture::new().dispatch(),
+        &mut Vec::new(),
     );
     assert!(matches!(result, Err(Error::IccUnavailable)));
 }

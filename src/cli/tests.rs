@@ -221,6 +221,7 @@ fn options(command: Command, path: &std::path::Path) -> Options {
         config: Some(path.to_owned()),
         simulate: None,
         no_discovery: true,
+        report: false,
     }
 }
 
@@ -456,6 +457,242 @@ async fn command_dispatch_and_sanitized_probe_failures() {
     );
     let simulator = simulator::Simulator::new(jpeg(32, 32)).unwrap();
     simulator.pause(std::time::Duration::from_millis(1)).await;
+}
+
+#[cfg(feature = "macos-icc")]
+#[test]
+fn settled_icc_report_writes_original_error_and_flush_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("icc.toml");
+    let mut cfg = free_cfg();
+    cfg.camera_backend = config::CameraBackend::Icc;
+    cfg.create(&path).unwrap();
+    let mut opts = options(Command::Doctor, &path);
+    opts.report = true;
+    let mut out = Vec::new();
+    let result = super::execute_using(
+        Ok(opts),
+        &mut out,
+        Ok(path),
+        &mut crate::service::Manager::new,
+        &|_, _, _, out| {
+            writeln!(out, "Error: no_camera")
+                .and(Err(std::io::Error::other("synthetic flush")))
+                .map_err(Error::Io)
+        },
+    );
+    assert!(matches!(result, Err(Error::Report("io"))));
+    assert!(out.ends_with(b"backend: icc\nError: no_camera\nError: io\n"));
+    let mut full: &mut [u8] = &mut [];
+    assert!(matches!(
+        super::finish_report(&mut full, &Err(Error::NoCamera)),
+        Err(Error::Report("io"))
+    ));
+    let mut invalid = options(Command::Setup, std::path::Path::new("synthetic.toml"));
+    invalid.report = true;
+    assert!(matches!(
+        super::execute_using(
+            Ok(invalid),
+            &mut out,
+            config::default_path(),
+            &mut crate::service::Manager::new,
+            &super::icc::launch
+        ),
+        Err(Error::Arguments(_))
+    ));
+}
+
+#[test]
+fn finish_does_not_duplicate_a_report_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = options(Command::Doctor, &dir.path().join("missing.toml"));
+    let mut out = Vec::new();
+    let mut report = opts;
+    report.report = true;
+    let failed = super::execute_using(
+        Ok(report),
+        &mut out,
+        config::default_path(),
+        &mut crate::service::Manager::new,
+        &super::icc::launch,
+    );
+    assert!(matches!(failed, Err(Error::Report("configuration"))));
+    let path = dir.path().join("config.toml");
+    free_cfg().create(&path).unwrap();
+    let mut opts = options(Command::Doctor, &path);
+    opts.report = true;
+    let header_len = String::from_utf8_lossy(&out).find("Error:").unwrap();
+    let mut header = vec![0; header_len];
+    for mut sink in [&mut [][..], header.as_mut_slice()] {
+        let result = super::execute_using(
+            Ok(opts.clone()),
+            &mut sink,
+            config::default_path(),
+            &mut crate::service::Manager::new,
+            &super::icc::launch,
+        );
+        assert!(matches!(result, Err(Error::Report("io"))));
+    }
+    assert!(out.ends_with(b"Error: configuration\n"));
+    out.clear();
+    assert_eq!(
+        finish(Err(Error::Report("configuration")), &mut out),
+        ExitCode::FAILURE
+    );
+    assert_eq!(out, [] as [u8; 0]);
+}
+
+#[tokio::test]
+async fn report_camera_failure_and_output_paths_are_bounded() {
+    let cfg = free_cfg();
+    let mut out = Vec::new();
+    let mut opts = options(Command::Doctor, std::path::Path::new("synthetic.toml"));
+    opts.report = true;
+    let private_camera = sony_camera(SonySimConfig {
+        model: "synthetic-private-model".into(),
+        live_view_jpeg: jpeg(32, 32),
+        ..SonySimConfig::default()
+    });
+    super::command_until(
+        Factory::new(vec![private_camera]),
+        &cfg,
+        &opts,
+        &mut out,
+        Box::pin(std::future::ready(())),
+    )
+    .await
+    .unwrap();
+    assert!(!String::from_utf8_lossy(&out).contains("synthetic-private-model"));
+    out.clear();
+    diagnostics::doctor_report(Factory::new(vec![camera()]), &cfg.streams, &mut out)
+        .await
+        .unwrap();
+    for length in 0..out.len() {
+        let mut sink = vec![0; length];
+        let mut writer = sink.as_mut_slice();
+        assert!(
+            diagnostics::doctor_report(Factory::new(vec![camera()]), &cfg.streams, &mut writer)
+                .await
+                .is_err()
+        );
+    }
+    let bad = sony_camera(SonySimConfig {
+        advertise_sdio: false,
+        ..SonySimConfig::default()
+    });
+    assert!(
+        diagnostics::doctor_report(Factory::new(vec![bad]), &cfg.streams, &mut out)
+            .await
+            .is_err()
+    );
+    out.clear();
+    let invalid = sony_camera(SonySimConfig::default());
+    assert!(
+        diagnostics::doctor_report(Factory::new(vec![invalid]), &cfg.streams, &mut out)
+            .await
+            .is_err()
+    );
+    let malformed = String::from_utf8(std::mem::take(&mut out)).unwrap();
+    assert!(malformed.contains("protocol: V"), "{malformed}");
+    assert!(malformed.contains("power:"), "{malformed}");
+    assert!(!malformed.contains("frame:"), "{malformed}");
+    let odd = sony_camera(SonySimConfig {
+        live_view_jpeg: jpeg(33, 33),
+        ..SonySimConfig::default()
+    });
+    assert!(
+        diagnostics::doctor_report(Factory::new(vec![odd]), &cfg.streams, &mut out)
+            .await
+            .is_err()
+    );
+    let partial = String::from_utf8(std::mem::take(&mut out)).unwrap();
+    assert!(partial.contains("frame: 33 x 33\n"), "{partial}");
+    assert!(partial.contains("capability_live_view: true"), "{partial}");
+    assert!(
+        diagnostics::doctor_report(Factory::new(Vec::new()), &cfg.streams, &mut out)
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn report_power_is_coarse_and_never_displays_the_indicator() {
+    use crate::sony::{Battery, PowerSource};
+    assert_eq!(diagnostics::report_power(None), "unknown");
+    let mut out = Vec::new();
+    diagnostics::report_battery(&mut out, None).unwrap();
+    assert_eq!(out, b"battery_percent: unknown\npower: unknown\n");
+    let mut full: &mut [u8] = &mut [];
+    assert!(diagnostics::report_battery(&mut full, None).is_err());
+    for (source, expected) in [
+        (PowerSource::Battery, "battery"),
+        (PowerSource::Usb, "usb"),
+        (PowerSource::NoBattery, "no_battery"),
+        (PowerSource::Unknown, "unknown"),
+    ] {
+        assert_eq!(
+            diagnostics::report_power(Some(Battery {
+                percent: None,
+                indicator: Some(255),
+                source
+            })),
+            expected
+        );
+    }
+}
+
+#[test]
+fn report_error_categories_do_not_interpolate_sources() {
+    for (cause, expected) in [
+        (FirstFrameCause::NotRemote, "not_remote"),
+        (FirstFrameCause::Refused, "handshake_refused"),
+        (
+            FirstFrameCause::LiveViewUnavailable,
+            "live_view_unavailable",
+        ),
+        (FirstFrameCause::NotReady, "live_view_not_ready"),
+        (FirstFrameCause::NoFrame, "no_frame"),
+        (FirstFrameCause::Timeout, "camera_timeout"),
+        (FirstFrameCause::Disconnected, "camera_disconnected"),
+        (FirstFrameCause::Transport, "transport"),
+        (FirstFrameCause::Busy, "camera_busy"),
+        (FirstFrameCause::Permission, "camera_permission"),
+        (FirstFrameCause::Rejected, "camera_rejected"),
+        (FirstFrameCause::Protocol, "protocol"),
+        (FirstFrameCause::Decode, "frame_decode"),
+        (FirstFrameCause::Encoder, "encoder"),
+        (FirstFrameCause::CloseFailed, "camera_close"),
+        (FirstFrameCause::Framing, "framing"),
+        (FirstFrameCause::Unclassified, "camera_unclassified"),
+    ] {
+        assert_eq!(super::report_error(&Error::FirstFrame(cause)), expected);
+    }
+    #[cfg(feature = "macos-icc")]
+    for (cause, expected) in [
+        (FirstFrameCause::NativeDeadline, "camera_timeout"),
+        (
+            FirstFrameCause::Native(crate::transport::icc::IccError::NativeFailure),
+            "backend",
+        ),
+        (FirstFrameCause::Quarantined, "backend"),
+        (FirstFrameCause::CleanupFailed, "camera_close"),
+    ] {
+        assert_eq!(super::report_error(&Error::FirstFrame(cause)), expected);
+    }
+    for (error, category) in [
+        (Error::Clock, "clock"),
+        (Error::Ports, "ports"),
+        (Error::NoCamera, "no_camera"),
+        (Error::Open(OpenError::Busy), "camera_open"),
+        (Error::FirstFrame(FirstFrameCause::Decode), "frame_decode"),
+        (Error::IccUnavailable, "backend"),
+        (Error::IccFailed, "backend"),
+        (Error::Quarantined, "backend"),
+        (Error::Io(std::io::Error::other("synthetic-private")), "io"),
+        (Error::Simulator, "other"),
+    ] {
+        assert_eq!(super::report_error(&error), category);
+    }
 }
 
 #[test]

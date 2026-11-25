@@ -138,6 +138,7 @@ fn dispatcher_uses_the_injected_bus_and_simulation_never_enumerates_it() {
         config: None,
         simulate: None,
         no_discovery: true,
+        report: false,
     };
     let mut out = Vec::new();
     dispatch(&options, &cfg, &mut out, FakeBus::with_camera(0x0c34)).unwrap();
@@ -200,6 +201,7 @@ fn the_usb_listing_reports_modes_and_points_at_camera_serial() {
         config: None,
         simulate: None,
         no_discovery: false,
+        report: false,
     };
     let mut out = Vec::new();
     let bus = FakeBus::with_camera(0x0c34);

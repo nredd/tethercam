@@ -54,10 +54,93 @@ pub(super) async fn doctor_camera<F: CameraFactory>(
         .await?
         .map_err(|failure| Error::FirstFrame(failure.cause(streams)))?;
     // The very check `run` makes of its first frame, so ready here means `run` accepts it.
-    frame
-        .map_or(Ok(()), |frame| check_first_frame(&frame, streams))
+    check_first_frame(&frame, streams)
         .map_err(|error| Error::FirstFrame(FirstFrameCause::of_pipeline(&error)))?;
     report(out, protocol, &capabilities, battery)
+}
+
+/// Produce the allowlisted camera portion of a public support report.
+pub(super) async fn doctor_report<F: CameraFactory>(
+    factory: F, streams: &Streams, out: &mut dyn Write,
+) -> Result<(), Error> {
+    write_camera_report(
+        inspect(factory, SonyConfig::default(), true).await?,
+        streams,
+        out,
+    )
+}
+
+fn write_camera_report(
+    inspected: Result<Inspected, Failure>, streams: &Streams, out: &mut dyn Write,
+) -> Result<(), Error> {
+    match inspected {
+        Ok((protocol, capabilities, battery, frame)) => {
+            report_observations(out, protocol, &capabilities, battery, &frame)?;
+            check_first_frame(&frame, streams)
+                .map_err(|error| Error::FirstFrame(FirstFrameCause::of_pipeline(&error)))
+        }
+        Err(failure) => {
+            if let Some((protocol, capabilities, battery)) = &failure.observed {
+                return report_observations(
+                    out,
+                    *protocol,
+                    capabilities,
+                    *battery,
+                    failure.frame.as_deref().unwrap_or_default(),
+                )
+                .and(Err(Error::FirstFrame(failure.cause(streams))));
+            }
+            Err(Error::FirstFrame(failure.cause(streams)))
+        }
+    }
+}
+
+/// Print the observations available even if the subsequent check or session close failed.
+fn report_observations(
+    out: &mut dyn Write, protocol: Protocol, capabilities: &Capabilities, battery: Option<Battery>,
+    frame: &[u8],
+) -> Result<(), Error> {
+    use crate::sony::Capability;
+    let dimensions = crate::media::JpegDecoder::dimensions(frame);
+    writeln!(out, "protocol: {protocol:?}")?;
+    for (name, capability) in [
+        ("live_view", Capability::LiveView),
+        ("still_capture", Capability::StillCapture),
+        ("set_property", Capability::SetProperty),
+        ("battery", Capability::Battery),
+        ("priority_mode", Capability::PriorityMode),
+    ] {
+        writeln!(
+            out,
+            "capability_{name}: {}",
+            capabilities.supports(capability)
+        )?;
+    }
+    if let Ok((width, height)) = dimensions {
+        writeln!(out, "frame: {width} x {height}")?;
+    }
+    report_battery(out, battery)
+}
+
+pub(super) fn report_battery(out: &mut dyn Write, battery: Option<Battery>) -> Result<(), Error> {
+    let percent = battery.and_then(|reading| reading.percent);
+    let power = report_power(battery);
+    if let Some(percent) = percent {
+        writeln!(out, "battery_percent: {percent}")?;
+    } else {
+        writeln!(out, "battery_percent: unknown")?;
+    }
+    writeln!(out, "power: {power}")?;
+    Ok(())
+}
+
+pub(super) fn report_power(battery: Option<Battery>) -> &'static str {
+    battery.map_or("unknown", |reading| match reading.source {
+        crate::sony::PowerSource::Battery => "battery",
+        crate::sony::PowerSource::Usb => "usb",
+        crate::sony::PowerSource::NoBattery => "no_battery",
+        crate::sony::PowerSource::Unknown => "unknown",
+    })
 }
 
 /// A failed walk of the session: the driver error, whether it came while waiting for the first
@@ -67,6 +150,7 @@ struct Failure {
     error: SonyError,
     waiting_for_frame: bool,
     frame: Option<Vec<u8>>,
+    observed: Option<(Protocol, Capabilities, Option<Battery>)>,
 }
 
 impl Failure {
@@ -83,7 +167,7 @@ impl Failure {
     }
 }
 
-type Inspected = (Protocol, Capabilities, Option<Battery>, Option<Vec<u8>>);
+type Inspected = (Protocol, Capabilities, Option<Battery>, Vec<u8>);
 
 /// Open the camera and walk the session as far as `check_frame` asks. The outer error is the
 /// factory's; the inner one is the [`Failure`].
@@ -94,8 +178,11 @@ async fn inspect<F: CameraFactory>(
     let mut session = factory.session(transport, SessionConfig::default(), std::time::Instant::now);
     let mut waiting_for_frame = false;
     let mut frame = None;
+    let mut observed = None;
     let report = SonyCamera::run(&mut session, config, async |camera| {
+        observed = Some((camera.protocol(), camera.capabilities(), None));
         camera.wait_live_view_ready().await?;
+        observed = Some((camera.protocol(), camera.capabilities(), camera.battery()));
         if check_frame {
             waiting_for_frame = true;
             frame = Some(camera.next_live_view_frame().await?);
@@ -106,11 +193,14 @@ async fn inspect<F: CameraFactory>(
     let transport = factory.recover(session);
     factory.release(transport);
     Ok(match report {
-        Ok((protocol, capabilities, battery)) => Ok((protocol, capabilities, battery, frame)),
+        Ok((protocol, capabilities, battery)) => {
+            Ok((protocol, capabilities, battery, frame.unwrap_or_default()))
+        }
         Err(error) => Err(Failure {
             error,
             waiting_for_frame,
             frame,
+            observed,
         }),
     })
 }

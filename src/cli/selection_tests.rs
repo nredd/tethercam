@@ -221,6 +221,7 @@ fn plan(command: Command, camera_id: Option<&str>, logs: &LogCapture) -> Plan {
             config: None,
             simulate: None,
             no_discovery: true,
+            report: false,
         },
         cfg,
         dispatch: logs.dispatch(),

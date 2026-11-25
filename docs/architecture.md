@@ -175,7 +175,13 @@ No local unsafe code, platform-number constants, or new license exception is nee
 ### CLI and supervisor contract
 
 - `cli::Options::parse` is total over OS strings, rejects unknown/duplicate options, preserves
-  non-UTF-8 foreground paths, and consumes at most seven arguments. The bounded `service`
+  non-UTF-8 foreground paths, and consumes at most eight arguments. `doctor --report` emits only
+  allowlisted environment and camera categories; failures are fixed categories, not error sources.
+  It retains available camera and frame fields when the first frame fails stream validation.
+  It writes and flushes failures through the report's sink. The ICC executable shares one sink
+  with its worker and cleanup watcher, preserving terminal exit statuses even if the sink fails.
+  Library callers with borrowed writers receive buffered ICC worker output on normal return.
+  The bounded `service`
   syntax accepts only `install|uninstall|status [--user]` and dispatches before runtime config,
   signals or USB access; service template paths reject unsupported bytes/control characters.
   `setup`, `probe`, `doctor` and `run`

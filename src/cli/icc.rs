@@ -42,7 +42,7 @@
 use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -333,6 +333,11 @@ pub(super) async fn drive_until(
     };
     let result = command_until(factory, cfg, options, out, Box::pin(shutdown)).await;
     if *quarantined.borrow() {
+        if options.report {
+            return Err(Error::QuarantinedReport(
+                result.as_ref().err().map(super::report_error),
+            ));
+        }
         match result {
             Err(Error::Probe(cause)) => Err(Error::QuarantinedProbe(cause)),
             _ => Err(Error::Quarantined),
@@ -390,7 +395,7 @@ type Entry = Box<dyn FnOnce(IccHandle) -> Result<(), Error> + Send>;
 enum Progress {
     /// The application ended. Carries the rendered error when it failed, whose report belongs
     /// before any notice but would otherwise be printed only after `run` returns.
-    Finished(Option<String>),
+    Finished(Completion),
     /// `run` returned: native cleanup settled and the process ends normally.
     Settled,
 }
@@ -398,13 +403,43 @@ enum Progress {
 /// Reports [`Progress::Finished`] when the entry ends, by return or by unwinding.
 struct Finished {
     progress: mpsc::Sender<Progress>,
-    failure: Option<String>,
+    completion: Completion,
+}
+
+#[derive(Default)]
+struct Completion {
+    message: Option<String>,
+    category: Option<&'static str>,
+    flush_failed: bool,
+}
+
+/// Flush observations before native cleanup. If the flush fails, record any check failure
+/// before the caller reports the I/O error; the watcher retries the category if writing failed.
+fn report_completion(result: &mut Result<(), Error>, out: &mut dyn Write) -> Completion {
+    let category = result.as_ref().err().map(super::report_error);
+    let mut completion = Completion {
+        category,
+        ..Completion::default()
+    };
+    if let Err(error) = out.flush() {
+        let check = category.filter(|category| *category != "io");
+        let written = check
+            .into_iter()
+            .try_for_each(|category| writeln!(out, "Error: {category}"));
+        completion.category = check.filter(|_| written.is_err());
+        completion.flush_failed = true;
+        *result = Err(Error::Io(written.err().unwrap_or(error)));
+    }
+    completion
 }
 
 impl Drop for Finished {
     fn drop(&mut self) {
         // The service has no watcher: nothing reads the send, which is then simply unobserved.
-        drop(self.progress.send(Progress::Finished(self.failure.take())));
+        drop(
+            self.progress
+                .send(Progress::Finished(std::mem::take(&mut self.completion))),
+        );
     }
 }
 
@@ -423,13 +458,14 @@ fn lock_out<W>(out: &SharedOut<W>) -> std::sync::MutexGuard<'_, W> {
 /// it is printed, and the output is complete either way.
 fn watch<W: Write>(
     out: &SharedOut<W>, progress: &mpsc::Receiver<Progress>, limit: Duration, terminate: fn(u8),
-) {
-    let Ok(Progress::Finished(failure)) = progress.recv() else {
+    report: bool,
+) -> io::Result<()> {
+    let Ok(Progress::Finished(completion)) = progress.recv() else {
         // `run` ended before the application ever did: nothing is pending on its account.
-        return;
+        return Ok(());
     };
     if !matches!(progress.recv_timeout(limit), Err(RecvTimeoutError::Timeout)) {
-        return;
+        return Ok(());
     }
     tracing::error!(
         event = "icc_cleanup_unsettled",
@@ -437,11 +473,24 @@ fn watch<W: Write>(
     );
     let mut out = lock_out(out);
     // Best effort: the process is about to end and there is nowhere left to report to.
-    if let Some(failure) = &failure {
+    if report {
+        let written = super::finalize_report(
+            &mut *out,
+            completion
+                .category
+                .into_iter()
+                .chain(completion.flush_failed.then_some("io"))
+                .chain(["backend_cleanup"]),
+        );
+        drop(out);
+        terminate(UNSETTLED_EXIT);
+        return written;
+    }
+    if let Some(failure) = &completion.message {
         let _ = writeln!(out, "Error: {failure}");
     }
     // Only a command that succeeded has a complete result to point at.
-    let outcome = if failure.is_some() {
+    let outcome = if completion.message.is_some() {
         "The command did not succeed."
     } else {
         "The result above is complete."
@@ -453,15 +502,17 @@ fn watch<W: Write>(
     let _ = out.flush();
     drop(out);
     terminate(UNSETTLED_EXIT);
+    Ok(())
 }
 
 /// The native main-thread runtime: runs the entry and returns once native cleanup has settled.
 type Run = fn(Entry) -> Result<Result<(), Error>, IccError>;
 
 /// Starts the settle watcher's thread. A seam only so a refusal of the OS is testable.
-type Spawn = fn(Box<dyn FnOnce() + Send>) -> io::Result<std::thread::JoinHandle<()>>;
+type WatchTask = Box<dyn FnOnce() -> io::Result<()> + Send>;
+type Spawn = fn(WatchTask) -> io::Result<std::thread::JoinHandle<io::Result<()>>>;
 
-fn spawn_watcher(task: Box<dyn FnOnce() + Send>) -> io::Result<std::thread::JoinHandle<()>> {
+fn spawn_watcher(task: WatchTask) -> io::Result<std::thread::JoinHandle<io::Result<()>>> {
     std::thread::Builder::new()
         .name("icc-settle-watch".into())
         .spawn(task)
@@ -496,67 +547,133 @@ fn launch_spawning<W: Write + Send + 'static>(
         .map(|limit| {
             let out = Arc::clone(&out);
             let dispatch = plan.dispatch.clone();
+            let report = plan.options.report;
             spawn(Box::new(move || {
                 tracing::dispatcher::with_default(&dispatch, || {
-                    watch(&out, &observed, limit, terminate);
-                });
+                    watch(&out, &observed, limit, terminate, report)
+                })
             }))
         })
         .transpose()?;
     // Set once the application is about to run: a later failure of the native runtime is then not
     // "never started", which would send the operator looking at the platform and the build.
-    let started = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(OnceLock::<fn() -> Error>::new());
     let ran = Arc::clone(&started);
     let finished = progress.clone();
     let entry: Entry = Box::new(move |handle| {
-        ran.store(true, Ordering::Release);
+        ran.get_or_init(|| || Error::IccFailed);
         // Start failed and overwrite on a normal return. Only where panics unwind (debug and test
         // builds): a panic then skips the overwrite and the watcher reports an error. The release
         // profile uses `panic = "abort"`, so there a panic ends the process before any of this runs.
         let mut report = Finished {
             progress: finished,
-            failure: Some(Error::IccFailed.to_string()),
+            completion: Completion {
+                message: Some(Error::IccFailed.to_string()),
+                category: Some("backend"),
+                flush_failed: false,
+            },
         };
         let mut out = lock_out(&out);
-        let result = worker(handle, &plan, &mut *out);
+        let mut result = worker(handle, &plan, &mut *out);
+        if let Err(Error::QuarantinedReport(category)) = &result {
+            let result =
+                super::finalize_report(&mut *out, category.iter().copied().chain(["backend"]))
+                    .map_err(Error::Io)
+                    .and(result);
+            // Output failure cannot make a quarantined runtime safe to keep running.
+            terminate(QUARANTINE_EXIT);
+            return result;
+        }
         if let Err(error @ (Error::Quarantined | Error::QuarantinedProbe(_))) = &result {
-            // Best effort: the process is about to end and there is nowhere left to report to.
             let _ = writeln!(out, "Error: {error}");
             let _ = out.flush();
             terminate(QUARANTINE_EXIT);
         }
-        // The result is complete and on its way out before the watcher can run out of patience.
-        let _ = out.flush();
-        report.failure = result.as_ref().err().map(ToString::to_string);
+        // Flush even failed commands before native cleanup can stall.
+        report.completion = if plan.options.report {
+            report_completion(&mut result, &mut *out)
+        } else {
+            let _ = out.flush();
+            Completion {
+                message: result.as_ref().err().map(ToString::to_string),
+                ..Completion::default()
+            }
+        };
         result
     });
     let outcome = run(entry);
     drop(progress.send(Progress::Settled));
-    if let Some(watcher) = watcher {
-        // The watcher only reports; a panic in it has no result to add.
-        drop(watcher.join());
-    }
-    outcome.map_err(|_| {
-        if started.load(Ordering::Acquire) {
-            Error::IccFailed
-        } else {
-            Error::IccUnavailable
-        }
-    })?
+    let written = watcher
+        .and_then(|watcher| watcher.join().ok())
+        .unwrap_or(Ok(()));
+    let error = started.get().copied().unwrap_or(icc_unavailable);
+    let outcome = outcome.map_err(|_| error());
+    written
+        .map_err(Error::Io)
+        .and(outcome)
+        .and_then(std::convert::identity)
+}
+
+fn icc_unavailable() -> Error {
+    Error::IccUnavailable
 }
 
 fn terminate(code: u8) {
     std::process::exit(i32::from(code));
 }
 
-/// Run `options.command` on the experimental native backend. The caller's `out` is not used:
-/// the main thread is parked in the native run loop, so the worker writes to the process stdout.
-pub(super) fn launch(options: &Options, cfg: &Config, dispatch: &Dispatch) -> Result<(), Error> {
+/// An owned sink used by both the calling thread and native worker.
+struct Writer<W>(SharedOut<W>);
+
+impl<W: Write> Write for Writer<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        lock_out(&self.0).write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        lock_out(&self.0).flush()
+    }
+}
+
+pub(super) fn run_stdout() -> std::process::ExitCode {
+    let stdout = Arc::new(Mutex::new(io::stdout()));
+    super::run_using(
+        &mut Writer(Arc::clone(&stdout)),
+        &|options, cfg, dispatch, _| {
+            launch_native(options, cfg, dispatch, Writer(Arc::clone(&stdout)))
+        },
+    )
+}
+
+/// A borrowed report sink cannot cross into the native worker. Collect its bounded output
+/// and forward it to the same caller sink after native cleanup, never to stdout.
+pub(super) fn launch(
+    options: &Options, cfg: &Config, dispatch: &Dispatch, out: &mut dyn Write,
+) -> Result<(), Error> {
+    if !options.report {
+        return launch_native(options, cfg, dispatch, io::stdout());
+    }
+    forward_report(out, |writer| launch_native(options, cfg, dispatch, writer))
+}
+
+fn forward_report(
+    out: &mut dyn Write, launch: impl FnOnce(Writer<Vec<u8>>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let result = launch(Writer(Arc::clone(&bytes)));
+    out.write_all(&lock_out(&bytes))
+        .map_err(Error::Io)
+        .and(result)
+}
+
+fn launch_native<W: Write + Send + 'static>(
+    options: &Options, cfg: &Config, dispatch: &Dispatch, out: W,
+) -> Result<(), Error> {
     launch_with(
         options,
         cfg,
         dispatch,
-        io::stdout(),
+        out,
         icc::run::<Entry, Result<(), Error>>,
         EmptyRecovery::for_command(options.command),
         settle_bound(options.command),
